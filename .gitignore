@@ -1,0 +1,157 @@
+# ==============================================================================
+# Rust / Cargo Build Artifacts & Caches
+# ==============================================================================
+/target
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+*.dwo
+*.dwp
+*.profraw
+*.profdata
+lcov.info
+coverage/
+tarpaulin-report.html
+cobertura.xml
+
+# Ignore Cargo.lock only if this were purely a library, but since win-cmd-rs
+# provides binaries (wincmd, wincheck), keep Cargo.lock tracked by default.
+# Uncomment if desired:
+# Cargo.lock
+
+# ==============================================================================
+# Fuzzing, Benchmarking & Testing Artifacts
+# ==============================================================================
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+proptest-regressions/
+*.snap.new
+flamegraph.svg
+perf.data
+perf.data.old
+
+# ==============================================================================
+# Operating System Files
+# ==============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux / POSIX
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ==============================================================================
+# IDEs & Editors
+# ==============================================================================
+# VS Code / Cursor / Windsurf
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+.history/
+
+# JetBrains (RustRover, IntelliJ, CLion)
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+cmake-build-*/
+
+# Vim / Neovim
+.*.swp
+.*.swo
+.*.swn
+*.swp
+*.swo
+*.swn
+.netrwhist
+Session.vim
+tags
+
+# Emacs
+.#*
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# Sublime Text / Helix / Zed
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+*.sublime-workspace
+*.sublime-project
+.helix/
+.zed/
+
+# ==============================================================================
+# Python / Pre-commit / Tooling Environments
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.python-version
+.pre-commit-cache/
+
+# Node / Web Tooling (if used for docs/wasm/benchmarks)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ==============================================================================
+# Temporary, Log & Local Environment Files
+# ==============================================================================
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.log
+*.out
+*.err
+*.pid
+*.seed
+*.pid.lock
+tmp/
+temp/
+.env
+.env.*
+!.env.example
+
+# AI / Agent Local Scratches
+.gemini/
+.claude/
+.aider*

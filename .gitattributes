@@ -1,0 +1,233 @@
+# ==============================================================================
+# Default Behavior & Line Endings
+# ==============================================================================
+# Auto-detect text files and normalize line endings to LF in the repository
+* text=auto eol=lf
+
+# ==============================================================================
+# Rust Source & Cargo Configuration
+# ==============================================================================
+*.rs      text eol=lf diff=rust
+*.toml    text eol=lf diff=toml
+Cargo.lock text eol=lf -diff linguist-generated=true
+
+# ==============================================================================
+# Windows Batch & CMD Scripts (Critical for win-cmd-rs)
+# ==============================================================================
+# cmd.exe relies on byte offsets and CRLF line endings for label seeking,
+# self-modifying batch scripts, and phase1 parser mechanics.
+*.bat     text eol=crlf linguist-language=Batchfile
+*.cmd     text eol=crlf linguist-language=Batchfile
+*.btm     text eol=crlf linguist-language=Batchfile
+
+# Explicit LF or binary test fixtures (if testing mixed/malformed line endings)
+tests/fixtures/**/*.lf.bat   text eol=lf
+tests/fixtures/**/*.lf.cmd   text eol=lf
+tests/fixtures/**/*.raw.bat  -text
+tests/fixtures/**/*.raw.cmd  -text
+tests/fixtures/**/*.bin      binary
+
+# ==============================================================================
+# Windows & DOS Ecosystem Files
+# ==============================================================================
+*.ps1     text eol=crlf
+*.psm1    text eol=crlf
+*.psd1    text eol=crlf
+*.vbs     text eol=crlf
+*.reg     text eol=crlf
+*.inf     text eol=crlf
+*.ini     text eol=crlf
+*.rc      text eol=crlf
+*.def     text eol=crlf
+*.sln     text eol=crlf
+*.vcxproj text eol=crlf
+*.props   text eol=crlf
+*.targets text eol=crlf
+
+# ==============================================================================
+# POSIX & Cross-Platform Scripts
+# ==============================================================================
+*.sh      text eol=lf diff=shell
+*.bash    text eol=lf diff=shell
+*.zsh     text eol=lf diff=shell
+*.fish    text eol=lf
+*.py      text eol=lf diff=python
+*.pl      text eol=lf diff=perl
+*.rb      text eol=lf diff=ruby
+*.js      text eol=lf
+*.mjs     text eol=lf
+*.cjs     text eol=lf
+*.ts      text eol=lf
+*.lua     text eol=lf
+
+# ==============================================================================
+# C / C++ / Systems Interop
+# ==============================================================================
+*.c       text eol=lf diff=cpp
+*.h       text eol=lf diff=cpp
+*.cc      text eol=lf diff=cpp
+*.cpp     text eol=lf diff=cpp
+*.cxx     text eol=lf diff=cpp
+*.hpp     text eol=lf diff=cpp
+*.hxx     text eol=lf diff=cpp
+*.s       text eol=lf
+*.S       text eol=lf
+*.asm     text eol=lf
+CMakeLists.txt text eol=lf
+*.cmake   text eol=lf
+Makefile  text eol=lf
+*.mk      text eol=lf
+
+# ==============================================================================
+# Documentation, Data & Configuration
+# ==============================================================================
+*.md      text eol=lf diff=markdown linguist-documentation=true
+*.markdown text eol=lf diff=markdown linguist-documentation=true
+*.txt     text eol=lf
+*.rst     text eol=lf
+*.adoc    text eol=lf
+*.json    text eol=lf
+*.jsonc   text eol=lf
+*.json5   text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.xml     text eol=lf
+*.html    text eol=lf diff=html
+*.htm     text eol=lf diff=html
+*.css     text eol=lf diff=css
+*.svg     text eol=lf
+*.sql     text eol=lf
+*.csv     text eol=lf
+*.tsv     text eol=lf
+*.snap    text eol=lf linguist-generated=true
+
+# Dotfiles & Repo Metadata
+.editorconfig  text eol=lf
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+.gitmodules    text eol=lf
+.mailmap       text eol=lf
+rust-toolchain text eol=lf
+rust-toolchain.toml text eol=lf
+rustfmt.toml   text eol=lf
+.rustfmt.toml  text eol=lf
+clippy.toml    text eol=lf
+.clippy.toml   text eol=lf
+deny.toml      text eol=lf
+nextest.toml   text eol=lf
+LICENSE*       text eol=lf
+NOTICE*        text eol=lf
+CHANGELOG*     text eol=lf
+README*        text eol=lf
+TODO*          text eol=lf
+
+# ==============================================================================
+# Binary Files & Archives (Prevent Git from corrupting or diffing)
+# ==============================================================================
+# Executables & Libraries
+*.exe     binary
+*.dll     binary
+*.so      binary
+*.dylib   binary
+*.a       binary
+*.lib     binary
+*.o       binary
+*.obj     binary
+*.pdb     binary
+*.rlib    binary
+*.rmeta   binary
+*.wasm    binary
+*.com     binary
+*.sys     binary
+*.msi     binary
+
+# Archives & Compressed Files
+*.7z      binary
+*.br      binary
+*.bz2     binary
+*.cab     binary
+*.deb     binary
+*.dmg     binary
+*.gz      binary
+*.iso     binary
+*.jar     binary
+*.lz      binary
+*.lz4     binary
+*.lzma    binary
+*.nupkg   binary
+*.pkg     binary
+*.rar     binary
+*.rpm     binary
+*.tar     binary
+*.tbz2    binary
+*.tgz     binary
+*.tlz     binary
+*.txz     binary
+*.WHL     binary
+*.whl     binary
+*.xz      binary
+*.Z       binary
+*.zip     binary
+*.zst     binary
+
+# Images, Icons & Fonts
+*.avif    binary
+*.bmp     binary
+*.cur     binary
+*.gif     binary
+*.icns    binary
+*.ico     binary
+*.jpeg    binary
+*.jpg     binary
+*.jxl     binary
+*.otf     binary
+*.pdf     binary
+*.png     binary
+*.psd     binary
+*.TGA     binary
+*.tga     binary
+*.tif     binary
+*.tiff    binary
+*.ttf     binary
+*.webp    binary
+*.woff    binary
+*.woff2   binary
+
+# Audio & Video
+*.aac     binary
+*.avi     binary
+*.flac    binary
+*.m4a     binary
+*.mkv     binary
+*.mov     binary
+*.mp3     binary
+*.mp4     binary
+*.ogg     binary
+*.opus    binary
+*.wav     binary
+*.webm    binary
+
+# Databases & Misc Binary Data
+*.db      binary
+*.mdb     binary
+*.sqlite  binary
+*.sqlite3 binary
+*.dat     binary
+*.bin     binary
+*.profraw binary
+*.profdata binary
+
+# ==============================================================================
+# GitHub Linguist & Export Overrides
+# ==============================================================================
+docs/**             linguist-documentation=true
+benches/**          linguist-vendored=false
+examples/**         linguist-vendored=false
+tests/**            linguist-vendored=false
+
+# Exclude development-only files from `git archive` exports
+.github/            export-ignore
+.gitignore          export-ignore
+.gitattributes      export-ignore
+.editorconfig       export-ignore
+TODO_PLAN.md        export-ignore

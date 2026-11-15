@@ -1,0 +1,1075 @@
+//! Automated documentation coverage (`100%` file, module, type, field, variant, function,
+//! `# Arguments`, `# Returns`, `# Errors`) and architectural anti-pattern quality gates for `win-cmd-rs`.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Recursively collects all `.rs` source files under `dir` in deterministic lexicographical order.
+///
+/// # Arguments
+/// * `dir` - Root directory to traverse.
+/// * `out` - Output accumulator of discovered `.rs` paths.
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|entry| entry.path()))
+        .collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Extracts the contiguous `///` doc-comment block immediately preceding line `item_line_idx`,
+/// skipping single-line and multi-line `#[...]` attribute annotations.
+///
+/// # Arguments
+/// * `lines` - Source lines of the file.
+/// * `item_line_idx` - 0-based line index of the item declaration.
+///
+/// # Returns
+/// Joined `///` doc-comment lines preceding the item (empty if undocumented).
+#[must_use]
+fn extract_preceding_doc_block(lines: &[&str], item_line_idx: usize) -> String {
+    let mut docs = Vec::new();
+    let mut idx = item_line_idx;
+    let mut bracket_depth: usize = 0;
+
+    while idx > 0 {
+        idx = idx.saturating_sub(1);
+        let trimmed = lines.get(idx).copied().unwrap_or("").trim();
+
+        if bracket_depth > 0 {
+            for ch in trimmed.chars().rev() {
+                if ch == ']' {
+                    bracket_depth = bracket_depth.saturating_add(1);
+                } else if ch == '[' {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("///") {
+            docs.push(rest.trim_start());
+            continue;
+        }
+        if trimmed.starts_with("#[") {
+            continue;
+        }
+        if trimmed.ends_with(']') {
+            bracket_depth = 1;
+            for ch in trimmed
+                .get(..trimmed.len().saturating_sub(1))
+                .unwrap_or("")
+                .chars()
+                .rev()
+            {
+                if ch == ']' {
+                    bracket_depth = bracket_depth.saturating_add(1);
+                } else if ch == '[' {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                }
+            }
+            continue;
+        }
+        break;
+    }
+
+    docs.reverse();
+    let nl = "\n";
+    docs.join(nl)
+}
+
+/// Strips optional `pub(...)` / `const` qualifiers from the front of a trimmed declaration line.
+///
+/// # Arguments
+/// * `trimmed` - Trimmed source line.
+///
+/// # Returns
+/// Remainder of `trimmed` after stripping leading visibility and `const` modifiers.
+#[must_use]
+fn strip_vis_and_const(trimmed: &str) -> &str {
+    let mut rest = trimmed;
+    if let Some(after_pub) = rest.strip_prefix("pub") {
+        if after_pub.starts_with('(') {
+            if let Some(close_paren) = after_pub.find(')') {
+                rest = after_pub
+                    .get(close_paren.saturating_add(1)..)
+                    .unwrap_or("")
+                    .trim_start();
+            }
+        } else if after_pub.starts_with(' ') {
+            rest = after_pub.trim_start();
+        }
+    }
+    if let Some(after_const) = rest.strip_prefix("const ") {
+        rest = after_const.trim_start();
+    }
+    rest
+}
+
+/// Checks whether a trimmed source line begins a Rust `fn` item declaration.
+///
+/// # Arguments
+/// * `trimmed` - Trimmed source line.
+///
+/// # Returns
+/// `true` if `trimmed` declares a function or method.
+#[must_use]
+fn is_fn_item_start(trimmed: &str) -> bool {
+    strip_vis_and_const(trimmed).starts_with("fn ")
+}
+
+/// Checks whether a trimmed source line begins a `mod`, `struct`, `enum`, `trait`, `type`,
+/// `const`, or `static` item declaration.
+///
+/// # Arguments
+/// * `trimmed` - Trimmed source line.
+///
+/// # Returns
+/// `true` if `trimmed` declares a named module, type, or constant item.
+#[must_use]
+fn is_named_item_start(trimmed: &str) -> bool {
+    let rest = strip_vis_and_const(trimmed);
+    for kw in ["struct ", "enum ", "trait ", "type ", "static "] {
+        if rest.starts_with(kw) {
+            return true;
+        }
+    }
+    if rest.starts_with("mod ") && !rest.ends_with(';') {
+        return true;
+    }
+    // `const NAME:` (since `strip_vis_and_const` stripped `const `, check `NAME:` after `const `)
+    let after_vis = trimmed.strip_prefix("pub").map_or(trimmed, |after_pub| {
+        if after_pub.starts_with('(') {
+            after_pub
+                .find(')')
+                .and_then(|cp| after_pub.get(cp.saturating_add(1)..))
+                .unwrap_or("")
+                .trim_start()
+        } else {
+            after_pub.trim_start()
+        }
+    });
+    after_vis
+        .strip_prefix("const ")
+        .is_some_and(|after_c| !after_c.trim_start().starts_with("fn "))
+}
+
+/// Parses non-`self` parameter identifiers and optional non-unit return type from a signature.
+///
+/// # Arguments
+/// * `sig` - Flattened function signature up to `{` or `;`.
+///
+/// # Returns
+/// `(fn_name, param_names, return_type_opt)` extracted from `sig`.
+#[must_use]
+fn parse_fn_signature(sig: &str) -> (String, Vec<String>, Option<String>) {
+    let Some(fn_pos) = sig.find("fn ") else {
+        return (String::new(), Vec::new(), None);
+    };
+    let after_fn = sig
+        .get(fn_pos.saturating_add(3)..)
+        .unwrap_or("")
+        .trim_start();
+    let name_len = after_fn
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .count();
+    let fn_name = after_fn.get(..name_len).unwrap_or("").to_owned();
+    let mut cursor = after_fn.get(name_len..).unwrap_or("").trim_start();
+
+    if cursor.starts_with('<') {
+        let mut depth: usize = 0;
+        let mut end_gen = 0;
+        for (i, ch) in cursor.char_indices() {
+            if ch == '<' {
+                depth = depth.saturating_add(1);
+            } else if ch == '>' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end_gen = i.saturating_add(1);
+                    break;
+                }
+            }
+        }
+        cursor = cursor.get(end_gen..).unwrap_or("").trim_start();
+    }
+
+    if !cursor.starts_with('(') {
+        return (fn_name, Vec::new(), None);
+    }
+
+    let mut p_depth: usize = 0;
+    let mut close_paren = 0;
+    for (i, ch) in cursor.char_indices() {
+        if ch == '(' {
+            p_depth = p_depth.saturating_add(1);
+        } else if ch == ')' {
+            p_depth = p_depth.saturating_sub(1);
+            if p_depth == 0 {
+                close_paren = i;
+                break;
+            }
+        }
+    }
+
+    let params_inner = cursor.get(1..close_paren).unwrap_or("");
+    let params = split_top_level_params(params_inner);
+
+    let after_params = cursor
+        .get(close_paren.saturating_add(1)..)
+        .unwrap_or("")
+        .trim();
+    let sig_tail = after_params
+        .split('{')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(';')
+        .trim();
+    let ret_type = sig_tail.find("->").and_then(|arrow| {
+        let raw_ret = sig_tail.get(arrow.saturating_add(2)..).unwrap_or("").trim();
+        let before_where = raw_ret.split("where ").next().unwrap_or(raw_ret).trim();
+        if before_where.is_empty() || before_where == "()" {
+            None
+        } else {
+            Some(before_where.to_owned())
+        }
+    });
+
+    (fn_name, params, ret_type)
+}
+
+/// Splits a comma-separated parameter list at nesting depth 0 and returns non-`self` identifiers.
+///
+/// # Arguments
+/// * `params_inner` - Substring inside `fn foo(...)`.
+///
+/// # Returns
+/// Ordered list of non-`self` parameter names.
+#[must_use]
+fn split_top_level_params(params_inner: &str) -> Vec<String> {
+    let mut raw_parts = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+
+    for (i, ch) in params_inner.char_indices() {
+        match ch {
+            '(' | '<' | '[' => depth = depth.saturating_add(1),
+            ')' | '>' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                raw_parts.push(params_inner.get(start..i).unwrap_or("").trim());
+                start = i.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    let tail = params_inner.get(start..).unwrap_or("").trim();
+    if !tail.is_empty() {
+        raw_parts.push(tail);
+    }
+
+    let mut names = Vec::new();
+    for part in raw_parts {
+        let cleaned = part.trim();
+        if cleaned == "self"
+            || cleaned == "&self"
+            || cleaned == "&mut self"
+            || cleaned == "mut self"
+            || (cleaned.starts_with("&'") && cleaned.ends_with("self"))
+        {
+            continue;
+        }
+        if let Some(colon_pos) = cleaned.find(':') {
+            let pat = cleaned.get(..colon_pos).unwrap_or("").trim();
+            let ident = pat.strip_prefix("mut ").unwrap_or(pat).trim();
+            if !ident.is_empty() && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                names.push(ident.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// Kind of body delimiter discovered on a `struct` or `enum` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeBodyDelimiter {
+    /// Braced `{ ... }` struct or enum body.
+    Brace,
+    /// Tuple `(...)` struct body.
+    TupleParen,
+    /// Unit `;` struct or EOF without body.
+    UnitOrNone,
+}
+
+/// Scans forward from `start_idx` to find the opening `{`, `(`, or `;` of a `struct` or `enum`.
+///
+/// # Arguments
+/// * `lines` - Source lines of the file.
+/// * `start_idx` - Declaration start line index.
+/// * `is_struct` - Whether the declaration is a `struct` (enabling tuple `(` detection).
+///
+/// # Returns
+/// `(header_idx, delimiter)` locating the body delimiter line and kind.
+#[must_use]
+fn find_type_header_open(
+    lines: &[&str],
+    start_idx: usize,
+    is_struct: bool,
+) -> (usize, TypeBodyDelimiter) {
+    let mut header_idx = start_idx;
+    while header_idx < lines.len() {
+        let hl = lines.get(header_idx).copied().unwrap_or("").trim();
+        let hl_decl = if header_idx == start_idx {
+            strip_vis_and_const(hl)
+        } else {
+            hl
+        };
+        if hl_decl.contains('{') {
+            return (header_idx, TypeBodyDelimiter::Brace);
+        }
+        if is_struct && header_idx == start_idx && hl_decl.contains('(') {
+            return (header_idx, TypeBodyDelimiter::TupleParen);
+        }
+        if hl_decl.ends_with(';') {
+            return (header_idx, TypeBodyDelimiter::UnitOrNone);
+        }
+        header_idx = header_idx.saturating_add(1);
+    }
+    (header_idx, TypeBodyDelimiter::UnitOrNone)
+}
+
+/// Audits braced `struct` fields and `enum` variants in `lines` to ensure every field and variant
+/// has a preceding `///` docstring.
+///
+/// # Arguments
+/// * `path` - File path for failure diagnostics.
+/// * `lines` - Source lines of the file.
+/// * `failures` - Accumulator of documentation violation messages.
+fn audit_fields_and_variants(path: &Path, lines: &[&str], failures: &mut Vec<String>) {
+    let mut idx = 0;
+    while idx < lines.len() {
+        let trimmed = lines.get(idx).copied().unwrap_or("").trim();
+        let rest = strip_vis_and_const(trimmed);
+        let is_struct = rest.starts_with("struct ");
+        let is_enum = rest.starts_with("enum ");
+        if !is_struct && !is_enum {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        let (header_idx, delim) = find_type_header_open(lines, idx, is_struct);
+        match delim {
+            TypeBodyDelimiter::TupleParen => {
+                audit_tuple_struct_fields(path, lines, header_idx, &mut idx, failures);
+                continue;
+            }
+            TypeBodyDelimiter::UnitOrNone => {
+                idx = header_idx.saturating_add(1);
+                continue;
+            }
+            TypeBodyDelimiter::Brace => {}
+        }
+
+        let mut brace_depth: usize = 0;
+        for ch in lines.get(header_idx).copied().unwrap_or("").chars() {
+            if ch == '{' {
+                brace_depth = brace_depth.saturating_add(1);
+            } else if ch == '}' {
+                brace_depth = brace_depth.saturating_sub(1);
+            }
+        }
+
+        let mut body_idx = header_idx.saturating_add(1);
+        let mut attr_depth: usize = 0;
+        while body_idx < lines.len() && brace_depth > 0 {
+            let bl = lines.get(body_idx).copied().unwrap_or("").trim();
+            let depth_at_line_start = brace_depth;
+            let in_multiline_attr = attr_depth > 0;
+            if attr_depth > 0 || bl.starts_with("#[") {
+                for ch in bl.chars() {
+                    if ch == '[' {
+                        attr_depth = attr_depth.saturating_add(1);
+                    } else if ch == ']' {
+                        attr_depth = attr_depth.saturating_sub(1);
+                    }
+                }
+            }
+            if !in_multiline_attr && !bl.starts_with("#[") {
+                for ch in bl.chars() {
+                    if ch == '{' {
+                        brace_depth = brace_depth.saturating_add(1);
+                    } else if ch == '}' {
+                        brace_depth = brace_depth.saturating_sub(1);
+                    }
+                }
+            }
+
+            if depth_at_line_start == 1
+                && !in_multiline_attr
+                && !bl.is_empty()
+                && !bl.starts_with("//")
+                && !bl.starts_with("#[")
+                && !bl.starts_with('}')
+            {
+                let candidate = strip_vis_and_const(bl);
+                let first_ok = candidate
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+                let looks_like_member = if is_struct {
+                    first_ok && candidate.contains(':')
+                } else {
+                    first_ok
+                };
+                if looks_like_member && extract_preceding_doc_block(lines, body_idx).is_empty() {
+                    failures.push(format!(
+                        "{}:{}: struct field or enum variant `{bl}` lacks `///` docstring",
+                        path.display(),
+                        body_idx.saturating_add(1)
+                    ));
+                }
+            }
+            body_idx = body_idx.saturating_add(1);
+        }
+        idx = body_idx;
+    }
+}
+
+/// Audits tuple `struct` fields (`pub struct Foo(\n /// doc\n pub T,\n);`) to ensure every
+/// tuple field has a preceding `///` docstring (rejecting undocumented inline `struct Foo(T);`).
+///
+/// # Arguments
+/// * `path` - File path for failure diagnostics.
+/// * `lines` - Source lines of the file.
+/// * `header_idx` - Line index containing the opening `(` of the tuple struct.
+/// * `next_idx` - Output index advanced past the tuple struct closing `);`.
+/// * `failures` - Accumulator of documentation violation messages.
+fn audit_tuple_struct_fields(
+    path: &Path,
+    lines: &[&str],
+    header_idx: usize,
+    next_idx: &mut usize,
+    failures: &mut Vec<String>,
+) {
+    let header_line = lines.get(header_idx).copied().unwrap_or("").trim();
+    let decl_line = strip_vis_and_const(header_line);
+    if let Some((_, after_open)) = decl_line.split_once('(') {
+        let inline_body = after_open.trim();
+        if !inline_body.is_empty() && !inline_body.starts_with("//") {
+            let inner = inline_body
+                .strip_suffix(");")
+                .or_else(|| inline_body.strip_suffix(')'))
+                .unwrap_or(inline_body)
+                .trim();
+            if !inner.is_empty() {
+                failures.push(format!(
+                    "{}:{}: inline tuple struct field in `{header_line}` lacks `///` docstring",
+                    path.display(),
+                    header_idx.saturating_add(1)
+                ));
+            }
+            if decl_line.ends_with(';') {
+                *next_idx = header_idx.saturating_add(1);
+                return;
+            }
+        }
+    }
+
+    let mut paren_depth: usize = 0;
+    for ch in decl_line.chars() {
+        if ch == '(' {
+            paren_depth = paren_depth.saturating_add(1);
+        } else if ch == ')' {
+            paren_depth = paren_depth.saturating_sub(1);
+        }
+    }
+
+    let mut body_idx = header_idx.saturating_add(1);
+    while body_idx < lines.len() && paren_depth > 0 {
+        let bl = lines.get(body_idx).copied().unwrap_or("").trim();
+        let depth_at_start = paren_depth;
+        if !bl.starts_with("//") {
+            for ch in bl.chars() {
+                if ch == '(' {
+                    paren_depth = paren_depth.saturating_add(1);
+                } else if ch == ')' {
+                    paren_depth = paren_depth.saturating_sub(1);
+                }
+            }
+        }
+        if depth_at_start == 1
+            && !bl.is_empty()
+            && !bl.starts_with("//")
+            && !bl.starts_with("#[")
+            && !bl.starts_with(')')
+            && extract_preceding_doc_block(lines, body_idx).is_empty()
+        {
+            failures.push(format!(
+                "{}:{}: tuple struct field `{bl}` lacks `///` docstring",
+                path.display(),
+                body_idx.saturating_add(1)
+            ));
+        }
+        body_idx = body_idx.saturating_add(1);
+    }
+    *next_idx = body_idx;
+}
+
+/// Audits a single `.rs` file for `//!` header, named-item/field/variant `///` docstrings, and
+/// complete `# Arguments` (`* `<param>` -` in order), `# Returns`, and `# Errors` (`CmdError`) sections.
+///
+/// # Arguments
+/// * `path` - Path to the `.rs` file under audit.
+/// * `failures` - Accumulator of documentation violation messages.
+fn audit_file_documentation(path: &Path, failures: &mut Vec<String>) {
+    let Ok(content) = fs::read_to_string(path) else {
+        failures.push(format!("{}: unreadable source file", path.display()));
+        return;
+    };
+    let lines: Vec<&str> = content.lines().collect();
+
+    let has_module_doc = lines
+        .iter()
+        .take(10)
+        .any(|line| line.trim_start().starts_with("//!"));
+    if !has_module_doc {
+        failures.push(format!(
+            "{}:1: missing top-level `//!` module/file documentation header",
+            path.display()
+        ));
+    }
+
+    audit_fields_and_variants(path, &lines, failures);
+
+    for (idx, raw_line) in lines.iter().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+
+        if is_named_item_start(trimmed) && extract_preceding_doc_block(&lines, idx).is_empty() {
+            failures.push(format!(
+                "{}:{}: item `{trimmed}` lacks `///` documentation",
+                path.display(),
+                idx.saturating_add(1)
+            ));
+        }
+
+        if !is_fn_item_start(trimmed) {
+            continue;
+        }
+
+        let mut sig = String::from(trimmed);
+        let mut lookahead = idx.saturating_add(1);
+        while lookahead < lines.len() && !sig.contains('{') && !sig.ends_with(';') {
+            sig.push(' ');
+            sig.push_str(lines.get(lookahead).copied().unwrap_or("").trim());
+            lookahead = lookahead.saturating_add(1);
+        }
+
+        let (fn_name, params, ret_type) = parse_fn_signature(&sig);
+        if fn_name.is_empty() {
+            continue;
+        }
+
+        let doc = extract_preceding_doc_block(&lines, idx);
+        let line_no = idx.saturating_add(1);
+        audit_fn_doc_sections(
+            path,
+            line_no,
+            &fn_name,
+            &params,
+            ret_type.as_deref(),
+            &doc,
+            failures,
+        );
+    }
+}
+
+/// Validates `# Arguments`, `# Returns`, and `# Errors` sections of a single function's doc block.
+///
+/// # Arguments
+/// * `path` - File path for failure diagnostics.
+/// * `line_no` - 1-based line number of the function declaration.
+/// * `fn_name` - Parsed function identifier.
+/// * `params` - Ordered list of non-`self` parameter names.
+/// * `ret_type` - Optional non-unit return type string.
+/// * `doc` - Joined preceding `///` doc lines.
+/// * `failures` - Accumulator of documentation violation messages.
+fn audit_fn_doc_sections(
+    path: &Path,
+    line_no: usize,
+    fn_name: &str,
+    params: &[String],
+    ret_type: Option<&str>,
+    doc: &str,
+    failures: &mut Vec<String>,
+) {
+    if doc.is_empty() {
+        failures.push(format!(
+            "{}:{line_no}: fn `{fn_name}` lacks `///` documentation",
+            path.display()
+        ));
+        return;
+    }
+
+    for section in ["# Arguments", "# Returns", "# Errors"] {
+        if doc.lines().filter(|l| l.trim() == section).count() > 1 {
+            failures.push(format!(
+                "{}:{line_no}: fn `{fn_name}` has duplicate `{section}` doc header",
+                path.display()
+            ));
+        }
+    }
+
+    if !params.is_empty() {
+        if let Some((_, args_section)) = doc.split_once("# Arguments") {
+            let mut search_offset = 0;
+            for p in params {
+                let exact_bullet = format!("* `{p}` -");
+                let tail = args_section.get(search_offset..).unwrap_or("");
+                if let Some(rel_pos) = tail.find(&exact_bullet) {
+                    search_offset = search_offset
+                        .saturating_add(rel_pos)
+                        .saturating_add(exact_bullet.len());
+                } else {
+                    failures.push(format!(
+                        "{}:{line_no}: fn `{fn_name}` `# Arguments` missing ordered entry `{exact_bullet}`",
+                        path.display()
+                    ));
+                }
+            }
+        } else {
+            failures.push(format!(
+                "{}:{line_no}: fn `{fn_name}` has parameters {params:?} but lacks `# Arguments`",
+                path.display()
+            ));
+        }
+    }
+
+    if let Some(ret) = ret_type {
+        if !doc.contains("# Returns") {
+            failures.push(format!(
+                "{}:{line_no}: fn `{fn_name}` -> `{ret}` lacks `# Returns`",
+                path.display()
+            ));
+        }
+        if ret.contains("Result<") && ret.contains("CmdError") {
+            if let Some((_, err_section)) = doc.split_once("# Errors") {
+                if !err_section.contains("CmdError") {
+                    failures.push(format!(
+                        "{}:{line_no}: fn `{fn_name}` `# Errors` does not name `CmdError`",
+                        path.display()
+                    ));
+                }
+            } else {
+                failures.push(format!(
+                    "{}:{line_no}: fn `{fn_name}` returns `{ret}` but lacks `# Errors`",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
+/// Enforces 100% file, module, type, field, variant, function, argument, return, and error
+/// documentation across every `.rs` file in `src/` and `tests/`.
+#[test]
+fn test_hundred_percent_documentation_coverage_gate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_rs_files(&root.join("src"), &mut files);
+    collect_rs_files(&root.join("tests"), &mut files);
+    assert!(files.len() >= 45);
+
+    let mut failures = Vec::new();
+    for file in &files {
+        audit_file_documentation(file, &mut failures);
+    }
+
+    let nl = "\n";
+    assert_eq!(
+        failures,
+        Vec::<String>::new(),
+        "Documentation completeness violations ({}): {}{}",
+        failures.len(),
+        nl,
+        failures.join(nl)
+    );
+}
+
+/// Strips standard (`"..."`) and raw (`r#"..."#`) Rust string literals from a single line
+/// so anti-pattern scanners inspect actual code tokens rather than string test fixtures.
+///
+/// # Arguments
+/// * `line` - Single Rust source line.
+///
+/// # Returns
+/// Code skeleton with string literal contents replaced by empty `""`.
+#[must_use]
+fn strip_string_literals(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes.get(i) == Some(&b'r') {
+            let mut hashes = 0usize;
+            while bytes.get(i.saturating_add(1).saturating_add(hashes)) == Some(&b'#') {
+                hashes = hashes.saturating_add(1);
+            }
+            if bytes.get(i.saturating_add(1).saturating_add(hashes)) == Some(&b'"') {
+                out.push_str("\"\"");
+                i = i.saturating_add(2).saturating_add(hashes);
+                while i < bytes.len() {
+                    if bytes.get(i) == Some(&b'"') {
+                        let mut close_h = 0usize;
+                        while close_h < hashes
+                            && bytes.get(i.saturating_add(1).saturating_add(close_h)) == Some(&b'#')
+                        {
+                            close_h = close_h.saturating_add(1);
+                        }
+                        if close_h == hashes {
+                            i = i.saturating_add(1).saturating_add(hashes);
+                            break;
+                        }
+                    }
+                    i = i.saturating_add(1);
+                }
+                continue;
+            }
+        }
+        if bytes.get(i) == Some(&b'"') {
+            out.push_str("\"\"");
+            i = i.saturating_add(1);
+            while i < bytes.len() {
+                if bytes.get(i) == Some(&b'\\') {
+                    i = i.saturating_add(2);
+                    continue;
+                }
+                if bytes.get(i) == Some(&b'"') {
+                    i = i.saturating_add(1);
+                    break;
+                }
+                i = i.saturating_add(1);
+            }
+            continue;
+        }
+        let ch = line.get(i..).and_then(|s| s.chars().next()).unwrap_or(' ');
+        out.push(ch);
+        i = i.saturating_add(ch.len_utf8());
+    }
+    out
+}
+
+/// Audits `src/` source files to forbid raw `: bool` function parameters (requiring semantic
+/// domain enums instead of boolean flags, while allowing `-> bool` return values on predicates).
+///
+/// # Arguments
+/// * `path` - Source file path under `src/`.
+/// * `content` - Full UTF-8 source text of `path`.
+/// * `violations` - Accumulator of violation messages.
+fn audit_no_raw_bool_params(path: &Path, content: &str, violations: &mut Vec<String>) {
+    let lines: Vec<&str> = content.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let after_vis = strip_vis_and_const(trimmed);
+        if !after_vis.starts_with("fn ") {
+            continue;
+        }
+        let mut combined = String::new();
+        for j in idx..lines.len().min(idx.saturating_add(25)) {
+            let l = lines.get(j).copied().unwrap_or("").trim();
+            if !l.starts_with("//") {
+                combined.push_str(l);
+                combined.push(' ');
+            }
+            if l.contains('{') || l.ends_with(';') {
+                break;
+            }
+        }
+        let Some(fn_pos) = combined.find("fn ") else {
+            continue;
+        };
+        let after_fn = combined
+            .get(fn_pos.saturating_add(3)..)
+            .unwrap_or("")
+            .trim_start();
+        let name_len = after_fn
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        let fn_name = after_fn.get(..name_len).unwrap_or("");
+        let mut cursor = after_fn.get(name_len..).unwrap_or("").trim_start();
+        if cursor.starts_with('<') {
+            let mut depth: usize = 0;
+            let mut end_gen = 0;
+            for (i, ch) in cursor.char_indices() {
+                if ch == '<' {
+                    depth = depth.saturating_add(1);
+                } else if ch == '>' {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end_gen = i.saturating_add(1);
+                        break;
+                    }
+                }
+            }
+            cursor = cursor.get(end_gen..).unwrap_or("").trim_start();
+        }
+        if !cursor.starts_with('(') {
+            continue;
+        }
+        let mut p_depth: usize = 0;
+        let mut close_paren = 0;
+        for (i, ch) in cursor.char_indices() {
+            if ch == '(' {
+                p_depth = p_depth.saturating_add(1);
+            } else if ch == ')' {
+                p_depth = p_depth.saturating_sub(1);
+                if p_depth == 0 {
+                    close_paren = i;
+                    break;
+                }
+            }
+        }
+        let params_inner = cursor.get(1..close_paren).unwrap_or("");
+        let mut depth: usize = 0;
+        let mut start = 0;
+        let mut parts = Vec::new();
+        for (i, ch) in params_inner.char_indices() {
+            match ch {
+                '(' | '<' | '[' => depth = depth.saturating_add(1),
+                ')' | '>' | ']' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    parts.push(params_inner.get(start..i).unwrap_or("").trim());
+                    start = i.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        let tail = params_inner.get(start..).unwrap_or("").trim();
+        if !tail.is_empty() {
+            parts.push(tail);
+        }
+        for part in parts {
+            if let Some((_, ty)) = part.split_once(':') {
+                let t = ty.trim();
+                if t == "bool" || t.contains("(bool") || t.contains("bool)") {
+                    violations.push(format!(
+                        "{}:{}: raw `: bool` parameter `{part}` in `fn {fn_name}` is forbidden; use a semantic enum",
+                        path.display(),
+                        idx.saturating_add(1)
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Enforces zero banned anti-patterns across `Cargo.toml`, `src/**`, and `tests/**`:
+/// - Zero `[lints.clippy]` `= "allow"` suppressions and zero `#[allow(` / `#![allow(` / `#[expect(` attributes.
+/// - Zero `anyhow`, `thiserror`, `eyre`, `snafu`, or `Box<dyn Error>` dynamic error erasure.
+/// - Zero `std::convert::identity` or `let _ =` silent result/branch-coverage gaming anywhere in `src/` or `tests/`.
+/// - Zero `.unwrap(`, `.expect(`, `panic!(`, `todo!(`, `unimplemented!(`, `unreachable!(`, `dbg!(`.
+/// - Zero vacuous `assert_ne!(..., "")`.
+#[test]
+fn test_zero_banned_antipatterns_and_lint_escapes_gate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut violations = Vec::new();
+
+    let cargo_toml = fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
+    for (idx, line) in cargo_toml.lines().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('#') && trimmed.contains("= \"allow\"") {
+            violations.push(format!(
+                "Cargo.toml:{}: blanket lint suppression `{trimmed}` is forbidden",
+                idx.saturating_add(1)
+            ));
+        }
+        for crate_ban in ["anyhow", "thiserror", "eyre", "snafu"] {
+            if trimmed.starts_with(crate_ban) {
+                violations.push(format!(
+                    "Cargo.toml:{}: banned error crate `{crate_ban}`",
+                    idx.saturating_add(1)
+                ));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect_rs_files(&root.join("src"), &mut files);
+    collect_rs_files(&root.join("tests"), &mut files);
+
+    let banned_everywhere = [
+        "#[allow(",
+        "#![allow(",
+        "#[expect(",
+        "#![expect(",
+        "convert::identity",
+        "let _ =",
+        ".unwrap(",
+        ".expect(",
+        "panic!(",
+        "todo!(",
+        "unimplemented!(",
+        "unreachable!(",
+        "dbg!(",
+        "anyhow",
+        "thiserror",
+        "Box<dyn Error",
+        "Box<dyn std::error::Error",
+        "Box<dyn core::error::Error",
+        "from_utf8(&[0x",
+    ];
+
+    let src_dir = root.join("src");
+    for path in &files {
+        let content = fs::read_to_string(path).unwrap_or_default();
+        if path.starts_with(&src_dir) {
+            audit_no_raw_bool_params(path, &content, &mut violations);
+        }
+
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let code_only = strip_string_literals(trimmed);
+
+            for needle in banned_everywhere {
+                if code_only.contains(needle) {
+                    violations.push(format!(
+                        "{}:{}: banned pattern `{needle}`",
+                        path.display(),
+                        idx.saturating_add(1)
+                    ));
+                }
+            }
+
+            if code_only.contains("assert_ne!(") && trimmed.contains(", \"\")") {
+                violations.push(format!(
+                    "{}:{}: vacuous non-empty assertion `{trimmed}` is forbidden",
+                    path.display(),
+                    idx.saturating_add(1)
+                ));
+            }
+        }
+    }
+
+    let nl = "\n";
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "Anti-pattern violations ({}):{}{}",
+        violations.len(),
+        nl,
+        violations.join(nl)
+    );
+}
+
+/// Enforces that `CmdError` in `src/error.rs` is the sole `#[derive(..., Error, ...)]` type
+/// in the crate and that every `CmdError` variant is constructed in non-test `src/` code.
+#[test]
+fn test_unified_cmd_error_architecture_gate() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut src_files = Vec::new();
+    collect_rs_files(&root.join("src"), &mut src_files);
+    src_files.sort();
+
+    let mut prod_sources: Vec<(PathBuf, String)> = Vec::new();
+    let mut error_derive_count = 0usize;
+
+    for path in &src_files {
+        let full = fs::read_to_string(path).unwrap_or_default();
+        let prod_part = full.split("#[cfg(test)]").next().unwrap_or("").to_owned();
+        for line in prod_part.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("#[derive(")
+                && trimmed
+                    .trim_start_matches("#[derive(")
+                    .trim_end_matches(")]")
+                    .split(',')
+                    .any(|item| item.trim() == "Error")
+            {
+                error_derive_count = error_derive_count.saturating_add(1);
+                assert!(
+                    path.ends_with("src/error.rs"),
+                    "Unexpected #[derive(..., Error)] outside src/error.rs in {}",
+                    path.display()
+                );
+            }
+        }
+        prod_sources.push((path.clone(), prod_part));
+    }
+
+    assert_eq!(
+        error_derive_count, 1,
+        "Expected exactly 1 #[derive(..., Error)] type (CmdError), found {error_derive_count}"
+    );
+
+    let err_prod = fs::read_to_string(root.join("src/error.rs"))
+        .unwrap_or_default()
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    let enum_after = err_prod.split("pub enum CmdError {").nth(1).unwrap_or("");
+    let enum_body = enum_after.split("\n}\n").next().unwrap_or("");
+
+    let mut variants = Vec::new();
+    for line in enum_body.lines() {
+        if let Some(after_indent) = line.strip_prefix("    ") {
+            let first_ch = after_indent.chars().next().unwrap_or(' ');
+            if first_ch.is_ascii_uppercase() {
+                let ident: String = after_indent
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !ident.is_empty() {
+                    variants.push(ident);
+                }
+            }
+        }
+    }
+    assert!(
+        !variants.is_empty(),
+        "Failed to parse CmdError variants from src/error.rs"
+    );
+
+    let mut unconstructed = Vec::new();
+    for var in &variants {
+        let cmd_pat = format!("CmdError::{var}");
+        let self_pat = format!("Self::{var}");
+        let from_wired = matches!(var.as_str(), "CliUsage" | "ExecutionLimitExceeded")
+            && prod_sources.iter().any(|(p, c)| {
+                !p.ends_with("src/error.rs")
+                    && ((var == "CliUsage" && c.contains("CliUsageFailure::new"))
+                        || (var == "ExecutionLimitExceeded" && c.contains("ExecutionLimitFailure")))
+            });
+        let constructed_in_prod = from_wired
+            || prod_sources.iter().any(|(p, c)| {
+                if p.ends_with("src/error.rs") {
+                    c.contains(&self_pat)
+                } else {
+                    c.contains(&cmd_pat)
+                }
+            });
+        if !constructed_in_prod {
+            unconstructed.push(var.clone());
+        }
+    }
+
+    assert_eq!(
+        unconstructed,
+        Vec::<String>::new(),
+        "Unconstructed CmdError variants in production code: {unconstructed:?}"
+    );
+}

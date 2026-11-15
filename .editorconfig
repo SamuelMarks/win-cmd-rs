@@ -1,0 +1,118 @@
+# EditorConfig is awesome: https://EditorConfig.org
+root = true
+
+# ==============================================================================
+# Default Settings for All Files
+# ==============================================================================
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+tab_width = 4
+
+# ==============================================================================
+# Rust Source Files
+# ==============================================================================
+[*.rs]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+# ==============================================================================
+# Windows Batch & CMD Scripts (Critical for win-cmd-rs)
+# ==============================================================================
+# cmd.exe scripts use CRLF line endings. Trailing whitespace can be significant
+# in batch files (e.g., `set VAR=value `, caret `^ ` escapes, or echo lines).
+[*.{bat,cmd,btm}]
+charset = utf-8
+end_of_line = crlf
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = false
+
+# Explicit LF test fixtures for parser line-ending tests
+[tests/fixtures/**/*.lf.{bat,cmd}]
+end_of_line = lf
+trim_trailing_whitespace = false
+
+# Raw/binary test fixtures — do not let editors alter line endings or whitespace
+[tests/fixtures/**/*.raw.{bat,cmd}]
+charset = unset
+end_of_line = unset
+insert_final_newline = false
+trim_trailing_whitespace = false
+
+# ==============================================================================
+# Other Windows Ecosystem Files
+# ==============================================================================
+[*.{ps1,psm1,psd1,vbs,reg,inf,ini,rc,def}]
+end_of_line = crlf
+indent_style = space
+indent_size = 4
+
+[*.{sln,vcxproj,props,targets}]
+charset = utf-8-bom
+end_of_line = crlf
+indent_style = space
+indent_size = 2
+
+# ==============================================================================
+# Configuration, Markup & Data Formats
+# ==============================================================================
+[*.{toml,yaml,yml,json,jsonc,json5,xml,html,htm,css,scss,svg}]
+indent_style = space
+indent_size = 2
+
+[Cargo.lock]
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+
+# ==============================================================================
+# Documentation
+# ==============================================================================
+[*.{md,markdown}]
+indent_style = space
+indent_size = 2
+# Preserve trailing double-spaces used for Markdown hard line breaks
+trim_trailing_whitespace = false
+
+[*.{txt,rst,adoc}]
+indent_style = space
+indent_size = 2
+
+# ==============================================================================
+# Shell, Python & Build Scripts
+# ==============================================================================
+[*.{sh,bash,zsh,fish}]
+end_of_line = lf
+indent_style = space
+indent_size = 2
+
+[*.py]
+end_of_line = lf
+indent_style = space
+indent_size = 4
+max_line_length = 88
+
+[{Makefile,*.mk,GNUmakefile}]
+end_of_line = lf
+indent_style = tab
+tab_width = 4
+
+[{CMakeLists.txt,*.cmake}]
+end_of_line = lf
+indent_style = space
+indent_size = 2
+
+# ==============================================================================
+# Snapshots, Fixtures & Patch Files
+# ==============================================================================
+[*.{snap,diff,patch}]
+insert_final_newline = false
+trim_trailing_whitespace = false

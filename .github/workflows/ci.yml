@@ -1,0 +1,425 @@
+name: CI
+
+"on":
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lint:
+    name: Lint, Format & Documentation Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Rust nightly toolchain (for rustdoc item coverage)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting (rustfmt)
+        run: cargo +stable fmt --all -- --check
+
+      - name: Run Clippy with all targets and strict lints
+        run: cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check Rustdoc (including private items)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --workspace --bins --lib --document-private-items --no-deps
+
+      - name: Run 100% doc-completeness & anti-pattern quality gates
+        run: cargo +stable test --test doc_and_quality_gates
+
+      - name: Enforce 100.0% nightly rustdoc item coverage
+        shell: python3 {0}
+        run: |
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          meta = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                  text=True,
+              )
+          )
+          doc_dir = pathlib.Path(meta["target_directory"]) / "doc"
+          for stale in ("win_cmd_rs.json", "wincmd.json", "wincheck.json"):
+              stale_path = doc_dir / stale
+              if stale_path.exists():
+                  stale_path.unlink()
+
+          env = {
+              **os.environ,
+              "RUSTDOCFLAGS": "-Z unstable-options --coverage --output-format json",
+          }
+          res = subprocess.run(
+              [
+                  "cargo",
+                  "+nightly",
+                  "doc",
+                  "--workspace",
+                  "--bins",
+                  "--lib",
+                  "--document-private-items",
+                  "--no-deps",
+              ],
+              env=env,
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          if res.returncode != 0:
+              sys.stderr.write(res.stderr)
+              sys.exit(res.returncode)
+
+          payloads = []
+          for crate_json in ("win_cmd_rs.json", "wincmd.json", "wincheck.json"):
+              json_path = doc_dir / crate_json
+              if json_path.is_file():
+                  payloads.append(json.loads(json_path.read_text(encoding="utf-8")))
+          for raw_line in res.stdout.splitlines():
+              raw_line = raw_line.strip()
+              if raw_line.startswith("{"):
+                  payloads.append(json.loads(raw_line))
+
+          total_items = 0
+          total_documented = 0
+          for data in payloads:
+              for file_stats in data.values():
+                  if isinstance(file_stats, dict):
+                      total_items += file_stats.get("total", 0)
+                      total_documented += file_stats.get("with_docs", 0)
+
+          pct = (total_documented / total_items * 100.0) if total_items else 0.0
+          print(f"Rustdoc coverage: {pct:.2f}% ({total_documented}/{total_items})")
+          if total_items == 0 or total_documented < total_items:
+              print(
+                  f"Documentation coverage {pct:.2f}% ({total_documented}/{total_items}) < 100.00%!",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+  test:
+    name: Test (${{ matrix.os }}, Rust ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            toolchain: stable
+            run_clippy: true
+          - os: macos-latest
+            toolchain: stable
+            run_clippy: true
+          - os: windows-latest
+            toolchain: stable
+            run_clippy: true
+          - os: ubuntu-latest
+            toolchain: "1.88"
+            run_clippy: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust ${{ matrix.toolchain }} toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: ${{ matrix.run_clippy && 'clippy' || '' }}
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run target Clippy checks
+        if: matrix.run_clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run unit, integration & property tests
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: Run documentation tests
+        run: cargo test --workspace --doc --all-features
+
+  coverage:
+    name: 100% Test Coverage Gate (fn / line / branch)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust nightly toolchain with llvm-tools
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Enforce 100.0% function, line, and branch coverage
+        shell: python3 {0}
+        run: |
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          res = subprocess.run(
+              [
+                  "cargo",
+                  "+nightly",
+                  "llvm-cov",
+                  "--branch",
+                  "--workspace",
+                  "--all-targets",
+                  "--json",
+                  "--summary-only",
+              ],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          if res.returncode != 0:
+              sys.stderr.write(res.stderr)
+              sys.exit(res.returncode)
+
+          payload = json.loads(res.stdout)
+          export = payload["data"][0]
+          totals = export["totals"]
+          fn_s = totals["functions"]
+          ln_s = totals["lines"]
+          br_s = totals["branches"]
+
+          root = pathlib.Path(".").resolve()
+          incomplete = []
+          for fobj in export.get("files", []):
+              fpath = pathlib.Path(fobj["filename"]).resolve()
+              try:
+                  rel = fpath.relative_to(root).as_posix()
+              except ValueError:
+                  continue
+              if rel.startswith("src/"):
+                  s = fobj["summary"]
+                  fc, fk = s["functions"]["covered"], s["functions"]["count"]
+                  lc, lk = s["lines"]["covered"], s["lines"]["count"]
+                  bc, bk = s["branches"]["covered"], s["branches"]["count"]
+                  if fc < fk or lc < lk or bc < bk:
+                      incomplete.append(
+                          f"  {rel}: functions={fc}/{fk}, lines={lc}/{lk}, branches={bc}/{bk}"
+                      )
+
+          print(
+              f"Coverage summary: functions={fn_s['covered']}/{fn_s['count']} "
+              f"({fn_s['percent']:.2f}%), lines={ln_s['covered']}/{ln_s['count']} "
+              f"({ln_s['percent']:.2f}%), branches={br_s['covered']}/{br_s['count']} "
+              f"({br_s['percent']:.2f}%)"
+          )
+          if (
+              incomplete
+              or fn_s["covered"] < fn_s["count"]
+              or ln_s["covered"] < ln_s["count"]
+              or br_s["covered"] < br_s["count"]
+          ):
+              print("Coverage below 100.00%!", file=sys.stderr)
+              for line in incomplete:
+                  print(line, file=sys.stderr)
+              sys.exit(1)
+
+  build-release:
+    name: Build Release (${{ matrix.target }})
+    needs:
+      - lint
+      - test
+      - coverage
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            apt_packages: musl-tools
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            apt_packages: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install cross-compilation packages (Linux)
+        if: matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt_packages }}
+
+      - name: Install Rust stable toolchain for ${{ matrix.target }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Configure cross-linker environment
+        if: matrix.linker_env != ''
+        shell: bash
+        run: echo "${{ matrix.linker_env }}" >> "$GITHUB_ENV"
+
+      - name: Build optimized release binaries (wincmd & wincheck)
+        run: cargo build --release --locked --bins --target ${{ matrix.target }}
+
+      - name: Package release archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          STAGE_NAME="win-cmd-rs-${TAG}-${TARGET}"
+          mkdir -p "dist/${STAGE_NAME}"
+          cp "target/${TARGET}/release/wincmd" "dist/${STAGE_NAME}/"
+          cp "target/${TARGET}/release/wincheck" "dist/${STAGE_NAME}/"
+          for doc in README.md USAGE.md LICENSE LICENSE-MIT LICENSE-APACHE; do
+            if [ -f "${doc}" ]; then
+              cp "${doc}" "dist/${STAGE_NAME}/"
+            fi
+          done
+          tar -C dist -czf "dist/${STAGE_NAME}.tar.gz" "${STAGE_NAME}"
+          rm -rf "dist/${STAGE_NAME}"
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${STAGE_NAME}.tar.gz" > "${STAGE_NAME}.tar.gz.sha256"
+            else
+              shasum -a 256 "${STAGE_NAME}.tar.gz" > "${STAGE_NAME}.tar.gz.sha256"
+            fi
+          )
+
+      - name: Package release archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $StageName = "win-cmd-rs-$env:TAG-$env:TARGET"
+          $StageDir = Join-Path "dist" $StageName
+          New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+          Copy-Item "target/$env:TARGET/release/wincmd.exe" -Destination $StageDir
+          Copy-Item "target/$env:TARGET/release/wincheck.exe" -Destination $StageDir
+          foreach ($Doc in @("README.md", "USAGE.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE")) {
+            if (Test-Path $Doc) {
+              Copy-Item $Doc -Destination $StageDir
+            }
+          }
+          $ZipPath = Join-Path "dist" "$StageName.zip"
+          Compress-Archive -Path $StageDir -DestinationPath $ZipPath -Force
+          Remove-Item -Recurse -Force $StageDir
+          $Hash = (Get-FileHash -Algorithm SHA256 $ZipPath).Hash.ToLowerInvariant()
+          "$Hash  $StageName.zip" | Set-Content -NoNewline:$false -Encoding ascii "$ZipPath.sha256"
+
+      - name: Upload release artifact (${{ matrix.target }})
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - lint
+      - test
+      - coverage
+      - build-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate combined SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 | sort -k 2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: win-cmd-rs ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/SHA256SUMS.txt

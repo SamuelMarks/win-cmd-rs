@@ -1,0 +1,265 @@
+# See https://pre-commit.com for more information
+# Install with: pip install pre-commit && pre-commit install
+minimum_pre_commit_version: "3.2.0"
+default_install_hook_types: [pre-commit]
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  - repo: local
+    hooks:
+      - id: doc-and-antipattern-gates
+        name: 100% documentation completeness & anti-pattern gate
+        language: system
+        entry: python3 -c
+        args:
+          - |
+            import pathlib, re, subprocess, sys
+
+            # Fast static anti-pattern check across Cargo.toml, src/**, and tests/**
+            root = pathlib.Path(".")
+            violations = []
+            cargo_toml = (root / "Cargo.toml").read_text(encoding="utf-8")
+            for idx, line in enumerate(cargo_toml.splitlines(), 1):
+                t = line.strip()
+                if not t.startswith("#") and '= "allow"' in t:
+                    violations.append(f"Cargo.toml:{idx}: blanket allow `{t}`")
+                for banned_dep in ("anyhow", "thiserror", "eyre", "snafu"):
+                    if t.startswith(banned_dep):
+                        violations.append(f"Cargo.toml:{idx}: banned crate `{banned_dep}`")
+
+            banned = (
+                "#[allow(",
+                "#![allow(",
+                "std::convert::identity",
+                "convert::identity",
+                "let _ = main()",
+                ".unwrap(",
+                ".expect(",
+                "panic!(",
+                "todo!(",
+                "unimplemented!(",
+                "unreachable!(",
+                "dbg!(",
+                "anyhow",
+                "thiserror",
+                "Box<dyn Error",
+                "Box<dyn std::error::Error",
+                "Box<dyn core::error::Error",
+            )
+            for p in sorted((root / "src").rglob("*.rs")) + sorted((root / "tests").rglob("*.rs")):
+                in_test = p.parts[0] == "tests"
+                for idx, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+                    t = line.strip()
+                    if t == "#[cfg(test)]":
+                        in_test = True
+                    if t.startswith("//"):
+                        continue
+                    scrubbed = re.sub(r'r(#*)"[\s\S]*?"\1|"(?:\\.|[^"\\])*"', '""', t)
+                    for needle in banned:
+                        if needle in scrubbed:
+                            violations.append(f"{p}:{idx}: banned `{needle}`")
+                    if in_test and scrubbed.startswith("let _ ="):
+                        violations.append(f"{p}:{idx}: assertion-free `let _ =` in test")
+
+            if violations:
+                for v in violations:
+                    print(v, file=sys.stderr)
+                sys.exit(1)
+
+            res = subprocess.run(
+                ["cargo", "test", "--test", "doc_and_quality_gates", "--quiet"],
+                check=False,
+            )
+            sys.exit(res.returncode)
+        files: (\.rs$|Cargo\.toml$)
+        pass_filenames: false
+
+      - id: cargo-fmt
+        name: cargo fmt
+        language: system
+        entry: bash -c 'exec cargo fmt --all -- --check'
+        files: \.rs$
+        pass_filenames: false
+
+      - id: cargo-clippy-and-rustdoc
+        name: cargo clippy & private-item rustdoc
+        language: system
+        entry: bash -c 'cargo clippy --workspace --all-targets -- -D warnings && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --bins --lib --document-private-items --no-deps'
+        files: (\.rs$|Cargo\.toml$|Cargo\.lock$)
+        pass_filenames: false
+
+      - id: update-doc-coverage-shield
+        name: enforce 100.0% rustdoc coverage & update README shield
+        language: system
+        entry: python3 -c
+        args:
+          - |
+            import json, os, pathlib, re, subprocess, sys
+
+            meta = json.loads(
+                subprocess.check_output(
+                    ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                    text=True,
+                )
+            )
+            doc_dir = pathlib.Path(meta["target_directory"]) / "doc"
+            for stale_json in ("win_cmd_rs.json", "wincmd.json", "wincheck.json"):
+                sp = doc_dir / stale_json
+                if sp.exists():
+                    sp.unlink()
+
+            env = {
+                **os.environ,
+                "RUSTDOCFLAGS": "-Z unstable-options --coverage --output-format json",
+            }
+            res = subprocess.run(
+                ["cargo", "+nightly", "doc", "--workspace", "--bins", "--lib", "--document-private-items", "--no-deps", "--quiet"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                sys.stderr.write(res.stderr)
+                sys.exit(res.returncode)
+
+            payloads = []
+            for crate_json in ("win_cmd_rs.json", "wincmd.json", "wincheck.json"):
+                jp = doc_dir / crate_json
+                if jp.is_file():
+                    payloads.append(json.loads(jp.read_text(encoding="utf-8")))
+            for raw_line in res.stdout.splitlines():
+                raw_line = raw_line.strip()
+                if raw_line.startswith("{"):
+                    payloads.append(json.loads(raw_line))
+
+            total_items = 0
+            total_documented = 0
+            for data in payloads:
+                for file_stats in data.values():
+                    if isinstance(file_stats, dict):
+                        total_items += file_stats.get("total", 0)
+                        total_documented += file_stats.get("with_docs", 0)
+            if total_items == 0:
+                print("Rustdoc coverage emitted zero JSON items!", file=sys.stderr)
+                sys.exit(1)
+
+            pct = (total_documented / total_items * 100.0) if total_items else 100.0
+            if total_documented < total_items:
+                print(
+                    f"Documentation coverage {pct:.2f}% ({total_documented}/{total_items}) < 100.00%!",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            badge = "![doc coverage](https://img.shields.io/badge/doc%20coverage-100.0%25-brightgreen)"
+            readme = pathlib.Path("README.md")
+            text = readme.read_text(encoding="utf-8")
+            linked_pattern = re.compile(
+                r"\[!\[doc(?:umentation)?[ _-]coverage\]\(https://img\.shields\.io/badge/[^\)]+\)\]\([^\)]+\)",
+                re.IGNORECASE,
+            )
+            if linked_pattern.search(text):
+                new_text = linked_pattern.sub(f"[{badge}](https://docs.rs/win-cmd-rs)", text, count=1)
+                if new_text != text:
+                    readme.write_text(new_text, encoding="utf-8")
+        files: (\.rs$|Cargo\.toml$|README\.md$)
+        pass_filenames: false
+
+      - id: update-test-coverage-shield
+        name: enforce 100.0% fn/line/branch test coverage & update README shield
+        language: system
+        entry: python3 -c
+        args:
+          - |
+            import json, pathlib, re, subprocess, sys
+
+            res = subprocess.run(
+                [
+                    "cargo",
+                    "+nightly",
+                    "llvm-cov",
+                    "--branch",
+                    "--workspace",
+                    "--all-targets",
+                    "--json",
+                    "--summary-only",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                sys.stderr.write(res.stderr)
+                sys.exit(res.returncode)
+
+            payload = json.loads(res.stdout)
+            export = payload["data"][0]
+            totals = export["totals"]
+            fn_s = totals["functions"]
+            ln_s = totals["lines"]
+            br_s = totals["branches"]
+
+            root = pathlib.Path(".").resolve()
+            incomplete = []
+            for fobj in export.get("files", []):
+                fpath = pathlib.Path(fobj["filename"]).resolve()
+                try:
+                    rel = fpath.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                if rel.startswith("src/"):
+                    s = fobj["summary"]
+                    fc, fk = s["functions"]["covered"], s["functions"]["count"]
+                    lc, lk = s["lines"]["covered"], s["lines"]["count"]
+                    bc, bk = s["branches"]["covered"], s["branches"]["count"]
+                    if fc < fk or lc < lk or bc < bk:
+                        incomplete.append(
+                            f"  {rel}: functions={fc}/{fk}, lines={lc}/{lk}, branches={bc}/{bk}"
+                        )
+
+            pct = ln_s["percent"]
+            badge = f"![test coverage](https://img.shields.io/badge/test%20coverage-{pct:.1f}%25-brightgreen)"
+            readme = pathlib.Path("README.md")
+            rtext = readme.read_text(encoding="utf-8")
+            linked_pat = re.compile(
+                r"\[!\[(?:test[ _-])?coverage\]\(https://img\.shields\.io/badge/(?:test%20)?coverage-[^\)]+\)\]\(([^\)]+)\)",
+                re.IGNORECASE,
+            )
+            if linked_pat.search(rtext):
+                new_rtext = linked_pat.sub(lambda m: f"[{badge}]({m.group(1)})", rtext, count=1)
+                if new_rtext != rtext:
+                    readme.write_text(new_rtext, encoding="utf-8")
+
+            if (
+                incomplete
+                or fn_s["covered"] < fn_s["count"]
+                or ln_s["covered"] < ln_s["count"]
+                or br_s["covered"] < br_s["count"]
+            ):
+                print(
+                    f"Coverage below 100.00%: functions={fn_s['covered']}/{fn_s['count']}, "
+                    f"lines={ln_s['covered']}/{ln_s['count']}, branches={br_s['covered']}/{br_s['count']}",
+                    file=sys.stderr,
+                )
+                for line in incomplete:
+                    print(line, file=sys.stderr)
+                sys.exit(1)
+        files: (\.rs$|Cargo\.toml$|Cargo\.lock$|README\.md$)
+        pass_filenames: false
