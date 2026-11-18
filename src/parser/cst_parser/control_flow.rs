@@ -1,5 +1,11 @@
 //! Compound `( ... )` block, `IF` conditional, and `FOR` loop rules for the lossless CST parser.
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::error::{PegExpected, ProbableMisuseKind};
 use crate::parser::cst::{CstElement, CstNode, CstToken, SyntaxKind};
 use crate::parser::lexer::{
@@ -562,7 +568,7 @@ fn try_parse_parenthesized_if_else(
             SyntaxKind::ErrorNode,
             input.source_id,
             fallback_offset,
-            std::mem::take(children),
+            core::mem::take(children),
         ));
     }
 
@@ -586,7 +592,7 @@ fn try_parse_parenthesized_if_else(
         kind,
         input.source_id,
         fallback_offset,
-        std::mem::take(children),
+        core::mem::take(children),
     ))
 }
 

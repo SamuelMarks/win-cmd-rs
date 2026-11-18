@@ -1,6 +1,6 @@
 # `win-cmd-rs` Usage Guide
 
-This guide covers day-to-day usage of the **`wincmd`** cross-platform Windows Command Prompt (`cmd.exe`) interpreter, the **`wincheck`** static analyzer and CST auto-fixer, CI/editor integrations, and embedding **`win_cmd_rs`** as a safe Rust library.
+This guide covers day-to-day usage of the **`wincmd` (`WINCMD.EXE`)** cross-platform Windows Command Prompt (`cmd.exe`) and MS-DOS (`COMMAND.COM`) interpreter, the **`wincheck` (`WINCHECK.EXE`)** static analyzer and CST auto-fixer, CI/editor integrations, and embedding **`win_cmd_rs`** as a `#![no_std]` + `alloc` or `std` safe Rust library.
 
 ---
 
@@ -13,7 +13,8 @@ This guide covers day-to-day usage of the **`wincmd`** cross-platform Windows Co
    - [Filesystem Sandboxing (`--hermetic` & `--host-root`)](#23-filesystem-sandboxing---hermetic----host-root)
    - [Interactive REPL, `PROMPT` Codes & `DOSKEY`](#24-interactive-repl-prompt-codes--doskey)
    - [Exit Codes](#25-exit-codes)
-3. [Batch Scripting Cookbook (`cmd.exe` Semantics)](#3-batch-scripting-cookbook-cmdexe-semantics)
+   - [MS-DOS `COMMAND.COM` Dialect (`--dialect dos622`, `/P`, `/E:nnnnn`)](#26-ms-dos-commandcom-dialect---dialect-dos622-p-ennnnn)
+3. [Batch Scripting Cookbook (`cmd.exe` & `COMMAND.COM` Semantics)](#3-batch-scripting-cookbook-cmdexe--commandcom-semantics)
    - [Variables, Delayed Expansion (`!VAR!`) & Slicing](#31-variables-delayed-expansion-var--slicing)
    - [Parameters (`%0`–`%9`, `%*`) & `%~` Path Modifiers](#32-parameters-09---path-modifiers)
    - [Control Flow (`IF`, `FOR`, `CALL :label`, `GOTO :EOF`)](#33-control-flow-if-for-call-label-goto-eof)
@@ -21,19 +22,21 @@ This guide covers day-to-day usage of the **`wincmd`** cross-platform Windows Co
    - [Redirections, Reserved DOS Devices & Pipelines](#35-redirections-reserved-dos-devices--pipelines)
    - [Registry (`REG`), `ASSOC`, `FTYPE` & `AutoRun`](#36-registry-reg-assoc-ftype--autorun)
    - [Built-In Commands & Cross-Platform Utility Shims Reference](#37-built-in-commands--cross-platform-utility-shims-reference)
+   - [MS-DOS Commands (`TRUENAME`, `CTTY`, `LH`, `MEM`, DOS `CHOICE`)](#38-ms-dos-commands-truename-ctty-lh-mem-dos-choice)
 4. [`wincheck` Static Linter & Auto-Fixer Guide](#4-wincheck-static-linter--auto-fixer-guide)
    - [CLI Options & Exit Codes](#41-cli-options--exit-codes)
    - [Output Formats (`tty`, `gcc`, `json`, `sarif`)](#42-output-formats-tty-gcc-json-sarif)
-   - [Previewing & Applying Fixes (`--diff`, `--fix`, `--unsafe-fixes`)](#43-previewing--applying-fixes---diff---fix---unsafe-fixes)
-   - [Dialect Checking & Conversion (`--mode batch` vs `--mode repl`)](#44-dialect-checking--conversion---mode-batch-vs---mode-repl)
+   - [Previewing & Applying Fixes (`--diff`, `--fix`, `--in-place`, `--unsafe-fixes`)](#43-previewing--applying-fixes---diff---fix---in-place---unsafe-fixes)
+   - [Dialect Checking & MS-DOS Portability (`--mode` & `--dialect dos622`)](#44-dialect-checking--ms-dos-portability---mode----dialect-dos622)
    - [Inline Suppression Directives](#45-inline-suppression-directives)
    - [CI/CD & Editor Integrations](#46-cicd--editor-integrations)
-5. [Embedding `win_cmd_rs` in Rust](#5-embedding-win_cmd_rs-in-rust)
+5. [Embedding `win_cmd_rs` in Rust (`std` & `#![no_std]` + `alloc`)](#5-embedding-win_cmd_rs-in-rust-std--no_std--alloc)
    - [Hermetic Execution & Safety Budgets (`ExecutionLimits`)](#51-hermetic-execution--safety-budgets-executionlimits)
    - [Mounting Host Directories (`HostOsVfs`)](#52-mounting-host-directories-hostosvfs)
    - [Mocking External Binaries (`MockProcessSpawner`)](#53-mocking-external-binaries-mockprocessspawner)
    - [Pre-Populating Environment & Windows Registry State](#54-pre-populating-environment--windows-registry-state)
    - [Lossless CST Parsing, AST Lowering & Programmatic Linting](#55-lossless-cst-parsing-ast-lowering--programmatic-linting)
+   - [`#![no_std]` + `alloc` & MS-DOS `DosKernelApi` Embedding](#56-no_std--alloc--ms-dos-doskernelapi-embedding)
 
 ---
 
@@ -74,8 +77,9 @@ wincheck --fix scripts/deploy.bat > scripts/deploy.fixed.bat
 ### 2.1 Command-Line Switches & VFS Modes
 
 ```text
-WINCMD [/A | /U] [/Q] [/D] [/E:ON | /E:OFF] [/F:ON | /F:OFF] [/V:ON | /V:OFF]
-       [/T:bf] [--in-memory | --hermetic | --host-native | --host-root <dir>]
+WINCMD [drive:\path] [/A | /U] [/Q] [/D] [/P] [/MSG] [/E:ON | /E:OFF | /E:nnnnn]
+       [/F:ON | /F:OFF] [/V:ON | /V:OFF] [/T:bf] [--dialect <cmd|dos622|freedos>]
+       [--in-memory | --hermetic | --host-native | --host-root <dir>]
        [[/S] [/C | /K] string] [--script <file> [args...]]
 ```
 
@@ -88,10 +92,15 @@ WINCMD [/A | /U] [/Q] [/D] [/E:ON | /E:OFF] [/F:ON | /F:OFF] [/V:ON | /V:OFF]
 | `/D` | Skips `HKLM` and `HKCU` `Software\Microsoft\Command Processor\AutoRun` commands. | Run `AutoRun` |
 | `/A` | Encodes redirected file and pipe output using the active ANSI/OEM codepage. | `/A` |
 | `/U` | Encodes redirected file and pipe output as UTF-16LE (`CodePage::Utf16Le`). | `/A` |
-| `/E:ON` \| `/E:OFF` | Enables or disables Command Extensions (`SET /A`, `SET /P`, `FOR /F`, `CALL :label`, `%~dp0`, etc.). | `/E:ON` |
+| `/E:ON` \| `/E:OFF` | Enables or disables Command Extensions (`SET /A`, `SET /P`, `FOR /F`, `CALL :label`, `%~dp0`, etc.). | `/E:ON` (`cmd`/`freedos`), `/E:OFF` (`dos622`) |
+| `/E:nnnnn` | Configures MS-DOS `COMMAND.COM` environment size budget in bytes (`160..=32768`). | Unbounded / DPMI 32 KiB |
+| `/P` | Permanent primary shell (`COMMAND.COM /P`): runs `C:\AUTOEXEC.BAT` on startup if present and ignores top-level `EXIT`. | Transient |
+| `/MSG` | Enables extended DOS resident error messages (`COMMAND.COM /MSG` compatibility). | Off |
+| `[drive:\path]` | Positional `COMMAND.COM` startup command directory setting `%COMSPEC%` (e.g., `wincmd C:\DOS /P`). | — |
 | `/V:ON` \| `/V:OFF` | Enables or disables `!VAR!` Delayed Environment Variable Expansion. | `/V:OFF` |
 | `/F:ON` \| `/F:OFF` | Enables or disables interactive file and directory completion mode. | `/F:ON` |
 | `/T:bf` | Sets initial background (`b`) and foreground (`f`) hex color nibbles (e.g., `/T:1F`; error if `b == f`). | None |
+| `--dialect <DIALECT>` | Selects compatibility dialect: `cmd` (Windows NT `cmd.exe`), `dos622` (MS-DOS 6.22), or `freedos`. | `cmd` (host), `dos622`/`freedos` (DOS) |
 | `--host-native` | Mounts the host OS filesystem via `HostOsVfs::from_host_env()` and imports host env vars. | Binary default |
 | `--host-root <dir>` | Mounts host `<dir>` as `C:\` with strict symlink sandbox containment (`SandboxContainment::Contained`). | — |
 | `--in-memory`, `--hermetic` | Uses an isolated in-memory `InMemoryVfs` (`C:\`, `C:\Windows\System32`, `C:\Temp`) with zero host disk I/O. | — |
@@ -155,9 +164,26 @@ Launch an interactive session with `wincmd` (or `wincmd /K "title Build Shell"`)
 - **`0`**: Command or script completed with `ERRORLEVEL 0` (or `/?`, `--help`, `--version`).
 - **`1`–`255`**: Propagates the low byte of the final `ExitCode` (`EXIT /B <code>`, `EXIT <code>`, external process status, or `CmdError::exit_code()`, such as `9009` for unknown command).
 
+### 2.6 MS-DOS `COMMAND.COM` Dialect (`--dialect dos622`, `/P`, `/E:nnnnn`)
+
+Passing `--dialect dos622` (or `--dialect freedos`) switches `wincmd` into MS-DOS `COMMAND.COM` compatibility mode:
+- **`--dialect dos622`**: Defaults `ExtensionsMode` to `/E:OFF` (unless explicitly overridden with `/E:ON`), sets default OEM codepage to `437` (`CodePage::OemUnitedStates`) or `DosKernelApi::active_codepage()`, sets `%PATHEXT%` to `.COM;.EXE;.BAT`, and formats `VER` as `MS-DOS Version 6.22`.
+- **`--dialect freedos`**: Enables FreeCOM-compatible extensions while reporting `FreeDOS` version formatting and DOS path/device semantics.
+- **`/P` (Permanent Primary Shell)**: Executes `C:\AUTOEXEC.BAT` automatically on startup if present and ignores top-level `EXIT` commands so the primary DOS shell never terminates accidentally.
+- **`/E:nnnnn` (`160..=32768`)**: Enforces an exact MS-DOS environment block byte budget (`Out of environment space` when exceeded).
+- **Positional Command Directory (`WINCMD C:\DOS /P`)**: Sets `%COMSPEC%` to `C:\DOS\COMMAND.COM` matching `SHELL=C:\DOS\COMMAND.COM C:\DOS /E:1024 /P` in `CONFIG.SYS`.
+
+```bash
+# Run a legacy MS-DOS 6.22 batch script with strict 1024-byte environment budget
+wincmd --dialect dos622 /E:1024 LEGACY.BAT
+
+# Simulate booting a primary MS-DOS shell running C:\AUTOEXEC.BAT
+wincmd C:\DOS --dialect dos622 /E:2048 /P
+```
+
 ---
 
-## 3. Batch Scripting Cookbook (`cmd.exe` Semantics)
+## 3. Batch Scripting Cookbook (`cmd.exe` & `COMMAND.COM` Semantics)
 
 ### 3.1 Variables, Delayed Expansion (`!VAR!`) & Slicing
 
@@ -282,10 +308,33 @@ Modifying `HKCU\Software\Microsoft\Command Processor` (`DelayedExpansion`, `Enab
 ### 3.7 Built-In Commands & Cross-Platform Utility Shims Reference
 
 - **Environment**: `SET`, `SETLOCAL`, `ENDLOCAL`, `PATH`, `PROMPT`, `ASSOC`, `FTYPE`
-- **Control Flow**: `IF`, `FOR`, `CALL`, `GOTO`, `SHIFT`, `EXIT`, `PAUSE`, `START`, `CMD`
-- **Filesystem**: `DIR`, `CD` / `CHDIR`, `MD` / `MKDIR`, `RD` / `RMDIR`, `PUSHD`, `POPD`, `COPY`, `DEL` / `ERASE`, `REN` / `RENAME`, `MOVE`, `TYPE`, `MKLINK`, `<Drive>:`
-- **Console**: `ECHO`, `REM`, `CLS`, `COLOR`, `TITLE`, `CHCP`, `MODE`, `VER`, `VOL`, `DATE`, `TIME`, `VERIFY`, `DOSKEY`
-- **Utility Shims**: `REG`, `WHERE`, `FIND`, `FINDSTR`, `SORT`, `MORE`, `FC`, `COMP`, `TREE`, `XCOPY`, `ROBOCOPY`, `ATTRIB`, `CHOICE`, `TIMEOUT`, `HOSTNAME`, `WHOAMI`
+- **Control Flow**: `IF`, `FOR`, `CALL`, `GOTO`, `SHIFT`, `EXIT`, `PAUSE`, `START`, `CMD`, `LH` / `LOADHIGH`
+- **Filesystem**: `DIR`, `CD` / `CHDIR`, `MD` / `MKDIR`, `RD` / `RMDIR`, `PUSHD`, `POPD`, `COPY`, `DEL` / `ERASE`, `REN` / `RENAME`, `MOVE`, `TYPE`, `TRUENAME`, `MKLINK`, `<Drive>:`
+- **Console**: `ECHO`, `REM`, `CLS`, `COLOR`, `TITLE`, `CHCP`, `CTTY`, `MODE`, `VER`, `VOL`, `DATE`, `TIME`, `VERIFY`, `DOSKEY`
+- **Utility Shims**: `MEM`, `REG`, `WHERE`, `FIND`, `FINDSTR`, `SORT`, `MORE`, `FC`, `COMP`, `TREE`, `XCOPY`, `ROBOCOPY`, `ATTRIB`, `CHOICE`, `TIMEOUT`, `HOSTNAME`, `WHOAMI`
+
+### 3.8 MS-DOS Commands (`TRUENAME`, `CTTY`, `LH`, `MEM`, DOS `CHOICE`)
+
+```bat
+REM Resolve canonical 8.3 or LFN drive:\path via VFS / INT 21h AH=60h
+truename .\SUBDIR\..\README.TXT
+
+REM Inspect conventional 640 KiB and extended XMS/DPMI memory (/C, /D, /F, /M, /P)
+mem /C
+
+REM Load TSR/command with UMB region switches stripped transparently under 32-bit DPMI
+lh /L:1,16384 doskey
+
+REM Classic MS-DOS 6.x CHOICE syntax (/C[:]keys, /S case-sensitive, /T[:]default,seconds)
+choice /C:YN /S /T:Y,5 Continue installation
+
+REM Redirect interactive console I/O to serial port COM1 (and restore to CON)
+ctty COM1
+echo Running headless over RS-232 serial
+ctty CON
+```
+
+In addition, `DEL <directory>` prompts `All files in directory will be deleted! Are you sure (Y/N)?` unless `/Q` is specified, matching both `COMMAND.COM` and `cmd.exe`.
 
 ---
 
@@ -301,16 +350,17 @@ wincheck [OPTIONS] <FILES...>
 | :--- | :--- |
 | `<FILES...>` | One or more `.bat` / `.cmd` file paths, or `-` to read from `stdin`. |
 | `-f, --format <FMT>` | Diagnostic output format: `tty` (default), `gcc`, `json`, or `sarif`. |
-| `-m, --mode <batch\|repl>` | Dialect mode: `batch` (`.bat`/`.cmd`, default) or `repl` (interactive `cmd /C` / REPL). |
+| `-m, --mode <batch\|repl>` | Execution context: `batch` (`.bat`/`.cmd`, default) or `repl` (interactive `cmd /C` / REPL). |
+| `--dialect <cmd\|dos622\|freedos>` | Target shell dialect: `cmd` (default), `dos622` (enables `CMD5001`–`CMD5010` MS-DOS checks), or `freedos`. |
 | `-S, --severity <SEV>` | Minimum severity threshold: `error`, `warning`, `info`, or `style` (default: `style`). |
-| `-i, --include <RULES>` | Comma-separated allowlist of rule IDs (e.g., `CMD2001,CMD3007,CMD4004`). |
+| `-i, --include <RULES>` | Comma-separated allowlist of rule IDs (e.g., `CMD2001,CMD3007,CMD5001`). |
 | `-e, --exclude <RULES>` | Comma-separated blocklist of rule IDs (e.g., `CMD1009,CMD4006`). |
 | `--explain <CMDxxxx>` | Displays full Markdown explanation, rationale, and bad/good examples for `<CMDxxxx>`. |
-| `--list-rules` | Prints the full 50-rule catalog (`CMD0001`–`CMD4010`) with severities and summaries. |
+| `--list-rules` | Prints the full 60-rule catalog (`CMD0001`–`CMD5010`) with severities and summaries. |
 | `--diff` | Generates a Myers/LCS unified diff of CST auto-fixes without modifying files on disk. |
 | `--fix, --stdout` | Writes the CST-rewritten script for a single file (or `-` stdin) to `stdout` preserving BOM/encoding and re-lints. |
-| `--in-place` | Writes CST-rewritten scripts back to disk in place preserving BOM/encoding (required when fixing multiple files). |
-| `--encoding <ENC>` | Fallback input encoding when no BOM is present: `utf8` (default), `ascii`, `cp437`, `cp850`, `cp1252`, `utf16le`, `utf16be`. |
+| `--in-place` | Writes CST-rewritten scripts back to disk in place via the active VFS preserving BOM/encoding. |
+| `--encoding <ENC>` | Fallback input encoding when no BOM is present: `utf8` (default), `ascii`, `cp437`, `cp850`, `cp852`, `cp865`, `cp866`, `cp1252`, `utf16le`, `utf16be`. |
 | `--unsafe-fixes` | Enables opt-in behavior-altering rewrites (`FixApplicability::UnsafeOptIn`) during `--fix` / `--in-place` / `--diff`. |
 | `-h, --help, /?` | Prints CLI help and exits `0`. |
 | `-V, --version` | Prints `wincheck` version and exits `0`. |
@@ -369,7 +419,7 @@ wincheck --fix script.bat > script.bat.tmp && mv script.bat.tmp script.bat
 wincheck --diff --unsafe-fixes script.bat
 ```
 
-### 4.4 Dialect Checking & Conversion (`--mode batch` vs `--mode repl`)
+### 4.4 Dialect Checking & MS-DOS Portability (`--mode` & `--dialect dos622`)
 
 Batch files require doubled `%%I` for `FOR` variables and `100%%` for literal percents, whereas interactive `cmd.exe /C` strings and REPL commands require single `%I` and `100%`:
 
@@ -379,6 +429,29 @@ printf 'for %%i in (*.txt) do echo %%i\r\n' | wincheck --mode repl -
 
 # Automatically convert a .bat snippet into an interactive REPL / `cmd /C` command
 wincheck --mode repl --fix snippet.bat
+```
+
+To statically audit `.BAT` scripts for real **MS-DOS 6.22 `COMMAND.COM`** compatibility, pass `--dialect dos622` (activating rules `CMD5001`–`CMD5010`):
+- **`CMD5001`**: Flags `SET /A` arithmetic and `SET /P` interactive prompts.
+- **`CMD5002`**: Flags `FOR /F`, `FOR /L`, `FOR /R`, and `FOR /D` extended loop switches.
+- **`CMD5003`**: Flags `IF /I`, `IF DEFINED`, `IF CMDEXTVERSION`, `EQU`–`GEQ`, and `ELSE`.
+- **`CMD5004`**: Flags `( ... )` parenthesized blocks and `&` / `&&` / `||` chains (auto-splits unconditional `&` chains into separate physical lines with `--fix`).
+- **`CMD5005`**: Flags `!VAR!` delayed expansion, `%VAR:~s,l%` slicing, `%VAR:a=b%` replacement, `%*`, and `%~dpnx1` modifiers.
+- **`CMD5006`**: Flags `CALL :label`, implicit `GOTO :EOF`, and `EXIT /B` (auto-rewrites `GOTO :EOF` to `GOTO EOF` and appends `:EOF` at end-of-file with `--fix`).
+- **`CMD5007`**: Flags NT-only built-ins (`SETLOCAL`, `ENDLOCAL`, `PUSHD`, `POPD`, `ASSOC`, `FTYPE`, `MKLINK`).
+- **`CMD5008`**: Flags numeric file-descriptor redirections (`2>`, `2>&1`, `1>&2`).
+- **`CMD5009`**: Flags non-8.3 path segments and `.cmd` extensions.
+- **`CMD5010`**: Flags external command invocations exceeding the 126-byte MS-DOS `PSP:0x80` tail limit.
+
+```bash
+# Audit an installer script for strict MS-DOS 6.22 COMMAND.COM compatibility in CP437
+wincheck --dialect dos622 --encoding cp437 INSTALL.BAT
+
+# Auto-fix `&` command chains and `GOTO :EOF` for MS-DOS 6.22 in place
+wincheck --dialect dos622 --fix --in-place INSTALL.BAT
+
+# Read detailed guidance for any DOS portability rule
+wincheck --explain CMD5006
 ```
 
 ### 4.5 Inline Suppression Directives
@@ -428,13 +501,15 @@ autocmd FileType dosbatch setlocal errorformat=%f:%l:%c:\ %t%*[^:]:\ %m
 
 ---
 
-## 5. Embedding `win_cmd_rs` in Rust
+## 5. Embedding `win_cmd_rs` in Rust (`std` & `#![no_std]` + `alloc`)
 
-Add `win-cmd-rs` to your `Cargo.toml`:
+Add `win-cmd-rs` to your `Cargo.toml` (disable default features when targeting `#![no_std]` + `alloc`):
 
 ```toml
 [dependencies]
-win-cmd-rs = "0.1.0"
+win-cmd-rs = "0.0.1"
+# For `#![no_std]` + `alloc` targets:
+# win-cmd-rs = { version = "0.0.1", default-features = false }
 ```
 
 ### 5.1 Hermetic Execution & Safety Budgets (`ExecutionLimits`)
@@ -591,4 +666,61 @@ fn analyze_and_fix(raw: &[u8]) -> Result<String, CmdError> {
 
 let diff = analyze_and_fix(b"@echo off\r\nset FOO = 1\r\n");
 assert!(diff.is_ok_and(|d| d.contains(r#"set "FOO=1""#)));
+```
+
+### 5.6 `#![no_std]` + `alloc` & MS-DOS `DosKernelApi` Embedding
+
+With `default-features = false`, the entire `win_cmd_rs` core compiles without `std` (`#![no_std]` + `extern crate alloc`, `#![forbid(unsafe_code)]`). You can drive both `wincmd` (`Interpreter::with_dos_kernel`) and `wincheck` (`execute_wincheck_over_vfs_streams`) over `SimulatedDosKernel` or a custom hardware `DosKernelApi`:
+
+```rust
+use win_cmd_rs::cli::execute_wincheck_over_vfs_streams;
+use win_cmd_rs::dos::{SimChildProgram, SimulatedDosKernel};
+use win_cmd_rs::error::CmdError;
+use win_cmd_rs::runtime::{InMemoryByteReader, Interpreter, IoStreams};
+use win_cmd_rs::types::{ExitCode, MemoryProfile, ShellDialect};
+use win_cmd_rs::vfs::{DosFatVfs, VirtualFileSystem};
+
+fn run_dos_pipeline_and_linter() -> Result<(), CmdError> {
+    let mut sim = SimulatedDosKernel::new();
+    // Register a simulated 16-bit DOS `.COM` tool reading redirected stdin spool bytes
+    sim.register_child_program(
+        r"C:\UPPER.COM",
+        SimChildProgram::UppercaseFilter {
+            exit_code: ExitCode::SUCCESS,
+        },
+    );
+
+    let (mut interp, _shared) = Interpreter::with_dos_kernel(sim);
+    interp.apply_memory_profile(MemoryProfile::DosCompact4MiB);
+    interp.apply_shell_dialect(ShellDialect::MsDos622);
+    interp.proc_env.vfs.write_bytes(r"C:\UPPER.COM", b"\xC3")?;
+
+    // Single-tasking `%TEMP%` spooled pipeline (`echo hello | C:\UPPER.COM`)
+    let mut io = IoStreams::new();
+    let rc = interp.execute_interactive_line(r"echo hello| C:\UPPER.COM", &mut io);
+    assert_eq!(rc, ExitCode::SUCCESS);
+    assert_eq!(io.stdout, "HELLO\r\n");
+
+    // Run `wincheck --dialect dos622 --fix --in-place` directly over `DosFatVfs`
+    let mut vfs = DosFatVfs::new(SimulatedDosKernel::new());
+    vfs.write_bytes(r"C:\AUTO.BAT", b"@echo off\r\ngoto :EOF\r\n")?;
+    let args = vec![
+        "--dialect".to_owned(),
+        "dos622".to_owned(),
+        "--fix".to_owned(),
+        "--in-place".to_owned(),
+        r"C:\AUTO.BAT".to_owned(),
+    ];
+    let mut empty_stdin = InMemoryByteReader::new(Vec::new());
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let lint_rc =
+        execute_wincheck_over_vfs_streams(&args, &mut vfs, &mut empty_stdin, &mut out, &mut err);
+    assert_eq!(lint_rc, 0);
+    let fixed = vfs.read_bytes(r"C:\AUTO.BAT")?;
+    assert!(fixed.ends_with(b":EOF\r\n"));
+    Ok(())
+}
+
+assert!(run_dos_pipeline_and_linter().is_ok());
 ```

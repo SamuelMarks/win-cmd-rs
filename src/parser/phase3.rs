@@ -4,6 +4,9 @@
 //! interactive mode), Phase 3 expands active `FOR` loop variables and their `%~` modifiers
 //! immediately before command execution.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::error::CmdError;
 use crate::parser::modifiers::{ParameterModifiers, parse_dollar_env_modifier};
 use crate::parser::phase1::push_expanded_text;

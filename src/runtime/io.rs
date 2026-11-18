@@ -7,19 +7,29 @@
 //! - [`RedirectedIo`]: Per-command / per-block handle redirection overlay (`<`, `>`, `>>`, `n>&m`).
 //! - [`ProcessSpawner`], [`HostProcessSpawner`], and [`MockProcessSpawner`]: Deadlock-free process execution.
 
-use std::collections::BTreeMap;
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+#[cfg(feature = "std")]
+use alloc::string::ToString;
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
 use std::ffi::OsString;
+#[cfg(feature = "std")]
 use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+#[cfg(feature = "std")]
 use std::process::{Command, Stdio};
 
 use crate::error::CmdError;
 use crate::reader::encoding::{
     decode_script_bytes, encode_codepage_bytes, encode_output_bytes_with_codepage,
 };
+#[cfg(feature = "std")]
+use crate::types::IoErrorKind;
 use crate::types::{
-    CR_CHAR, CodePage, ExitCode, LF_CHAR, OutputUnicodeMode, ProcessPriority, StartEnvMode,
-    StartWindowMode, WaitMode,
+    CR_CHAR, CodePage, ExitCode, LF_CHAR, NativeBackingPath, OutputUnicodeMode, ProcessPriority,
+    StartEnvMode, StartWindowMode, WaitMode,
 };
 use crate::vfs::path::WindowsPath;
 
@@ -28,16 +38,16 @@ use crate::vfs::path::WindowsPath;
 pub struct ExternalSpawnRequest {
     /// Resolved executable VFS path.
     pub program_vfs_path: WindowsPath,
-    /// Optional resolved host path (when running against [`crate::vfs::HostOsVfs`]).
-    pub program_host_path: Option<PathBuf>,
+    /// Optional resolved native backing path (when running against [`crate::vfs::HostOsVfs`] or `DosFatVfs`).
+    pub program_host_path: Option<NativeBackingPath>,
     /// Tokenized command-line arguments (unquoted).
     pub args: Vec<String>,
     /// Raw unexpanded/expanded command-line tail.
     pub raw_tail: String,
     /// Active working directory on the VFS.
     pub cwd_vfs: WindowsPath,
-    /// Optional host working directory.
-    pub cwd_host: Option<PathBuf>,
+    /// Optional native working directory.
+    pub cwd_host: Option<NativeBackingPath>,
     /// Visible environment variables (`(key, value)`).
     pub env_vars: Vec<(String, String)>,
     /// Standard input text piped to the process.
@@ -65,8 +75,8 @@ pub struct ExternalSpawnResult {
     pub stderr: String,
 }
 
-/// Trait abstracting external OS process creation (`CreateProcessW` / `std::process::Command`).
-pub trait ProcessSpawner: std::fmt::Debug + Send + Sync {
+/// Trait abstracting external OS process creation (`CreateProcessW` / `std::process::Command` / DOS `INT 21h AH=4Bh`).
+pub trait ProcessSpawner: core::fmt::Debug {
     /// Spawns an external executable and waits for completion.
     ///
     /// # Arguments
@@ -96,12 +106,13 @@ pub trait ProcessSpawner: std::fmt::Debug + Send + Sync {
 /// * `err` - Underlying OS [`std::io::Error`].
 ///
 /// # Returns
-/// Typed [`CmdError::ChildProcessFailure`] preserving [`std::io::ErrorKind`].
+/// Typed [`CmdError::ChildProcessFailure`] preserving [`IoErrorKind`].
+#[cfg(feature = "std")]
 #[must_use]
 pub fn map_child_process_io_error(program: &str, err: &std::io::Error) -> CmdError {
     CmdError::ChildProcessFailure {
         program: program.to_owned(),
-        kind: err.kind(),
+        kind: IoErrorKind::from(err.kind()),
         message: err.to_string(),
     }
 }
@@ -117,6 +128,7 @@ pub fn map_child_process_io_error(program: &str, err: &std::io::Error) -> CmdErr
 ///
 /// # Errors
 /// Returns [`std::io::Error`] for any non-`BrokenPipe` I/O failure.
+#[cfg(feature = "std")]
 pub fn write_child_stdin_bytes(
     writer: &mut dyn Write,
     payload: &[u8],
@@ -132,9 +144,11 @@ pub fn write_child_stdin_bytes(
 }
 
 /// Real OS process spawner backed by [`std::process::Command`] with scoped-thread pipe pumping.
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, Default)]
 pub struct HostProcessSpawner;
 
+#[cfg(feature = "std")]
 impl ProcessSpawner for HostProcessSpawner {
     /// Spawns a host executable using `OsStr` path semantics and pumps `stdin`, `stdout`, and
     /// `stderr` concurrently via [`std::thread::scope`] to eliminate >64 KiB OS pipe deadlocks.
@@ -154,11 +168,11 @@ impl ProcessSpawner for HostProcessSpawner {
     ) -> Result<ExternalSpawnResult, CmdError> {
         let exe_os: OsString = req.program_host_path.as_ref().map_or_else(
             || OsString::from(req.program_vfs_path.to_windows_string()),
-            |p| p.as_os_str().to_os_string(),
+            |p| p.as_path().as_os_str().to_os_string(),
         );
         let exe_display = req.program_host_path.as_ref().map_or_else(
             || req.program_vfs_path.to_windows_string(),
-            |p| p.to_string_lossy().into_owned(),
+            |p| p.as_str().to_owned(),
         );
 
         let mut cmd = Command::new(&exe_os);
@@ -168,8 +182,8 @@ impl ProcessSpawner for HostProcessSpawner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        if let Some(host_cwd) = req.cwd_host.as_ref().filter(|p| p.is_dir()) {
-            cmd.current_dir(host_cwd);
+        if let Some(host_cwd) = req.cwd_host.as_ref().filter(|p| p.as_path().is_dir()) {
+            cmd.current_dir(host_cwd.as_path());
         }
         for (k, v) in &req.env_vars {
             cmd.env(k, v);
@@ -248,6 +262,7 @@ impl ProcessSpawner for HostProcessSpawner {
 ///
 /// # Errors
 /// Returns [`CmdError`] mapped via [`map_child_process_io_error`] if any child I/O operation failed.
+#[cfg(feature = "std")]
 fn collect_spawn_outcome(
     exe_display: &str,
     wait_code_res: Result<Option<i32>, std::io::Error>,
@@ -578,7 +593,7 @@ impl BufferedIoStreams {
     fn materialize_stdin_text(&mut self, fallback_codepage: CodePage) -> Result<(), CmdError> {
         if self.stdin.is_empty() && !self.stdin_bytes.is_empty() {
             let cp = self.stdin_encoding.unwrap_or(fallback_codepage);
-            let raw = std::mem::take(&mut self.stdin_bytes);
+            let raw = core::mem::take(&mut self.stdin_bytes);
             self.stdin = decode_script_bytes(&raw, cp)?;
         }
         Ok(())
@@ -670,7 +685,7 @@ impl CmdIo for BufferedIoStreams {
     /// Returns [`CmdError::EncodingFailure`] if pending `stdin_bytes` cannot be decoded.
     fn read_stdin_to_string(&mut self, codepage: CodePage) -> Result<String, CmdError> {
         self.materialize_stdin_text(codepage)?;
-        Ok(std::mem::take(&mut self.stdin))
+        Ok(core::mem::take(&mut self.stdin))
     }
 
     /// Reads and consumes all remaining raw `stdin` bytes.
@@ -685,10 +700,613 @@ impl CmdIo for BufferedIoStreams {
     /// Never returns [`CmdError`] on in-memory buffers.
     fn read_stdin_bytes(&mut self, codepage: CodePage) -> Result<Vec<u8>, CmdError> {
         if !self.stdin_bytes.is_empty() {
-            return Ok(std::mem::take(&mut self.stdin_bytes));
+            return Ok(core::mem::take(&mut self.stdin_bytes));
         }
-        let text = std::mem::take(&mut self.stdin);
+        let text = core::mem::take(&mut self.stdin);
         Ok(encode_codepage_bytes(&text, codepage))
+    }
+}
+
+/// Portable `#![no_std]`-compatible byte-stream reader trait returning [`CmdError`].
+pub trait ByteStreamRead {
+    /// Reads up to `buf.len()` bytes into `buf`, returning `0` on EOF.
+    ///
+    /// # Arguments
+    /// * `buf` - Destination byte slice.
+    ///
+    /// # Returns
+    /// `Ok(count)` of bytes read into `buf`.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] if reading from the underlying stream fails.
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, CmdError>;
+
+    /// Appends all remaining bytes from this stream until EOF onto `out`.
+    ///
+    /// # Arguments
+    /// * `out` - Destination `Vec<u8>` receiving all remaining bytes.
+    ///
+    /// # Returns
+    /// `Ok(total)` count of bytes appended to `out`.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] if reading fails prior to EOF.
+    fn read_all_bytes(&mut self, out: &mut Vec<u8>) -> Result<usize, CmdError> {
+        let mut scratch = [0u8; 4096];
+        let mut total = 0usize;
+        loop {
+            let n = self.read_chunk(&mut scratch)?;
+            if n == 0 {
+                return Ok(total);
+            }
+            out.extend_from_slice(scratch.get(..n).unwrap_or(&[]));
+            total = total.saturating_add(n);
+        }
+    }
+}
+
+/// Portable `#![no_std]`-compatible line-buffered byte-stream reader trait.
+pub trait ByteStreamBufRead: ByteStreamRead {
+    /// Reads bytes up through the next `0x0A` (`LF`) byte or EOF, appending them to `out`.
+    ///
+    /// # Arguments
+    /// * `out` - Destination byte buffer.
+    ///
+    /// # Returns
+    /// `Ok(count)` of bytes appended (`0` at EOF).
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] if reading from the underlying stream fails.
+    fn read_line_bytes(&mut self, out: &mut Vec<u8>) -> Result<usize, CmdError>;
+}
+
+/// Portable `#![no_std]`-compatible byte-stream writer trait returning [`CmdError`].
+pub trait ByteStreamWrite {
+    /// Writes a partial or complete chunk of `buf` into the stream.
+    ///
+    /// # Arguments
+    /// * `buf` - Source byte slice.
+    ///
+    /// # Returns
+    /// `Ok(count)` of bytes accepted by the stream.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] (`BrokenPipe` or `IoFailure`) on write failure.
+    fn write_chunk(&mut self, buf: &[u8]) -> Result<usize, CmdError>;
+
+    /// Writes the entirety of `buf` into the stream.
+    ///
+    /// # Arguments
+    /// * `buf` - Source byte slice to write completely.
+    ///
+    /// # Returns
+    /// `Ok(())` when all bytes have been written.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] (`BrokenPipe` or `IoFailure`) on write failure.
+    fn write_all_bytes(&mut self, buf: &[u8]) -> Result<(), CmdError>;
+
+    /// Flushes any buffered output bytes to the underlying device or sink.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] (`BrokenPipe` or `IoFailure`) on flush failure.
+    fn flush_stream(&mut self) -> Result<(), CmdError>;
+}
+
+/// In-memory `#![no_std]` byte cursor implementing [`ByteStreamRead`] and [`ByteStreamBufRead`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InMemoryByteReader {
+    /// Backing byte vector.
+    data: Vec<u8>,
+    /// Current read offset (`0..=data.len()`).
+    pos: usize,
+}
+
+impl InMemoryByteReader {
+    /// Creates a new [`InMemoryByteReader`] positioned at byte offset `0`.
+    ///
+    /// # Arguments
+    /// * `data` - Backing input bytes.
+    ///
+    /// # Returns
+    /// Initialized [`InMemoryByteReader`].
+    #[must_use]
+    pub const fn new(data: Vec<u8>) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    /// Returns the current read cursor offset in bytes.
+    ///
+    /// # Returns
+    /// Current byte position (`0..=len`).
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Consumes this reader and returns the unread remainder slice as a `Vec<u8>`.
+    ///
+    /// # Returns
+    /// Unread trailing bytes starting at [`Self::position`].
+    #[must_use]
+    pub fn into_remaining(self) -> Vec<u8> {
+        self.data.get(self.pos..).unwrap_or(&[]).to_vec()
+    }
+}
+
+impl ByteStreamRead for InMemoryByteReader {
+    /// Copies up to `buf.len()` unread bytes from `self` into `buf`.
+    ///
+    /// # Arguments
+    /// * `buf` - Destination byte slice.
+    ///
+    /// # Returns
+    /// `Ok(count)` of bytes copied (`0` when exhausted).
+    ///
+    /// # Errors
+    /// Never returns [`CmdError`] on in-memory buffers.
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, CmdError> {
+        let rem = self.data.get(self.pos..).unwrap_or(&[]);
+        let n = buf
+            .iter_mut()
+            .zip(rem.iter())
+            .map(|(dst, &src)| *dst = src)
+            .count();
+        self.pos = self.pos.saturating_add(n);
+        Ok(n)
+    }
+}
+
+impl ByteStreamBufRead for InMemoryByteReader {
+    /// Reads bytes up through the next `0x0A` (`LF`) or end of buffer into `out`.
+    ///
+    /// # Arguments
+    /// * `out` - Destination `Vec<u8>` buffer.
+    ///
+    /// # Returns
+    /// `Ok(count)` of bytes appended (`0` at EOF).
+    ///
+    /// # Errors
+    /// Never returns [`CmdError`] on in-memory buffers.
+    fn read_line_bytes(&mut self, out: &mut Vec<u8>) -> Result<usize, CmdError> {
+        let rem = self.data.get(self.pos..).unwrap_or(&[]);
+        if rem.is_empty() {
+            return Ok(0);
+        }
+        let take_len = rem
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(rem.len(), |idx| idx.saturating_add(1));
+        out.extend_from_slice(rem.get(..take_len).unwrap_or(&[]));
+        self.pos = self.pos.saturating_add(take_len);
+        Ok(take_len)
+    }
+}
+
+/// Type alias for an in-memory `#![no_std]` [`ByteStreamWrite`] buffer (`Vec<u8>`).
+pub type InMemoryByteWriter = Vec<u8>;
+
+impl ByteStreamWrite for Vec<u8> {
+    /// Appends `buf` onto this `Vec<u8>`.
+    ///
+    /// # Arguments
+    /// * `buf` - Byte slice to append.
+    ///
+    /// # Returns
+    /// `Ok(buf.len())`.
+    ///
+    /// # Errors
+    /// Never returns [`CmdError`] on `Vec<u8>`.
+    fn write_chunk(&mut self, buf: &[u8]) -> Result<usize, CmdError> {
+        self.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    /// Appends all bytes of `buf` onto this `Vec<u8>`.
+    ///
+    /// # Arguments
+    /// * `buf` - Byte slice to append.
+    ///
+    /// # Returns
+    /// `Ok(())`.
+    ///
+    /// # Errors
+    /// Never returns [`CmdError`] on `Vec<u8>`.
+    fn write_all_bytes(&mut self, buf: &[u8]) -> Result<(), CmdError> {
+        self.extend_from_slice(buf);
+        Ok(())
+    }
+
+    /// No-op flush on an in-memory `Vec<u8>`.
+    ///
+    /// # Returns
+    /// `Ok(())`.
+    ///
+    /// # Errors
+    /// Never returns [`CmdError`] on `Vec<u8>`.
+    fn flush_stream(&mut self) -> Result<(), CmdError> {
+        Ok(())
+    }
+}
+
+/// Writes `bytes` to `stream` and flushes it, treating [`CmdError::BrokenPipe`] as graceful EOF.
+///
+/// # Arguments
+/// * `stream` - Target [`ByteStreamWrite`] sink.
+/// * `bytes` - Byte slice to write.
+///
+/// # Returns
+/// `Ok(())` on success or `BrokenPipe` EOF.
+///
+/// # Errors
+/// Returns [`CmdError`] on any non-`BrokenPipe` write or flush failure.
+pub fn write_byte_stream_gracefully(
+    stream: &mut dyn ByteStreamWrite,
+    bytes: &[u8],
+) -> Result<(), CmdError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if let Err(err) = stream.write_all_bytes(bytes) {
+        return if err.is_broken_pipe() {
+            Ok(())
+        } else {
+            Err(err)
+        };
+    }
+    flush_byte_stream_gracefully(stream)
+}
+
+/// Flushes `stream`, treating [`CmdError::BrokenPipe`] as graceful EOF.
+///
+/// # Arguments
+/// * `stream` - Target [`ByteStreamWrite`] sink.
+///
+/// # Returns
+/// `Ok(())` on success or `BrokenPipe` EOF.
+///
+/// # Errors
+/// Returns [`CmdError`] on any non-`BrokenPipe` flush failure.
+pub fn flush_byte_stream_gracefully(stream: &mut dyn ByteStreamWrite) -> Result<(), CmdError> {
+    match stream.flush_stream() {
+        Ok(()) => Ok(()),
+        Err(err) if err.is_broken_pipe() => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Portable `#![no_std]` live streaming [`CmdIo`] adapter over [`ByteStreamBufRead`] and [`ByteStreamWrite`].
+pub struct ByteStreamIo<'a> {
+    /// Live buffered standard input reader.
+    pub stdin: &'a mut dyn ByteStreamBufRead,
+    /// Live standard output writer.
+    pub stdout: &'a mut dyn ByteStreamWrite,
+    /// Live standard error writer.
+    pub stderr: &'a mut dyn ByteStreamWrite,
+    /// Active console [`CodePage`] for byte decoding.
+    pub codepage: CodePage,
+    /// Active [`OutputUnicodeMode`] (`/A` vs `/U`) for raw byte output.
+    pub unicode_mode: OutputUnicodeMode,
+    /// First non-`BrokenPipe` stream [`CmdError`] encountered during execution, if any.
+    pub last_error: Option<CmdError>,
+}
+
+impl<'a> ByteStreamIo<'a> {
+    /// Creates a new portable [`ByteStreamIo`] adapter.
+    ///
+    /// # Arguments
+    /// * `stdin` - Live buffered input stream.
+    /// * `stdout` - Live standard output stream.
+    /// * `stderr` - Live standard error stream.
+    /// * `codepage` - Active [`CodePage`].
+    /// * `unicode_mode` - Active [`OutputUnicodeMode`].
+    ///
+    /// # Returns
+    /// Configured [`ByteStreamIo`].
+    #[must_use]
+    pub fn new(
+        stdin: &'a mut dyn ByteStreamBufRead,
+        stdout: &'a mut dyn ByteStreamWrite,
+        stderr: &'a mut dyn ByteStreamWrite,
+        codepage: CodePage,
+        unicode_mode: OutputUnicodeMode,
+    ) -> Self {
+        Self {
+            stdin,
+            stdout,
+            stderr,
+            codepage,
+            unicode_mode,
+            last_error: None,
+        }
+    }
+
+    /// Takes and returns any recorded stream [`CmdError`].
+    ///
+    /// # Returns
+    /// `Ok(())` when no stream failure occurred.
+    ///
+    /// # Errors
+    /// Returns the recorded [`CmdError`] if a live read/write/flush failed.
+    pub fn check_error(&mut self) -> Result<(), CmdError> {
+        self.last_error.take().map_or(Ok(()), Err)
+    }
+
+    /// Records `err` as the first sticky I/O failure and returns `err`.
+    ///
+    /// # Arguments
+    /// * `err` - [`CmdError`] encountered during live stream I/O.
+    ///
+    /// # Returns
+    /// The passed `err`.
+    fn record_err(&mut self, err: CmdError) -> CmdError {
+        if self.last_error.is_none() {
+            self.last_error = Some(err.clone());
+        }
+        err
+    }
+}
+
+impl CmdIo for ByteStreamIo<'_> {
+    /// Writes UTF-8 `text` directly to live `self.stdout` and flushes immediately.
+    ///
+    /// # Arguments
+    /// * `text` - UTF-8 text to write.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns [`CmdError::IoFailure`] on non-`BrokenPipe` write failure.
+    fn write_stdout_str(&mut self, text: &str) -> Result<(), CmdError> {
+        write_byte_stream_gracefully(self.stdout, text.as_bytes())
+            .map_err(|err| self.record_err(err))
+    }
+
+    /// Writes raw `bytes` directly to live `self.stdout` and flushes immediately.
+    ///
+    /// # Arguments
+    /// * `bytes` - Raw byte slice to write.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns [`CmdError::IoFailure`] on non-`BrokenPipe` write failure.
+    fn write_stdout_bytes(&mut self, bytes: &[u8]) -> Result<(), CmdError> {
+        write_byte_stream_gracefully(self.stdout, bytes).map_err(|err| self.record_err(err))
+    }
+
+    /// Writes UTF-8 error `text` directly to live `self.stderr` and flushes immediately.
+    ///
+    /// # Arguments
+    /// * `text` - UTF-8 error text to write.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns [`CmdError::IoFailure`] on non-`BrokenPipe` write failure.
+    fn write_stderr_str(&mut self, text: &str) -> Result<(), CmdError> {
+        write_byte_stream_gracefully(self.stderr, text.as_bytes())
+            .map_err(|err| self.record_err(err))
+    }
+
+    /// Flushes both `self.stdout` and `self.stderr`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns [`CmdError::IoFailure`] on non-`BrokenPipe` flush failure.
+    fn flush_outputs(&mut self) -> Result<(), CmdError> {
+        flush_byte_stream_gracefully(self.stdout)
+            .and_then(|()| flush_byte_stream_gracefully(self.stderr))
+            .map_err(|err| self.record_err(err))
+    }
+
+    /// Flushes pending prompts and reads a single interactive line from `self.stdin`.
+    ///
+    /// # Returns
+    /// `Ok(Some(line))` without trailing CR/LF, or `Ok(None)` at EOF.
+    ///
+    /// # Errors
+    /// Returns [`CmdError::IoFailure`] if reading from `self.stdin` fails.
+    fn read_stdin_line(&mut self) -> Result<Option<String>, CmdError> {
+        self.flush_outputs()?;
+        let mut raw = Vec::new();
+        let n = match self.stdin.read_line_bytes(&mut raw) {
+            Ok(count) => count,
+            Err(err) => return Err(self.record_err(err)),
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        let decoded = String::from_utf8_lossy(&raw);
+        Ok(Some(
+            decoded.trim_end_matches([CR_CHAR, LF_CHAR]).to_owned(),
+        ))
+    }
+
+    /// Reads all remaining bytes from `self.stdin` and decodes them with `codepage`.
+    ///
+    /// # Arguments
+    /// * `codepage` - Active [`CodePage`] for decoding.
+    ///
+    /// # Returns
+    /// Decoded `stdin` text.
+    ///
+    /// # Errors
+    /// Returns [`CmdError::IoFailure`] or [`CmdError::EncodingFailure`] on read or decode error.
+    fn read_stdin_to_string(&mut self, codepage: CodePage) -> Result<String, CmdError> {
+        let bytes = self.read_stdin_bytes(codepage)?;
+        decode_script_bytes(&bytes, codepage)
+    }
+
+    /// Reads all remaining raw bytes from `self.stdin` until EOF.
+    ///
+    /// # Arguments
+    /// * `_codepage` - Unused on raw byte stream.
+    ///
+    /// # Returns
+    /// Raw byte buffer read from `self.stdin`.
+    ///
+    /// # Errors
+    /// Returns [`CmdError::IoFailure`] if reading from `self.stdin` fails.
+    fn read_stdin_bytes(&mut self, _codepage: CodePage) -> Result<Vec<u8>, CmdError> {
+        self.flush_outputs()?;
+        let mut buf = Vec::new();
+        if let Err(err) = self.stdin.read_all_bytes(&mut buf) {
+            return Err(self.record_err(err));
+        }
+        Ok(buf)
+    }
+}
+
+/// Adapter bridging [`std::io::Read`] onto [`ByteStreamRead`].
+#[cfg(feature = "std")]
+pub struct StdReadAdapter<'a>(
+    /// Wrapped mutable [`std::io::Read`] trait object.
+    pub &'a mut dyn Read,
+);
+
+#[cfg(feature = "std")]
+impl ByteStreamRead for StdReadAdapter<'_> {
+    /// Reads a chunk from the wrapped [`std::io::Read`] stream.
+    ///
+    /// # Arguments
+    /// * `buf` - Destination byte buffer.
+    ///
+    /// # Returns
+    /// `Ok(count)` of bytes read.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] mapped via [`CmdError::from_io_error`].
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, CmdError> {
+        self.0
+            .read(buf)
+            .map_err(|err| CmdError::from_io_error(&err, "-", "read"))
+    }
+}
+
+/// Adapter bridging [`std::io::BufRead`] onto [`ByteStreamRead`] and [`ByteStreamBufRead`].
+#[cfg(feature = "std")]
+pub struct StdBufReadAdapter<'a>(
+    /// Wrapped mutable [`std::io::BufRead`] trait object.
+    pub &'a mut dyn BufRead,
+);
+
+#[cfg(feature = "std")]
+impl ByteStreamRead for StdBufReadAdapter<'_> {
+    /// Reads a chunk from the wrapped [`std::io::BufRead`] stream.
+    ///
+    /// # Arguments
+    /// * `buf` - Destination byte buffer.
+    ///
+    /// # Returns
+    /// `Ok(count)` of bytes read.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] mapped via [`map_stream_io_error`].
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, CmdError> {
+        self.0
+            .read(buf)
+            .map_err(|err| map_stream_io_error(&err, "read stdin"))
+    }
+}
+
+#[cfg(feature = "std")]
+impl ByteStreamBufRead for StdBufReadAdapter<'_> {
+    /// Reads up through `0x0A` (`LF`) or EOF from the wrapped [`std::io::BufRead`] stream.
+    ///
+    /// # Arguments
+    /// * `out` - Destination byte vector.
+    ///
+    /// # Returns
+    /// `Ok(count)` of bytes read.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] mapped via [`map_stream_io_error`].
+    fn read_line_bytes(&mut self, out: &mut Vec<u8>) -> Result<usize, CmdError> {
+        self.0
+            .read_until(b'\n', out)
+            .map_err(|err| map_stream_io_error(&err, "read stdin"))
+    }
+}
+
+/// Adapter bridging [`std::io::Write`] onto [`ByteStreamWrite`].
+#[cfg(feature = "std")]
+pub struct StdWriteAdapter<'a> {
+    /// Wrapped mutable [`std::io::Write`] trait object.
+    pub inner: &'a mut dyn Write,
+    /// Diagnostic operation label (`"write"`, `"write stdout"`, `"write stderr"`).
+    pub op_name: &'a str,
+}
+
+#[cfg(feature = "std")]
+impl<'a> StdWriteAdapter<'a> {
+    /// Constructs a new [`StdWriteAdapter`] around `inner` with diagnostic label `op_name`.
+    ///
+    /// # Arguments
+    /// * `inner` - Mutable [`std::io::Write`] sink.
+    /// * `op_name` - Operation label reported on failure.
+    ///
+    /// # Returns
+    /// Configured [`StdWriteAdapter`].
+    #[must_use]
+    pub fn new(inner: &'a mut dyn Write, op_name: &'a str) -> Self {
+        Self { inner, op_name }
+    }
+}
+
+#[cfg(feature = "std")]
+impl ByteStreamWrite for StdWriteAdapter<'_> {
+    /// Writes a partial or full chunk to `self.inner`.
+    ///
+    /// # Arguments
+    /// * `buf` - Source byte slice.
+    ///
+    /// # Returns
+    /// `Ok(count)` of bytes written.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] mapped via [`map_stream_io_error`].
+    fn write_chunk(&mut self, buf: &[u8]) -> Result<usize, CmdError> {
+        self.inner
+            .write(buf)
+            .map_err(|err| map_stream_io_error(&err, self.op_name))
+    }
+
+    /// Writes all bytes of `buf` to `self.inner`.
+    ///
+    /// # Arguments
+    /// * `buf` - Source byte slice.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] mapped via [`map_stream_io_error`].
+    fn write_all_bytes(&mut self, buf: &[u8]) -> Result<(), CmdError> {
+        self.inner
+            .write_all(buf)
+            .map_err(|err| map_stream_io_error(&err, self.op_name))
+    }
+
+    /// Flushes `self.inner`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns [`CmdError`] mapped via [`map_stream_io_error`].
+    fn flush_stream(&mut self) -> Result<(), CmdError> {
+        self.inner
+            .flush()
+            .map_err(|err| map_stream_io_error(&err, self.op_name))
     }
 }
 
@@ -700,6 +1318,7 @@ impl CmdIo for BufferedIoStreams {
 ///
 /// # Returns
 /// [`CmdError::BrokenPipe`] when `err.kind() == BrokenPipe`, otherwise [`CmdError::IoFailure`].
+#[cfg(feature = "std")]
 #[must_use]
 pub fn map_stream_io_error(err: &std::io::Error, op_name: &str) -> CmdError {
     if err.kind() == std::io::ErrorKind::BrokenPipe {
@@ -724,23 +1343,14 @@ pub fn map_stream_io_error(err: &std::io::Error, op_name: &str) -> CmdError {
 ///
 /// # Errors
 /// Returns [`CmdError::IoFailure`] on any non-`BrokenPipe` write or flush error.
+#[cfg(feature = "std")]
 pub fn write_and_flush_gracefully(
     stream: &mut dyn Write,
     bytes: &[u8],
     op_name: &str,
 ) -> Result<(), CmdError> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    if let Err(err) = stream.write_all(bytes) {
-        let mapped = map_stream_io_error(&err, op_name);
-        return if mapped.is_broken_pipe() {
-            Ok(())
-        } else {
-            Err(mapped)
-        };
-    }
-    flush_stream_gracefully(stream, op_name)
+    let mut adapter = StdWriteAdapter::new(stream, op_name);
+    write_byte_stream_gracefully(&mut adapter, bytes)
 }
 
 /// Flushes `stream`, treating [`CmdError::BrokenPipe`] as graceful EOF.
@@ -754,21 +1364,14 @@ pub fn write_and_flush_gracefully(
 ///
 /// # Errors
 /// Returns [`CmdError::IoFailure`] on any non-`BrokenPipe` flush error.
+#[cfg(feature = "std")]
 pub fn flush_stream_gracefully(stream: &mut dyn Write, op_name: &str) -> Result<(), CmdError> {
-    match stream.flush() {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let mapped = map_stream_io_error(&err, op_name);
-            if mapped.is_broken_pipe() {
-                Ok(())
-            } else {
-                Err(mapped)
-            }
-        }
-    }
+    let mut adapter = StdWriteAdapter::new(stream, op_name);
+    flush_byte_stream_gracefully(&mut adapter)
 }
 
 /// Live streaming [`CmdIo`] adapter wrapping `BufRead` `stdin` and `Write` `stdout`/`stderr`.
+#[cfg(feature = "std")]
 pub struct StdIoStreams<'a> {
     /// Live buffered standard input reader.
     pub stdin: &'a mut dyn BufRead,
@@ -784,6 +1387,7 @@ pub struct StdIoStreams<'a> {
     pub last_error: Option<CmdError>,
 }
 
+#[cfg(feature = "std")]
 impl<'a> StdIoStreams<'a> {
     /// Creates a new live [`StdIoStreams`] adapter.
     ///
@@ -825,21 +1429,38 @@ impl<'a> StdIoStreams<'a> {
         self.last_error.take().map_or(Ok(()), Err)
     }
 
-    /// Records `err` as the first sticky I/O failure and returns `err`.
+    /// Executes `f` against a temporary [`ByteStreamIo`] adapter, propagating `last_error`.
     ///
     /// # Arguments
-    /// * `err` - [`CmdError`] encountered during live stream I/O.
+    /// * `f` - Closure operating on [`ByteStreamIo`].
     ///
     /// # Returns
-    /// The passed `err`.
-    fn record_err(&mut self, err: CmdError) -> CmdError {
-        if self.last_error.is_none() {
-            self.last_error = Some(err.clone());
-        }
-        err
+    /// Result of `f`.
+    ///
+    /// # Errors
+    /// Propagates any [`CmdError`] returned by `f`.
+    fn with_byte_io<T>(
+        &mut self,
+        f: impl FnOnce(&mut ByteStreamIo<'_>) -> Result<T, CmdError>,
+    ) -> Result<T, CmdError> {
+        let mut sin = StdBufReadAdapter(self.stdin);
+        let mut sout = StdWriteAdapter::new(self.stdout, "write stdout");
+        let mut serr = StdWriteAdapter::new(self.stderr, "write stderr");
+        let mut bio = ByteStreamIo {
+            stdin: &mut sin,
+            stdout: &mut sout,
+            stderr: &mut serr,
+            codepage: self.codepage,
+            unicode_mode: self.unicode_mode,
+            last_error: self.last_error.take(),
+        };
+        let res = f(&mut bio);
+        self.last_error = bio.last_error;
+        res
     }
 }
 
+#[cfg(feature = "std")]
 impl CmdIo for StdIoStreams<'_> {
     /// Writes UTF-8 `text` directly to live `self.stdout` and flushes immediately.
     ///
@@ -852,8 +1473,7 @@ impl CmdIo for StdIoStreams<'_> {
     /// # Errors
     /// Returns [`CmdError::IoFailure`] on non-`BrokenPipe` write failure.
     fn write_stdout_str(&mut self, text: &str) -> Result<(), CmdError> {
-        write_and_flush_gracefully(self.stdout, text.as_bytes(), "write stdout")
-            .map_err(|err| self.record_err(err))
+        self.with_byte_io(|bio| bio.write_stdout_str(text))
     }
 
     /// Writes raw `bytes` directly to live `self.stdout` and flushes immediately.
@@ -867,8 +1487,7 @@ impl CmdIo for StdIoStreams<'_> {
     /// # Errors
     /// Returns [`CmdError::IoFailure`] on non-`BrokenPipe` write failure.
     fn write_stdout_bytes(&mut self, bytes: &[u8]) -> Result<(), CmdError> {
-        write_and_flush_gracefully(self.stdout, bytes, "write stdout")
-            .map_err(|err| self.record_err(err))
+        self.with_byte_io(|bio| bio.write_stdout_bytes(bytes))
     }
 
     /// Writes UTF-8 error `text` directly to live `self.stderr` and flushes immediately.
@@ -882,8 +1501,7 @@ impl CmdIo for StdIoStreams<'_> {
     /// # Errors
     /// Returns [`CmdError::IoFailure`] on non-`BrokenPipe` write failure.
     fn write_stderr_str(&mut self, text: &str) -> Result<(), CmdError> {
-        write_and_flush_gracefully(self.stderr, text.as_bytes(), "write stderr")
-            .map_err(|err| self.record_err(err))
+        self.with_byte_io(|bio| bio.write_stderr_str(text))
     }
 
     /// Flushes both `self.stdout` and `self.stderr`.
@@ -894,9 +1512,7 @@ impl CmdIo for StdIoStreams<'_> {
     /// # Errors
     /// Returns [`CmdError::IoFailure`] on non-`BrokenPipe` flush failure.
     fn flush_outputs(&mut self) -> Result<(), CmdError> {
-        flush_stream_gracefully(self.stdout, "flush stdout")
-            .and_then(|()| flush_stream_gracefully(self.stderr, "flush stderr"))
-            .map_err(|err| self.record_err(err))
+        self.with_byte_io(|bio: &mut ByteStreamIo<'_>| bio.flush_outputs())
     }
 
     /// Flushes pending prompts and reads a single interactive line from `self.stdin`.
@@ -907,21 +1523,7 @@ impl CmdIo for StdIoStreams<'_> {
     /// # Errors
     /// Returns [`CmdError::IoFailure`] if reading from `self.stdin` fails.
     fn read_stdin_line(&mut self) -> Result<Option<String>, CmdError> {
-        self.flush_outputs()?;
-        let mut line = String::new();
-        let n = match self.stdin.read_line(&mut line) {
-            Ok(count) => count,
-            Err(err) => {
-                return Err(self.record_err(CmdError::IoFailure {
-                    operation: "read stdin".to_owned(),
-                    message: err.to_string(),
-                }));
-            }
-        };
-        if n == 0 {
-            return Ok(None);
-        }
-        Ok(Some(line.trim_end_matches([CR_CHAR, LF_CHAR]).to_owned()))
+        self.with_byte_io(|bio: &mut ByteStreamIo<'_>| bio.read_stdin_line())
     }
 
     /// Reads all remaining bytes from `self.stdin` and decodes them with `codepage`.
@@ -935,30 +1537,21 @@ impl CmdIo for StdIoStreams<'_> {
     /// # Errors
     /// Returns [`CmdError::IoFailure`] or [`CmdError::EncodingFailure`] on read or decode error.
     fn read_stdin_to_string(&mut self, codepage: CodePage) -> Result<String, CmdError> {
-        let bytes = self.read_stdin_bytes(codepage)?;
-        decode_script_bytes(&bytes, codepage)
+        self.with_byte_io(|bio| bio.read_stdin_to_string(codepage))
     }
 
     /// Reads all remaining raw bytes from `self.stdin` until EOF.
     ///
     /// # Arguments
-    /// * `_codepage` - Unused on raw byte stream.
+    /// * `codepage` - Active [`CodePage`] passed through to [`ByteStreamIo::read_stdin_bytes`].
     ///
     /// # Returns
     /// Raw byte buffer read from `self.stdin`.
     ///
     /// # Errors
     /// Returns [`CmdError::IoFailure`] if reading from `self.stdin` fails.
-    fn read_stdin_bytes(&mut self, _codepage: CodePage) -> Result<Vec<u8>, CmdError> {
-        self.flush_outputs()?;
-        let mut buf = Vec::new();
-        if let Err(err) = self.stdin.read_to_end(&mut buf) {
-            return Err(self.record_err(CmdError::IoFailure {
-                operation: "read stdin".to_owned(),
-                message: err.to_string(),
-            }));
-        }
-        Ok(buf)
+    fn read_stdin_bytes(&mut self, codepage: CodePage) -> Result<Vec<u8>, CmdError> {
+        self.with_byte_io(|bio| bio.read_stdin_bytes(codepage))
     }
 }
 
@@ -1152,7 +1745,7 @@ impl CmdIo for RedirectedIo<'_> {
     /// Returns [`CmdError::IoFailure`] or [`CmdError::EncodingFailure`] if reading from `self.parent` fails.
     fn read_stdin_to_string(&mut self, codepage: CodePage) -> Result<String, CmdError> {
         if let Some(buf) = &mut self.stdin_override {
-            Ok(std::mem::take(buf))
+            Ok(core::mem::take(buf))
         } else {
             self.parent.read_stdin_to_string(codepage)
         }
@@ -1170,7 +1763,7 @@ impl CmdIo for RedirectedIo<'_> {
     /// Returns [`CmdError::IoFailure`] if reading from `self.parent` fails.
     fn read_stdin_bytes(&mut self, codepage: CodePage) -> Result<Vec<u8>, CmdError> {
         if let Some(buf) = &mut self.stdin_override {
-            let text = std::mem::take(buf);
+            let text = core::mem::take(buf);
             Ok(encode_codepage_bytes(&text, codepage))
         } else {
             self.parent.read_stdin_bytes(codepage)
@@ -1250,10 +1843,10 @@ mod tests {
         // 1. >128 KiB payload through `cat` / `powershell` (exceeds 64 KiB OS pipe buffer, proving zero deadlock!)
         let large_payload = "A".repeat(131_072);
         #[cfg(unix)]
-        let (cat_prog, cat_args) = (PathBuf::from("cat"), Vec::new());
+        let (cat_prog, cat_args) = (std::path::PathBuf::from("cat"), Vec::new());
         #[cfg(windows)]
         let (cat_prog, cat_args) = (
-            PathBuf::from("powershell"),
+            std::path::PathBuf::from("powershell"),
             vec![
                 "-NoProfile".to_owned(),
                 "-NonInteractive".to_owned(),
@@ -1263,11 +1856,11 @@ mod tests {
         );
         let cat_request = ExternalSpawnRequest {
             program_vfs_path: WindowsPath::root(DriveLetter::C).join_component("cat"),
-            program_host_path: Some(cat_prog),
+            program_host_path: Some(NativeBackingPath::from_path_buf(cat_prog)),
             args: cat_args,
             raw_tail: String::new(),
             cwd_vfs: WindowsPath::root(DriveLetter::C),
-            cwd_host: Some(std::env::temp_dir()),
+            cwd_host: Some(NativeBackingPath::from_path_buf(std::env::temp_dir())),
             env_vars: vec![("TEST_K".to_owned(), "TEST_V".to_owned())],
             stdin: String::new(),
             stdin_bytes: large_payload.as_bytes().to_vec(),
@@ -1288,10 +1881,13 @@ mod tests {
 
         // 2. Child (`echo` / `powershell`) exits immediately without reading 256 KiB stdin -> BrokenPipe handled cleanly!
         #[cfg(unix)]
-        let (echo_prog, echo_args) = (PathBuf::from("echo"), vec!["ok_early".to_owned()]);
+        let (echo_prog, echo_args) = (
+            std::path::PathBuf::from("echo"),
+            vec!["ok_early".to_owned()],
+        );
         #[cfg(windows)]
         let (echo_prog, echo_args) = (
-            PathBuf::from("powershell"),
+            std::path::PathBuf::from("powershell"),
             vec![
                 "-NoProfile".to_owned(),
                 "-NonInteractive".to_owned(),
@@ -1301,7 +1897,7 @@ mod tests {
         );
         let echo_request = ExternalSpawnRequest {
             program_vfs_path: WindowsPath::root(DriveLetter::C).join_component("echo"),
-            program_host_path: Some(echo_prog),
+            program_host_path: Some(NativeBackingPath::from_path_buf(echo_prog)),
             args: echo_args,
             raw_tail: "ok_early".to_owned(),
             cwd_vfs: WindowsPath::root(DriveLetter::C),
@@ -1348,7 +1944,7 @@ mod tests {
         };
         assert!(write_child_stdin_bytes(&mut err_writer, b"hi").is_err());
 
-        // 2. Nonexistent executable -> `CmdError::ChildProcessFailure` with `ErrorKind::NotFound`
+        // 2. Nonexistent executable -> `CmdError::ChildProcessFailure` with `IoErrorKind::NotFound`
         let missing_request = ExternalSpawnRequest {
             program_vfs_path: WindowsPath::root(DriveLetter::C)
                 .join_component("nonexistent_wincmd_bin_99999"),
@@ -1356,7 +1952,9 @@ mod tests {
             args: Vec::new(),
             raw_tail: String::new(),
             cwd_vfs: WindowsPath::root(DriveLetter::C),
-            cwd_host: Some(PathBuf::from("/nonexistent_wincmd_dir_99999")),
+            cwd_host: Some(NativeBackingPath::from_string(
+                "/nonexistent_wincmd_dir_99999",
+            )),
             env_vars: Vec::new(),
             stdin: String::new(),
             stdin_bytes: Vec::new(),
@@ -1369,7 +1967,7 @@ mod tests {
         assert!(matches!(
             missing_outcome,
             Err(CmdError::ChildProcessFailure {
-                kind: std::io::ErrorKind::NotFound,
+                kind: IoErrorKind::NotFound,
                 ..
             })
         ));
@@ -1625,5 +2223,34 @@ mod tests {
             ]
         );
         assert_eq!(parent_buf2.stdout, "");
+
+        let mut mem_reader = InMemoryByteReader::new(b"hello\nworld".to_vec());
+        assert_eq!(mem_reader.position(), 0);
+        let mut chunk_buf = [0u8; 3];
+        assert_eq!(mem_reader.read_chunk(&mut chunk_buf), Ok(3));
+        assert_eq!(&chunk_buf, b"hel");
+        assert_eq!(mem_reader.position(), 3);
+        let mut all_rest = Vec::new();
+        assert_eq!(mem_reader.read_all_bytes(&mut all_rest), Ok(8));
+        assert_eq!(all_rest, b"lo\nworld");
+        assert_eq!(mem_reader.into_remaining(), Vec::<u8>::new());
+
+        let mut mem_writer: InMemoryByteWriter = Vec::new();
+        assert_eq!(mem_writer.write_chunk(b"abc"), Ok(3));
+        assert_eq!(mem_writer, b"abc");
+
+        let mut raw_std_vec = Vec::new();
+        {
+            let mut std_w = StdWriteAdapter::new(&mut raw_std_vec, "chunk");
+            assert_eq!(std_w.write_chunk(b"xyz"), Ok(3));
+        }
+        assert_eq!(raw_std_vec, b"xyz");
+
+        let mut fail_chunk_sink = MockFailingWriter {
+            kind: std::io::ErrorKind::PermissionDenied,
+            fail_on_flush: false,
+        };
+        let mut std_fail_w = StdWriteAdapter::new(&mut fail_chunk_sink, "chunk_err");
+        assert!(std_fail_w.write_chunk(b"x").is_err());
     }
 }

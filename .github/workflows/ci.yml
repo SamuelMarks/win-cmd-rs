@@ -43,10 +43,19 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting (rustfmt)
-        run: cargo +stable fmt --all -- --check
+        run: |
+          cargo +stable fmt --all -- --check
+          cargo +stable fmt --manifest-path crates/wincmd-dos/Cargo.toml --all -- --check
+
+      - name: Verify pure no_std + alloc core (--no-default-features)
+        run: |
+          cargo +stable check --lib --no-default-features
+          cargo +stable clippy --lib --no-default-features -- -D warnings
 
       - name: Run Clippy with all targets and strict lints
-        run: cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
+        run: |
+          cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
+          CARGO_TARGET_DIR=target/wincmd-dos-host cargo +stable clippy --manifest-path crates/wincmd-dos/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Check Rustdoc (including private items)
         env:
@@ -165,7 +174,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run unit, integration & property tests
-        run: cargo test --workspace --all-targets --all-features
+        run: |
+          cargo test --workspace --all-targets --all-features
+          CARGO_TARGET_DIR=target/wincmd-dos-host cargo test --manifest-path crates/wincmd-dos/Cargo.toml --all-targets --all-features
 
       - name: Run documentation tests
         run: cargo test --workspace --doc --all-features
@@ -205,6 +216,7 @@ jobs:
                   "--branch",
                   "--workspace",
                   "--all-targets",
+                  "--all-features",
                   "--json",
                   "--summary-only",
               ],
@@ -258,12 +270,292 @@ jobs:
                   print(line, file=sys.stderr)
               sys.exit(1)
 
+  dos-cross-test:
+    name: Headless FreeDOS + QEMU Cross-Build & Boot Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install QEMU, mtools, dosfstools & archive utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 mtools dosfstools unzip curl bzip2 zip python3
+
+      - name: Install DJGPP cross-compiler, CWSDPMI.EXE & FreeDOS 1.3 boot floppy
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dos-env"
+          curl -fsSL -L --retry 3 \
+            "https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-linux64-gcc1220.tar.bz2" \
+            -o "$RUNNER_TEMP/dos-env/djgpp.tar.bz2"
+          tar -xjf "$RUNNER_TEMP/dos-env/djgpp.tar.bz2" -C "$RUNNER_TEMP/dos-env"
+          echo "$RUNNER_TEMP/dos-env/djgpp/bin" >> "$GITHUB_PATH"
+
+          curl -fsSL -L --retry 3 \
+            "https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/repos/base/cwsdpmi.zip" \
+            -o "$RUNNER_TEMP/dos-env/cwsdpmi.zip"
+          unzip -j -o "$RUNNER_TEMP/dos-env/cwsdpmi.zip" "BIN/CWSDPMI.EXE" -d "$RUNNER_TEMP/dos-env"
+
+          curl -fsSL -L --retry 3 \
+            "https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/official/FD13-FloppyEdition.zip" \
+            -o "$RUNNER_TEMP/dos-env/fd13.zip"
+          unzip -j -o "$RUNNER_TEMP/dos-env/fd13.zip" "144m/x86BOOT.img" -d "$RUNNER_TEMP/dos-env"
+
+      - name: Install Rust nightly toolchain with rust-src
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src, clippy
+
+      - name: Cross-compile WINCMD.EXE and WINCHECK.EXE (i586-pc-msdosdjgpp)
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/djgpp-target
+        run: |
+          cargo +nightly clippy --manifest-path crates/wincmd-dos/Cargo.toml \
+            -Z build-std=core,alloc,panic_abort -Z json-target-spec \
+            --target targets/i586-pc-msdosdjgpp.json --no-default-features --bins --lib -- -D warnings
+          cargo +nightly build --manifest-path crates/wincmd-dos/Cargo.toml \
+            -Z build-std=core,alloc,panic_abort -Z json-target-spec \
+            --target targets/i586-pc-msdosdjgpp.json --no-default-features --release
+
+      - name: Assemble FreeDOS FAT16 image and run headless QEMU verification
+        shell: python3 {0}
+        env:
+          DOS_ENV: ${{ runner.temp }}/dos-env
+          DJGPP_REL: ${{ runner.temp }}/djgpp-target/i586-pc-msdosdjgpp/release
+        run: |
+          import os, pathlib, shutil, struct, subprocess, sys
+
+          dos_env = pathlib.Path(os.environ["DOS_ENV"])
+          rel = pathlib.Path(os.environ["DJGPP_REL"])
+          work = dos_env / "qemu"
+          work.mkdir(parents=True, exist_ok=True)
+
+          boot_img = work / "boot.img"
+          shutil.copy2(dos_env / "x86BOOT.img", boot_img)
+          fdauto = work / "FDAUTO.BAT"
+          fdauto.write_bytes(
+              b"@ECHO OFF\r\n"
+              b"SET PATH=C:\\;A:\\FREEDOS\\BIN\r\n"
+              b"SET TEMP=C:\\TEMP\r\n"
+              b"C:\r\n"
+              b"CALL C:\\RUNTESTS.BAT\r\n"
+              b"A:\\FREEDOS\\BIN\\FDAPM.COM POWEROFF\r\n"
+          )
+          subprocess.run(
+              ["mcopy", "-i", str(boot_img), "-o", str(fdauto), "::/FDAUTO.BAT"],
+              check=True,
+          )
+
+          suite_bat = (
+              b"@echo off\r\n"
+              b"set /a SUM=19+23\r\n"
+              b"echo ARITH=%SUM%\r\n"
+              b"set ITEMS=\r\n"
+              b"for %%X in (A B C) do call :acc %%X\r\n"
+              b"echo LOOP=%ITEMS%\r\n"
+              b"md C:\\WORK\r\n"
+              b"echo HELLO_FAT > C:\\WORK\\A.TXT\r\n"
+              b"copy C:\\WORK\\A.TXT C:\\WORK\\B.TXT > NUL\r\n"
+              b"move C:\\WORK\\B.TXT C:\\WORK\\C.TXT > NUL\r\n"
+              b"attrib +R C:\\WORK\\C.TXT\r\n"
+              b"attrib C:\\WORK\\C.TXT\r\n"
+              b"attrib -R C:\\WORK\\C.TXT\r\n"
+              b"dir /B C:\\WORK\r\n"
+              b"truename C:\\WORK\\C.TXT\r\n"
+              b"chcp\r\n"
+              b"del /Q C:\\WORK\\C.TXT\r\n"
+              b"C:\\EXTCHILD.COM\r\n"
+              b"echo EXT_RC=%ERRORLEVEL%\r\n"
+              b"echo spool_ok| C:\\UPCASE.COM\r\n"
+              b"C:\\EXTCHILD.COM | C:\\UPCASE.COM\r\n"
+              b"goto :eof\r\n"
+              b":acc\r\n"
+              b"set ITEMS=%ITEMS%%1\r\n"
+              b"exit /b 0\r\n"
+          )
+          runtests_bat = (
+              b"@ECHO OFF\r\n"
+              b"C:\r\n"
+              b"CD \\\r\n"
+              b"SET TEMP=C:\\TEMP\r\n"
+              b"CTTY COM1\r\n"
+              b"ECHO === BOOTED FREEDOS ===\r\n"
+              b"C:\\WINCMD.EXE /E:ON /C C:\\SUITE.BAT\r\n"
+              b"ECHO SUITE_RC=%ERRORLEVEL%\r\n"
+              b"ECHO --- WINCHECK TTY ---\r\n"
+              b"C:\\WINCHECK.EXE --dialect dos622 --format tty C:\\PORT.BAT\r\n"
+              b"ECHO --- WINCHECK GCC ---\r\n"
+              b"C:\\WINCHECK.EXE --dialect dos622 --format gcc C:\\PORT.BAT\r\n"
+              b"ECHO --- WINCHECK JSON ---\r\n"
+              b"C:\\WINCHECK.EXE --dialect dos622 --format json C:\\PORT.BAT\r\n"
+              b"ECHO --- WINCHECK SARIF ---\r\n"
+              b"C:\\WINCHECK.EXE --dialect dos622 --format sarif C:\\PORT.BAT > C:\\SARIF.OUT\r\n"
+              b"IF EXIST C:\\SARIF.OUT ECHO SARIF_OK\r\n"
+              b"ECHO --- WINCHECK FIX IN-PLACE ---\r\n"
+              b"C:\\WINCHECK.EXE --dialect dos622 --fix --in-place C:\\PORT.BAT\r\n"
+              b"C:\\WINCHECK.EXE --dialect dos622 --format gcc C:\\PORT.BAT\r\n"
+              b"ECHO FIX_RC=%ERRORLEVEL%\r\n"
+              b"IF NOT ERRORLEVEL 1 ECHO PASS_ALL_DOS_TESTS\r\n"
+              b"ECHO === DONE_FREEDOS ===\r\n"
+              b"CTTY CON\r\n"
+          )
+
+          cyls, heads, spt = 32, 16, 63
+          total_sectors = cyls * heads * spt
+          part_lba = 63
+          part_sectors = total_sectors - part_lba
+          img = bytearray(total_sectors * 512)
+          img[446:462] = struct.pack(
+              "<BBBBBBBBII", 0x80, 1, 1, 0, 0x06, heads - 1, spt, cyls - 1, part_lba, part_sectors
+          )
+          img[510:512] = b"\x55\xAA"
+
+          spc, res_sec, num_fats, root_entries, spf = 4, 1, 2, 512, 32
+          root_dir_secs = (root_entries * 32) // 512
+          bpb = bytearray(512)
+          bpb[0:3] = b"\xEB\x3C\x90"
+          bpb[3:11] = b"MSDOS5.0"
+          struct.pack_into(
+              "<HBHBHHBHHHII",
+              bpb,
+              11,
+              512,
+              spc,
+              res_sec,
+              num_fats,
+              root_entries,
+              part_sectors,
+              0xF8,
+              spf,
+              spt,
+              heads,
+              part_lba,
+              0,
+          )
+          bpb[36] = 0x80
+          bpb[38] = 0x29
+          struct.pack_into("<I", bpb, 39, 0x19940622)
+          bpb[43:54] = b"WINCMDDOS  "
+          bpb[54:62] = b"FAT16   "
+          bpb[510:512] = b"\x55\xAA"
+          p_off = part_lba * 512
+          img[p_off : p_off + 512] = bpb
+
+          fat1_off = p_off + res_sec * 512
+          fat2_off = fat1_off + spf * 512
+          for f_off in (fat1_off, fat2_off):
+              struct.pack_into("<HH", img, f_off, 0xFFF8, 0xFFFF)
+
+          root_off = fat2_off + spf * 512
+          data_off = root_off + root_dir_secs * 512
+          cluster_bytes = spc * 512
+          next_cluster = 2
+          root_idx = 0
+
+          def add_root_entry(name8, ext3, attr, data_bytes):
+              nonlocal next_cluster, root_idx
+              if attr & 0x10:
+                  cl = next_cluster
+                  next_cluster += 1
+                  for f_off in (fat1_off, fat2_off):
+                      struct.pack_into("<H", img, f_off + cl * 2, 0xFFFF)
+                  d_off = data_off + (cl - 2) * cluster_bytes
+                  struct.pack_into("<11sB10xHHHI", img, d_off, b".          ", 0x10, 0, 0x0021, cl, 0)
+                  struct.pack_into("<11sB10xHHHI", img, d_off + 32, b"..         ", 0x10, 0, 0x0021, 0, 0)
+                  size = 0
+              else:
+                  cl = next_cluster
+                  n_cl = max(1, (len(data_bytes) + cluster_bytes - 1) // cluster_bytes)
+                  for i in range(n_cl):
+                      c = cl + i
+                      nxt = 0xFFFF if i == n_cl - 1 else (c + 1)
+                      for f_off in (fat1_off, fat2_off):
+                          struct.pack_into("<H", img, f_off + c * 2, nxt)
+                  d_off = data_off + (cl - 2) * cluster_bytes
+                  img[d_off : d_off + len(data_bytes)] = data_bytes
+                  next_cluster += n_cl
+                  size = len(data_bytes)
+              entry_off = root_off + root_idx * 32
+              raw11 = name8.ljust(8, " ").encode("ascii") + ext3.ljust(3, " ").encode("ascii")
+              struct.pack_into("<11sB10xHHHI", img, entry_off, raw11, attr, 0, 0x0021, cl, size)
+              root_idx += 1
+
+          add_root_entry("TEMP", "", 0x10, b"")
+          add_root_entry("CWSDPMI", "EXE", 0x20, (dos_env / "CWSDPMI.EXE").read_bytes())
+          add_root_entry("WINCMD", "EXE", 0x20, (rel / "wincmd.exe").read_bytes())
+          add_root_entry("WINCHECK", "EXE", 0x20, (rel / "wincheck.exe").read_bytes())
+          add_root_entry(
+              "EXTCHILD",
+              "COM",
+              0x20,
+              bytes.fromhex("ba0e01b409cd21b82a4ccd2190904558545f4348494c445f34320d0a24"),
+          )
+          add_root_entry(
+              "UPCASE",
+              "COM",
+              0x20,
+              bytes.fromhex(
+                  "b43f31dbb94000ba4001cd2189c6b440bb0100b90500ba2c01cd21b440bb010089f1ba4001cd21b8004ccd21504950453a"
+              ),
+          )
+          add_root_entry("PORT", "BAT", 0x20, b"@echo off\r\necho P1 & echo P2\r\ngoto :EOF\r\n")
+          add_root_entry("SUITE", "BAT", 0x20, suite_bat)
+          add_root_entry("RUNTESTS", "BAT", 0x20, runtests_bat)
+
+          hd_img = work / "hd_fat16.img"
+          hd_img.write_bytes(img)
+          serial_log = work / "serial.log"
+
+          subprocess.run(
+              [
+                  "qemu-system-i386",
+                  "-m", "8M",
+                  "-cpu", "pentium",
+                  "-fda", str(boot_img),
+                  "-hda", str(hd_img),
+                  "-boot", "a",
+                  "-display", "none",
+                  "-serial", f"file:{serial_log}",
+              ],
+              check=True,
+              timeout=90,
+          )
+
+          transcript = serial_log.read_text(encoding="latin-1")
+          print(transcript)
+          for expected in (
+              "=== BOOTED FREEDOS ===",
+              "ARITH=42",
+              "LOOP=ABC",
+              "C:\\WORK\\C.TXT",
+              "Active code page: 437",
+              "EXT_CHILD_42",
+              "EXT_RC=42",
+              "PIPE:spool_ok",
+              "PIPE:EXT_CHILD_42",
+              "SUITE_RC=0",
+              "CMD5004",
+              "CMD5006",
+              "SARIF_OK",
+              "FIX_RC=0",
+              "PASS_ALL_DOS_TESTS",
+              "=== DONE_FREEDOS ===",
+          ):
+              if expected not in transcript:
+                  print(f"Missing expected FreeDOS marker: {expected}", file=sys.stderr)
+                  sys.exit(1)
+
   build-release:
     name: Build Release (${{ matrix.target }})
     needs:
       - lint
       - test
       - coverage
+      - dos-cross-test
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     strategy:
@@ -294,6 +586,10 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             archive: zip
+          - target: i586-pc-msdosdjgpp
+            os: ubuntu-latest
+            archive: dos-zip
+            apt_packages: unzip curl bzip2 zip python3
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -305,9 +601,27 @@ jobs:
           sudo apt-get install -y --no-install-recommends ${{ matrix.apt_packages }}
 
       - name: Install Rust stable toolchain for ${{ matrix.target }}
+        if: matrix.archive != 'dos-zip'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install Rust nightly & DJGPP toolchain (MS-DOS)
+        if: matrix.archive == 'dos-zip'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly --profile minimal --component rust-src
+          mkdir -p "$RUNNER_TEMP/dos-env"
+          curl -fsSL -L --retry 3 \
+            "https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-linux64-gcc1220.tar.bz2" \
+            -o "$RUNNER_TEMP/dos-env/djgpp.tar.bz2"
+          tar -xjf "$RUNNER_TEMP/dos-env/djgpp.tar.bz2" -C "$RUNNER_TEMP/dos-env"
+          echo "$RUNNER_TEMP/dos-env/djgpp/bin" >> "$GITHUB_PATH"
+          curl -fsSL -L --retry 3 \
+            "https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/repos/base/cwsdpmi.zip" \
+            -o "$RUNNER_TEMP/dos-env/cwsdpmi.zip"
+          unzip -j -o "$RUNNER_TEMP/dos-env/cwsdpmi.zip" "BIN/CWSDPMI.EXE" -d "$RUNNER_TEMP/dos-env"
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@v2
@@ -320,7 +634,17 @@ jobs:
         run: echo "${{ matrix.linker_env }}" >> "$GITHUB_ENV"
 
       - name: Build optimized release binaries (wincmd & wincheck)
+        if: matrix.archive != 'dos-zip'
         run: cargo build --release --locked --bins --target ${{ matrix.target }}
+
+      - name: Build optimized MS-DOS release binaries (WINCMD.EXE & WINCHECK.EXE)
+        if: matrix.archive == 'dos-zip'
+        env:
+          CARGO_TARGET_DIR: target/dos-release
+        run: |
+          cargo +nightly build --manifest-path crates/wincmd-dos/Cargo.toml \
+            -Z build-std=core,alloc,panic_abort -Z json-target-spec \
+            --target targets/i586-pc-msdosdjgpp.json --no-default-features --release
 
       - name: Package release archive (Unix)
         if: matrix.archive == 'tar.gz'
@@ -348,6 +672,29 @@ jobs:
             else
               shasum -a 256 "${STAGE_NAME}.tar.gz" > "${STAGE_NAME}.tar.gz.sha256"
             fi
+          )
+
+      - name: Package release archive (MS-DOS DJGPP + CWSDPMI)
+        if: matrix.archive == 'dos-zip'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          STAGE_NAME="win-cmd-rs-${TAG}-${TARGET}"
+          mkdir -p "dist/${STAGE_NAME}"
+          cp "target/dos-release/i586-pc-msdosdjgpp/release/wincmd.exe" "dist/${STAGE_NAME}/WINCMD.EXE"
+          cp "target/dos-release/i586-pc-msdosdjgpp/release/wincheck.exe" "dist/${STAGE_NAME}/WINCHECK.EXE"
+          cp "$RUNNER_TEMP/dos-env/CWSDPMI.EXE" "dist/${STAGE_NAME}/CWSDPMI.EXE"
+          for doc in README.md USAGE.md LICENSE-MIT LICENSE-APACHE; do
+            cp "${doc}" "dist/${STAGE_NAME}/"
+          done
+          (
+            cd dist
+            zip -rq "${STAGE_NAME}.zip" "${STAGE_NAME}"
+            rm -rf "${STAGE_NAME}"
+            sha256sum "${STAGE_NAME}.zip" > "${STAGE_NAME}.zip.sha256"
           )
 
       - name: Package release archive (Windows)
@@ -390,6 +737,7 @@ jobs:
       - lint
       - test
       - coverage
+      - dos-cross-test
       - build-release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest

@@ -1,11 +1,16 @@
 //! Deterministic in-memory multi-drive and UNC-share [`VirtualFileSystem`] implementation.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use crate::error::CmdError;
 use crate::types::{
-    BS_CHAR, CaseSensitivity, DriveLetter, HostBindingMode, MklinkKind, fold_win32_case,
+    BS_CHAR, CaseSensitivity, DriveLetter, HostBindingMode, MklinkKind, NativeBackingPath,
+    fold_win32_case,
 };
 use crate::vfs::devices::DosDevice;
 use crate::vfs::glob::{self, matches_win32_glob};
@@ -1717,14 +1722,14 @@ impl VirtualFileSystem for InMemoryVfs {
         }
     }
 
-    /// Translates a resolved [`WindowsPath`] to a real host [`PathBuf`] if backed by the host OS.
+    /// Translates a resolved [`WindowsPath`] to a native backing path ([`NativeBackingPath`]) if backed by a host OS or DOS volume.
     ///
     /// # Arguments
     /// * `_win_path` - Resolved [`WindowsPath`] (unused on pure [`InMemoryVfs`]).
     ///
     /// # Returns
-    /// `Some(PathBuf)` if backed by [`super::HostOsVfs`], or `None` for pure [`InMemoryVfs`].
-    fn resolve_host_path(&self, _win_path: &WindowsPath) -> Option<PathBuf> {
+    /// `None` for pure [`InMemoryVfs`].
+    fn resolve_host_path(&self, _win_path: &WindowsPath) -> Option<NativeBackingPath> {
         None
     }
 

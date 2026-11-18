@@ -5,7 +5,12 @@
 //! ([`AttrFilter`]) instead of boolean clusters, sorts `DIR /O:D` chronologically via
 //! [`crate::vfs::FileTimestamp`], and propagates VFS/decoding [`CmdError`]s without silent loss.
 
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 use crate::error::CmdError;
 use crate::parser::ast::SpannedWord;
@@ -1274,10 +1279,16 @@ fn delete_target_spec(
     };
 
     if (pat == "*" || pat == "*.*") && opts.wildcard_confirm == PromptConfirmMode::PromptEach {
-        io.write_stdout_str(&format!(
-            "{}{BS_STR}*, Are you sure (Y/N)? ",
-            base_dir.to_windows_string()
-        ))?;
+        let prompt_msg =
+            if is_dir && interp.config.dialect != crate::types::ShellDialect::WindowsNtCmd {
+                format!("All files in directory will be deleted!{CRLF}Are you sure (Y/N)? ")
+            } else {
+                format!(
+                    "{}{BS_STR}*, Are you sure (Y/N)? ",
+                    base_dir.to_windows_string()
+                )
+            };
+        io.write_stdout_str(&prompt_msg)?;
         let ans = io.read_stdin_line()?.unwrap_or_default();
         if !ans.trim().to_ascii_uppercase().starts_with('Y') {
             return Ok(());

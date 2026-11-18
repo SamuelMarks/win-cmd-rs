@@ -4,7 +4,10 @@
 //! control flow, `FOR` loops, `IF` conditionals, pipelines (`|`), conditional chains (`&`, `&&`, `||`),
 //! execution safety budgets ([`ExecutionLimits`]), and built-in commands.
 
+use alloc::vec::Vec;
+
 pub mod arithmetic;
+pub mod dos_exec;
 pub mod env;
 pub mod io;
 pub mod registry;
@@ -17,15 +20,23 @@ mod exec;
 mod interpreter;
 
 pub use self::argv::{ResolvedCommandTarget, parse_windows_command_line_argv};
+pub use self::dos_exec::{DEFAULT_MIN_CONVENTIONAL_BYTES, DosProcessSpawner};
 pub use self::interpreter::{
     BatchCallFrame, ConsoleState, ExecutionLimits, ExecutionState, FlowControl, Interpreter,
     ProcessEnvironment, PushdEntry, SessionConfig,
 };
 pub use self::io::{
-    BufferedIoStreams, CapturedOutputChunk, CmdIo, ExternalSpawnRequest, ExternalSpawnResult,
-    HostProcessSpawner, IoStreams, MockProcessSpawner, OutputCaptureMode, OutputStreamId,
-    ProcessSpawner, RedirectedIo, StdIoStreams, consume_buffered_line, flush_stream_gracefully,
-    map_child_process_io_error, write_and_flush_gracefully, write_child_stdin_bytes,
+    BufferedIoStreams, ByteStreamBufRead, ByteStreamIo, ByteStreamRead, ByteStreamWrite,
+    CapturedOutputChunk, CmdIo, ExternalSpawnRequest, ExternalSpawnResult, InMemoryByteReader,
+    InMemoryByteWriter, IoStreams, MockProcessSpawner, OutputCaptureMode, OutputStreamId,
+    ProcessSpawner, RedirectedIo, consume_buffered_line, flush_byte_stream_gracefully,
+    write_byte_stream_gracefully,
+};
+#[cfg(feature = "std")]
+pub use self::io::{
+    HostProcessSpawner, StdBufReadAdapter, StdIoStreams, StdReadAdapter, StdWriteAdapter,
+    flush_stream_gracefully, map_child_process_io_error, write_and_flush_gracefully,
+    write_child_stdin_bytes,
 };
 
 /// Saved active drive and per-drive working directories for restoring VFS state after subshells.
@@ -1353,5 +1364,221 @@ mod tests {
             interp.execute_interactive_line("(copy /b C:/raw.bin CON) > C:/ro.txt", &mut io),
             ExitCode::FAILURE
         );
+    }
+
+    /// Verifies `DosProcessSpawner` PSP tail modes, `%TEMP%` spooling & cleanup, env/memory limits, and error paths.
+    #[test]
+    fn test_dos_process_spawner_psp_cmdline_rsp_and_spool_cleanup() {
+        use crate::dos::{
+            DosKernelApi, DosWriteDisposition, LongCmdlineTransfer, SharedDosKernel,
+            SimChildProgram, SimulatedDosKernel,
+        };
+        use crate::types::{
+            NativeBackingPath, ProcessPriority, StartEnvMode, StartWindowMode, WaitMode,
+        };
+        use crate::vfs::path::WindowsPath;
+
+        let shared = SharedDosKernel::new(SimulatedDosKernel::new());
+        shared.with_mut(|k| {
+            assert_eq!(k.create_dir("C:/TEMP"), Ok(()));
+            assert_eq!(
+                k.write_file_bytes("C:/NOTDIR.TMP", b"x", DosWriteDisposition::CreateTruncate),
+                Ok(())
+            );
+            k.register_child_program(
+                "C:\\ECHO.COM",
+                SimChildProgram::EchoPspAndCmdline {
+                    exit_code: ExitCode::SUCCESS,
+                },
+            );
+        });
+
+        let mut spawner = DosProcessSpawner::new(shared.clone());
+        assert_eq!(spawner.kernel().current_drive(), DriveLetter::C);
+        assert_eq!(spawner.kernel_mut().current_drive(), DriveLetter::C);
+        let _cloned = spawner.clone_box();
+
+        let mut req = ExternalSpawnRequest {
+            program_vfs_path: WindowsPath::root(DriveLetter::C).join_component("ECHO.COM"),
+            program_host_path: None,
+            args: vec!["argA".to_owned(), "argB".to_owned()],
+            raw_tail: String::new(),
+            cwd_vfs: WindowsPath::root(DriveLetter::C),
+            cwd_host: None,
+            env_vars: vec![
+                ("WINCMD_PIPE_DIR".to_owned(), "   ".to_owned()),
+                ("TEMP".to_owned(), "C:/NOTDIR.TMP".to_owned()),
+                ("TMP".to_owned(), "C:/TEMP".to_owned()),
+                ("CMDLINE".to_owned(), "stale".to_owned()),
+            ],
+            stdin: "text_in".to_owned(),
+            stdin_bytes: Vec::new(),
+            wait_mode: WaitMode::Wait,
+            window_mode: StartWindowMode::Normal,
+            env_mode: StartEnvMode::CurrentEnv,
+            priority: ProcessPriority::Normal,
+        };
+
+        let short_res = spawner.spawn_external(&req);
+        assert_eq!(
+            short_res.map(|r| r.stdout),
+            Ok(format!("PSP= argA argB{CRLF}CMDLINE={CRLF}"))
+        );
+        assert_eq!(
+            shared.with(|k| k.read_dir_entries("C:/TEMP").map(|v| v.len())),
+            Ok(0)
+        );
+
+        req.program_host_path = Some(NativeBackingPath::from_string("C:\\ECHO.COM"));
+        req.cwd_host = Some(NativeBackingPath::from_string("C:\\"));
+        req.env_vars = Vec::new();
+        req.raw_tail = "x".repeat(135);
+        req.stdin = String::new();
+        req.stdin_bytes = b"bin".to_vec();
+
+        let cmdline_res = spawner.spawn_external(&req);
+        assert!(cmdline_res.is_ok_and(|r| r.stdout.contains("CMDLINE=C:\\ECHO.COM ")));
+
+        spawner.cmdline_policy = LongCmdlineTransfer::ResponseFileAtSign;
+        req.stdin_bytes.clear();
+        let rsp_res = spawner.spawn_external(&req);
+        assert!(rsp_res.is_ok_and(|r| r.stdout.contains("PSP= @C:\\_WCR")));
+        req.raw_tail = "short".to_owned();
+        assert!(spawner.spawn_external(&req).is_ok());
+        req.raw_tail = "x".repeat(135);
+
+        spawner.cmdline_policy = LongCmdlineTransfer::Strict126BytePsp;
+        assert!(matches!(
+            spawner.spawn_external(&req),
+            Err(CmdError::CommandLineTooLong { .. })
+        ));
+
+        run_dos_spawner_fault_and_limit_checks(&mut spawner, &mut req, &shared);
+    }
+
+    /// Exercises `DosProcessSpawner` environment, conventional RAM, and spool-cleanup fault paths.
+    ///
+    /// # Arguments
+    /// * `spawner` - Mutable [`DosProcessSpawner`].
+    /// * `req` - Mutable [`ExternalSpawnRequest`].
+    /// * `shared` - Shared [`crate::dos::SimulatedDosKernel`] handle.
+    fn run_dos_spawner_fault_and_limit_checks(
+        spawner: &mut DosProcessSpawner<
+            crate::dos::SharedDosKernel<crate::dos::SimulatedDosKernel>,
+        >,
+        req: &mut ExternalSpawnRequest,
+        shared: &crate::dos::SharedDosKernel<crate::dos::SimulatedDosKernel>,
+    ) {
+        use crate::dos::{
+            DosEnvSizeLimit, DosFaultOp, DosFaultRule, LongCmdlineTransfer, PipeSpoolCleanupPolicy,
+        };
+        use crate::types::DosErrorCode;
+
+        spawner.cmdline_policy = LongCmdlineTransfer::CmdlineEnvVar;
+        spawner.env_limit = DosEnvSizeLimit::CommandComBytes(16);
+        assert_eq!(
+            spawner.spawn_external(req),
+            Err(CmdError::OutOfEnvironmentSpace)
+        );
+        spawner.env_limit = DosEnvSizeLimit::Dpmi32KiB;
+
+        spawner.min_conventional_bytes = 900_000;
+        assert_eq!(
+            spawner.spawn_external(req),
+            Err(CmdError::InsufficientMemory)
+        );
+        spawner.min_conventional_bytes = DEFAULT_MIN_CONVENTIONAL_BYTES;
+
+        req.raw_tail = "ok".to_owned();
+        shared.with_mut(|k| {
+            k.push_fault(DosFaultRule {
+                op: DosFaultOp::DeleteFile,
+                path_substr: Some("_WCO".to_owned()),
+                error_code: DosErrorCode::FileNotFound,
+            });
+        });
+        assert!(spawner.spawn_external(req).is_ok());
+        shared.with_mut(|k| {
+            k.fault_queue.clear();
+            for _ in 0..2 {
+                k.push_fault(DosFaultRule {
+                    op: DosFaultOp::DeleteFile,
+                    path_substr: None,
+                    error_code: DosErrorCode::AccessDenied,
+                });
+            }
+        });
+        assert!(spawner.spawn_external(req).is_err());
+        spawner.cleanup_policy = PipeSpoolCleanupPolicy::BestEffort;
+        assert!(spawner.spawn_external(req).is_ok());
+    }
+
+    /// Verifies `Interpreter::with_dos_kernel`, sequential `%TEMP%` pipelines, `START`, `Ctrl+Break`, and `MemoryProfile`s.
+    #[test]
+    fn test_dos_interpreter_pipelines_start_ctrl_break_and_memory_profiles() {
+        use crate::dos::{DosKernelApi, DosWriteDisposition, SimChildProgram, SimulatedDosKernel};
+        use crate::types::{InterruptState, MemoryProfile};
+
+        let mut kernel = SimulatedDosKernel::new();
+        assert_eq!(kernel.create_dir("C:/DOS"), Ok(()));
+        assert_eq!(kernel.create_dir("C:/TEMP"), Ok(()));
+        assert_eq!(
+            kernel.write_file_bytes(
+                "C:/DOS/UPPER.COM",
+                b"MZ",
+                DosWriteDisposition::CreateTruncate
+            ),
+            Ok(())
+        );
+        kernel.register_child_program(
+            "C:\\DOS\\UPPER.COM",
+            SimChildProgram::UppercaseFilter {
+                exit_code: ExitCode::SUCCESS,
+            },
+        );
+
+        let (mut interp, shared) = Interpreter::with_dos_kernel(kernel);
+        for prof in [
+            MemoryProfile::DosCompact4MiB,
+            MemoryProfile::DosExtended16MiBPlus,
+            MemoryProfile::HostUnbounded,
+            MemoryProfile::DosStandard8MiB,
+        ] {
+            interp.apply_memory_profile(prof);
+            assert_eq!(interp.config.memory_profile, prof);
+        }
+
+        let mut io = BufferedIoStreams::new();
+        assert_eq!(
+            interp.execute_interactive_line("echo dos pipe | upper | sort", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(io.stdout, format!("DOS PIPE {CRLF}"));
+
+        io.stdout.clear();
+        assert_eq!(
+            interp.execute_interactive_line("start /b upper < NUL", &mut io),
+            ExitCode::SUCCESS
+        );
+
+        shared.with_mut(|k| k.ctrl_break = InterruptState::Pending);
+        io.stdout.clear();
+        assert_eq!(
+            interp.execute_interactive_line("echo left | echo right", &mut io),
+            ExitCode::CTRL_C
+        );
+        assert_eq!(io.stdout, "");
+
+        assert_eq!(
+            interp
+                .proc_env
+                .vfs
+                .write_bytes("C:/LOOP.BAT", b"@echo one\r\n@echo two\r\n"),
+            Ok(())
+        );
+        shared.with_mut(|k| k.ctrl_break = InterruptState::Pending);
+        let mut batch_io = BufferedIoStreams::with_stdin("Y\r\n".to_owned());
+        let _code = interp.execute_interactive_line("C:\\LOOP.BAT", &mut batch_io);
+        assert!(batch_io.stdout.contains("Terminate batch job (Y/N)? "));
     }
 }

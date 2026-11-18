@@ -1,7 +1,11 @@
 //! Inline `REM wincheck` / `:: wincheck` suppression directives, file-level encoding checks,
 //! and PEG syntax diagnostic conversion.
 
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::borrow::ToOwned;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use crate::error::{CmdError, ProbableMisuseKind};
 use crate::linter::rules::{Diagnostic, RuleId, Severity, SuggestedFix, all_rule_metadata};

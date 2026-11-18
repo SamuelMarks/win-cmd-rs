@@ -5,11 +5,16 @@
 //! `QuoteUnquotedVariablesPass`) while respecting [`FixApplicability`] (`Safe` vs `UnsafeOptIn`),
 //! preserving comments and trivia, and recomputing exact byte [`Span`]s.
 
-use std::collections::BTreeSet;
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeSet;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::linter::directives::{SuppressionTable, check_file_encoding_and_lines};
 pub use crate::linter::passes::delayed_exp::DelayedExpansionBlockPass;
 pub use crate::linter::passes::dialect::ExecutionModePercentPass;
+pub use crate::linter::passes::dos_compat::MsDosPortabilityPass;
 pub use crate::linter::passes::quoting::QuoteUnquotedVariablesPass;
 pub use crate::linter::passes::structural::StructuralSyntaxFixPass;
 use crate::linter::rules::{FixApplicability, LinterConfig, RuleId, rule_default_severity};
@@ -150,6 +155,21 @@ impl RewriteContext {
         }
         let id = RuleId::new(rule_code);
         if let Some(cfg) = &self.linter_config {
+            if cfg.dialect == crate::types::ShellDialect::MsDos622
+                && matches!(
+                    rule_code,
+                    "CMD2001"
+                        | "CMD2004"
+                        | "CMD2005"
+                        | "CMD2008"
+                        | "CMD2009"
+                        | "CMD3004"
+                        | "CMD4001"
+                        | "CMD4002"
+                )
+            {
+                return false;
+            }
             let sev = rule_default_severity(rule_code);
             let included = cfg.included_rules.is_empty() || cfg.included_rules.contains(&id);
             if sev < cfg.min_severity || cfg.excluded_rules.contains(&id) || !included {
@@ -252,6 +272,8 @@ pub enum BuiltinRewritePass {
     DelayedExpansionBlock(DelayedExpansionBlockPass),
     /// Smart variable & path quoting (`"%VAR%"`, `"%~1"`, `"%%~I"`, `CMD2003`, `CMD2006`, `CMD2007`).
     QuoteUnquotedVariables(QuoteUnquotedVariablesPass),
+    /// MS-DOS 6.22 `COMMAND.COM` dialect rewrites (`CMD5004` `&` line split, `CMD5006` `:EOF` footer).
+    MsDosPortability(MsDosPortabilityPass),
 }
 
 impl CstRewriteRule for BuiltinRewritePass {
@@ -265,6 +287,7 @@ impl CstRewriteRule for BuiltinRewritePass {
             Self::ExecutionModePercent(p) => p.rule_id(),
             Self::DelayedExpansionBlock(p) => p.rule_id(),
             Self::QuoteUnquotedVariables(p) => p.rule_id(),
+            Self::MsDosPortability(p) => p.rule_id(),
         }
     }
 
@@ -278,6 +301,7 @@ impl CstRewriteRule for BuiltinRewritePass {
             Self::ExecutionModePercent(p) => p.name(),
             Self::DelayedExpansionBlock(p) => p.name(),
             Self::QuoteUnquotedVariables(p) => p.name(),
+            Self::MsDosPortability(p) => p.name(),
         }
     }
 
@@ -295,6 +319,7 @@ impl CstRewriteRule for BuiltinRewritePass {
             Self::ExecutionModePercent(p) => p.rewrite_script(root, ctx),
             Self::DelayedExpansionBlock(p) => p.rewrite_script(root, ctx),
             Self::QuoteUnquotedVariables(p) => p.rewrite_script(root, ctx),
+            Self::MsDosPortability(p) => p.rewrite_script(root, ctx),
         }
     }
 }
@@ -384,6 +409,7 @@ impl CstRewriter {
                 BuiltinRewritePass::StructuralSyntax(StructuralSyntaxFixPass),
                 BuiltinRewritePass::ExecutionModePercent(ExecutionModePercentPass),
                 BuiltinRewritePass::QuoteUnquotedVariables(QuoteUnquotedVariablesPass),
+                BuiltinRewritePass::MsDosPortability(MsDosPortabilityPass),
             ],
         }
     }
@@ -895,5 +921,48 @@ mod tests {
         );
         assert_eq!(unchanged_repl, repl_sample);
         assert_eq!(repl_edits, 0);
+    }
+
+    /// Verifies `MsDosPortabilityPass` `CMD5004` `&` splitting, `CMD5006` `:EOF` footer, and idempotence.
+    #[test]
+    fn test_msdos_portability_pass_rewrites_and_idempotence() {
+        let pass = BuiltinRewritePass::MsDosPortability(MsDosPortabilityPass);
+        assert_eq!(pass.rule_id(), RuleId::new("CMD5006"));
+        assert_eq!(pass.name(), "MsDosPortabilityPass");
+
+        let dos_cfg = LinterConfig {
+            dialect: crate::types::ShellDialect::MsDos622,
+            ..LinterConfig::default()
+        };
+        let dos_src = format!(
+            "echo a & echo b{CRLF}(echo in_blk & echo two){CRLF}echo c && echo d{CRLF}goto{CRLF}goto :EOF{CRLF}"
+        );
+        let (dos_rewritten, dos_edits) =
+            crate::linter::rewrite_script(&dos_src, ExecutionContext::BatchFile, &dos_cfg);
+        assert!(dos_edits >= 2);
+        assert!(dos_rewritten.contains("goto EOF"));
+        assert!(dos_rewritten.ends_with(&format!(":EOF{CRLF}")));
+
+        let mut dos_excl = dos_cfg.clone();
+        dos_excl.excluded_rules.insert(RuleId::new("CMD5004"));
+        dos_excl.excluded_rules.insert(RuleId::new("CMD5006"));
+        let (_, excl_edits) =
+            crate::linter::rewrite_script(&dos_src, ExecutionContext::BatchFile, &dos_excl);
+        assert_eq!(excl_edits, 0);
+
+        let pre_eof = format!("goto :EOF{CRLF}:EOF{CRLF}");
+        let (_, pre_edits) =
+            crate::linter::rewrite_script(&pre_eof, ExecutionContext::BatchFile, &dos_cfg);
+        assert_eq!(pre_edits, 0);
+
+        let (dos_idempotent, second_edits) =
+            crate::linter::rewrite_script(&dos_rewritten, ExecutionContext::BatchFile, &dos_cfg);
+        assert_eq!(dos_idempotent, dos_rewritten);
+        assert_eq!(second_edits, 0);
+
+        let block_src = format!("({CRLF}  set A=1{CRLF}  echo %A%{CRLF}){CRLF}");
+        let (dos_blk, _) =
+            crate::linter::rewrite_script(&block_src, ExecutionContext::BatchFile, &dos_cfg);
+        assert!(!dos_blk.contains("EnableDelayedExpansion"));
     }
 }

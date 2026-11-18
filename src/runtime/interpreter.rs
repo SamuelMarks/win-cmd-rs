@@ -1,6 +1,11 @@
 //! Stateful `Interpreter` session struct, safety limits, console history, `AutoRun`, and tab completion.
 
-use std::collections::{BTreeMap, VecDeque};
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::error::{CmdError, ExecutionLimitFailure, LimitKind};
 use crate::reader::stream::BatchFrameReader;
@@ -13,10 +18,10 @@ use crate::types::{
     VerifyCopyMode, WaitMode,
 };
 use crate::vfs::path::WindowsPath;
-use crate::vfs::{HostOsVfs, InMemoryVfs, VirtualFileSystem};
+use crate::vfs::{InMemoryVfs, VirtualFileSystem};
 
 use super::env::EnvironmentStack;
-use super::io::{CmdIo, HostProcessSpawner, ProcessSpawner, consume_buffered_line};
+use super::io::{CmdIo, ProcessSpawner, consume_buffered_line};
 use super::registry::RegistryStore;
 use super::{VfsCwdSnapshot, restore_vfs_cwds};
 
@@ -153,8 +158,10 @@ pub struct ProcessEnvironment {
     pub startup_env: EnvironmentStack,
     /// Virtual file system backing all drives and files.
     pub vfs: Box<dyn VirtualFileSystem>,
-    /// External process spawner (`HostProcessSpawner` or `MockProcessSpawner`).
+    /// External process spawner (`HostProcessSpawner`, `DosProcessSpawner`, or `MockProcessSpawner`).
     pub spawner: Box<dyn ProcessSpawner>,
+    /// Optional attached MS-DOS kernel (`SharedDosKernel`) for hardware `Ctrl+Break`, RTC, memory, and `CHCP`/`CLS`.
+    pub dos_kernel: Option<Box<dyn crate::dos::DosKernelApi>>,
     /// Unified Registry store (`HKLM`, `HKCU`, `HKCR`, `HKU`, `HKCC`) backing `Command Processor`, `ASSOC`, `FTYPE`, and `REG`.
     pub registry_store: RegistryStore,
     /// Stack of directories (and optional temporary UNC drives) pushed by `PUSHD`.
@@ -166,6 +173,16 @@ pub struct ProcessEnvironment {
 pub struct SessionConfig {
     /// Host working directory synchronization mode (`Isolated` vs `Synchronized`).
     pub host_binding_mode: HostBindingMode,
+    /// Active shell dialect (`WindowsNtCmd`, `MsDos622`, or `FreeDos`).
+    pub dialect: crate::types::ShellDialect,
+    /// Primary permanent shell policy (`COMMAND.COM /P`).
+    pub permanent_shell: crate::types::PermanentShellMode,
+    /// Optional MS-DOS `/E:nnnnn` environment paragraph size budget (`160..=32768` bytes).
+    pub dos_env_bytes: Option<u16>,
+    /// Active memory footprint and recursion/history budget profile (`HostUnbounded` vs DOS 4–16 MiB).
+    pub memory_profile: crate::types::MemoryProfile,
+    /// Character provenance tracking mode (`Full` vs `Compact`).
+    pub provenance_mode: crate::reader::char_map::ProvenanceMode,
     /// Configurable locale formatting rules for `DATE`, `TIME`, and `DIR`.
     pub locale: CmdLocaleConfig,
     /// Current disk write verification mode (`VERIFY ON` / `VERIFY OFF`).
@@ -198,6 +215,11 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             host_binding_mode: HostBindingMode::Isolated,
+            dialect: crate::types::ShellDialect::WindowsNtCmd,
+            permanent_shell: crate::types::PermanentShellMode::Transient,
+            dos_env_bytes: None,
+            memory_profile: crate::types::MemoryProfile::HostUnbounded,
+            provenance_mode: crate::reader::char_map::ProvenanceMode::Full,
             locale: CmdLocaleConfig::default(),
             verify_state: VerifyCopyMode::Unverified,
             unicode_output_mode: OutputUnicodeMode::Ansi,
@@ -228,6 +250,8 @@ pub struct ConsoleState {
     pub console_title: String,
     /// Current console color pair (`COLOR`).
     pub console_color: Option<ConsoleColor>,
+    /// Screen-clear and color rendering backend (`AnsiSysEscape`, `BiosVgaAttribute`, or `DumbTeletype`).
+    pub render_backend: crate::types::ConsoleRenderBackend,
     /// Line editing cursor mode (`DOSKEY /INSERT` vs `/OVERSTRIKE`).
     pub doskey_edit_mode: DoskeyEditMode,
     /// Defined `DOSKEY` macros (`name -> definition`).
@@ -251,6 +275,7 @@ impl Default for ConsoleState {
             console_lines: 25,
             console_title: "Command Prompt".to_owned(),
             console_color: None,
+            render_backend: crate::types::ConsoleRenderBackend::AnsiSysEscape,
             doskey_edit_mode: DoskeyEditMode::Insert,
             doskey_macros: BTreeMap::new(),
             command_history: VecDeque::new(),
@@ -714,14 +739,15 @@ impl Interpreter {
         Self::with_vfs(Box::new(InMemoryVfs::new()))
     }
 
-    /// Constructs a new [`Interpreter`] backed by [`HostOsVfs::from_host_env()`] and
+    /// Constructs a new [`Interpreter`] backed by [`crate::vfs::HostOsVfs::from_host_env()`] and
     /// populated with the current OS process environment (`std::env::vars()`).
     ///
     /// # Returns
     /// Host-native [`Interpreter`].
+    #[cfg(feature = "std")]
     #[must_use]
     pub fn new_host_native() -> Self {
-        let mut interp = Self::with_vfs(Box::new(HostOsVfs::from_host_env()));
+        let mut interp = Self::with_vfs(Box::new(crate::vfs::HostOsVfs::from_host_env()));
         interp.proc_env.env = EnvironmentStack::from_host_iter(std::env::vars());
         interp.proc_env.startup_env = interp.proc_env.env.clone();
         interp.config.limits = ExecutionLimits::cli_default();
@@ -739,18 +765,175 @@ impl Interpreter {
     pub fn with_vfs(vfs: Box<dyn VirtualFileSystem>) -> Self {
         let env = EnvironmentStack::new();
         let startup_env = env.clone();
+        #[cfg(feature = "std")]
+        let default_spawner: Box<dyn ProcessSpawner> = Box::new(super::io::HostProcessSpawner);
+        #[cfg(not(feature = "std"))]
+        let default_spawner: Box<dyn ProcessSpawner> =
+            Box::new(super::io::MockProcessSpawner::new());
         Self {
             proc_env: ProcessEnvironment {
                 env,
                 startup_env,
                 vfs,
-                spawner: Box::new(HostProcessSpawner),
+                spawner: default_spawner,
+                dos_kernel: None,
                 registry_store: RegistryStore::new(),
                 pushd_stack: Vec::new(),
             },
             config: SessionConfig::default(),
             console: ConsoleState::default(),
             exec: ExecutionState::default(),
+        }
+    }
+
+    /// Constructs an MS-DOS [`Interpreter`] session sharing `kernel` across [`crate::vfs::DosFatVfs`],
+    /// [`super::DosProcessSpawner`], and hardware `Ctrl+Break` / RTC / `CHCP` / `CLS` hooks.
+    ///
+    /// # Arguments
+    /// * `kernel` - Initialized [`crate::dos::DosKernelApi`] implementation.
+    ///
+    /// # Returns
+    /// `(Interpreter, SharedDosKernel<K>)` wired to the same live MS-DOS kernel.
+    #[must_use]
+    pub fn with_dos_kernel<K: crate::dos::DosKernelApi + 'static>(
+        kernel: K,
+    ) -> (Self, crate::dos::SharedDosKernel<K>) {
+        use crate::dos::DosKernelApi;
+
+        let shared = crate::dos::SharedDosKernel::new(kernel);
+        let vfs = Box::new(crate::vfs::DosFatVfs::new(shared.clone()));
+        let spawner = Box::new(super::DosProcessSpawner::new(shared.clone()));
+        let env_pairs = shared.startup_env_vars().unwrap_or_default();
+        let env = EnvironmentStack::from_host_iter(env_pairs);
+        let startup_env = env.clone();
+        let (cols, lines) = shared.console_geometry();
+        let codepage = shared
+            .active_codepage()
+            .unwrap_or(CodePage::OemUnitedStates);
+        let version_banner = alloc::format!("{}", shared.dos_version());
+
+        let mut interp = Self {
+            proc_env: ProcessEnvironment {
+                env,
+                startup_env,
+                vfs,
+                spawner,
+                dos_kernel: Some(Box::new(shared.clone())),
+                registry_store: RegistryStore::new(),
+                pushd_stack: Vec::new(),
+            },
+            config: SessionConfig {
+                version_banner,
+                verify_state: shared.verify_flag(),
+                ..SessionConfig::default()
+            },
+            console: ConsoleState {
+                codepage,
+                console_cols: cols,
+                console_lines: lines,
+                render_backend: crate::types::ConsoleRenderBackend::BiosVgaAttribute,
+                ..ConsoleState::default()
+            },
+            exec: ExecutionState::default(),
+        };
+        interp.apply_memory_profile(crate::types::MemoryProfile::DosStandard8MiB);
+        (interp, shared)
+    }
+
+    /// Applies a [`crate::types::MemoryProfile`] to recursion limits, `DOSKEY` history capacity, and provenance mode.
+    ///
+    /// # Arguments
+    /// * `profile` - Target [`crate::types::MemoryProfile`].
+    pub fn apply_memory_profile(&mut self, profile: crate::types::MemoryProfile) {
+        use crate::reader::char_map::ProvenanceMode;
+        use crate::types::MemoryProfile;
+
+        self.config.memory_profile = profile;
+        match profile {
+            MemoryProfile::HostUnbounded => {
+                self.config.limits = ExecutionLimits::sandboxed();
+                self.config.provenance_mode = ProvenanceMode::Full;
+                self.console.set_history_list_size(50);
+            }
+            MemoryProfile::DosCompact4MiB => {
+                self.config.limits = ExecutionLimits {
+                    max_steps: None,
+                    max_call_depth: Some(64),
+                    max_loop_iterations: None,
+                };
+                self.config.provenance_mode = ProvenanceMode::Compact;
+                self.console.set_history_list_size(16);
+            }
+            MemoryProfile::DosStandard8MiB => {
+                self.config.limits = ExecutionLimits {
+                    max_steps: None,
+                    max_call_depth: Some(128),
+                    max_loop_iterations: None,
+                };
+                self.config.provenance_mode = ProvenanceMode::Compact;
+                self.console.set_history_list_size(32);
+            }
+            MemoryProfile::DosExtended16MiBPlus => {
+                self.config.limits = ExecutionLimits {
+                    max_steps: None,
+                    max_call_depth: Some(256),
+                    max_loop_iterations: None,
+                };
+                self.config.provenance_mode = ProvenanceMode::Full;
+                self.console.set_history_list_size(50);
+            }
+        }
+    }
+
+    /// Polls any attached MS-DOS kernel for a latched `INT 23h` `Ctrl+C` / `Ctrl+Break` signal.
+    pub fn poll_dos_ctrl_break(&mut self) {
+        if let Some(kernel) = &mut self.proc_env.dos_kernel
+            && kernel.poll_ctrl_break() == InterruptState::Pending
+        {
+            self.exec.interrupt_state = InterruptState::Pending;
+        }
+    }
+
+    /// Applies [`crate::types::ShellDialect`] defaults (`ExtensionsMode`, `CodePage`, `PATHEXT`, and `VER` banner).
+    ///
+    /// # Arguments
+    /// * `dialect` - Target [`crate::types::ShellDialect`].
+    pub fn apply_shell_dialect(&mut self, dialect: crate::types::ShellDialect) {
+        use crate::types::ShellDialect;
+
+        self.config.dialect = dialect;
+        match dialect {
+            ShellDialect::WindowsNtCmd => {
+                self.proc_env.env.extensions = ExtensionsMode::Enabled;
+                "Microsoft Windows [Version 10.0.19045.5011]"
+                    .clone_into(&mut self.config.version_banner);
+            }
+            ShellDialect::MsDos622 => {
+                self.proc_env.env.extensions = ExtensionsMode::Disabled;
+                self.console.codepage = self
+                    .proc_env
+                    .dos_kernel
+                    .as_ref()
+                    .and_then(|k| k.active_codepage().ok())
+                    .unwrap_or(CodePage::OemUnitedStates);
+                self.proc_env.env.set("PATHEXT", ".COM;.EXE;.BAT");
+                if let Some(k) = &self.proc_env.dos_kernel {
+                    self.config.version_banner = alloc::format!("{}", k.dos_version());
+                } else {
+                    "MS-DOS Version 6.22".clone_into(&mut self.config.version_banner);
+                }
+            }
+            ShellDialect::FreeDos => {
+                self.proc_env.env.extensions = ExtensionsMode::Enabled;
+                self.console.codepage = self
+                    .proc_env
+                    .dos_kernel
+                    .as_ref()
+                    .and_then(|k| k.active_codepage().ok())
+                    .unwrap_or(CodePage::OemUnitedStates);
+                self.proc_env.env.set("PATHEXT", ".COM;.EXE;.BAT");
+                "FreeDOS FreeCom version 0.85a".clone_into(&mut self.config.version_banner);
+            }
         }
     }
 
@@ -830,7 +1013,7 @@ impl Interpreter {
     /// # Returns
     /// Child [`Interpreter`] owning the live VFS.
     pub(crate) fn fork_subshell_taking_vfs(&mut self) -> Self {
-        let vfs = std::mem::replace(&mut self.proc_env.vfs, Box::new(InMemoryVfs::new()));
+        let vfs = core::mem::replace(&mut self.proc_env.vfs, Box::new(InMemoryVfs::new()));
         let mut exec = ExecutionState::default();
         exec.source_map = self.exec.source_map.clone();
         exec.for_vars.clone_from(&self.exec.for_vars);
@@ -848,6 +1031,7 @@ impl Interpreter {
                 startup_env: self.proc_env.startup_env.clone(),
                 vfs,
                 spawner: self.proc_env.spawner.clone_box(),
+                dos_kernel: self.proc_env.dos_kernel.as_ref().map(|k| k.clone_box()),
                 registry_store: self.proc_env.registry_store.clone(),
                 pushd_stack: Vec::new(),
             },

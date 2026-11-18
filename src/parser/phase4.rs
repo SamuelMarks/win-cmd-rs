@@ -6,6 +6,9 @@
 //!   where `^` escapes the next character (even INSIDE double quotes `"..."`!) and unescaped
 //!   `!VAR!` / `!VAR:~offset,len!` / `!VAR:old=new!` sequences are expanded.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::parser::phase1::push_expanded_text;
 use crate::parser::var_ops::evaluate_var_expression;
 use crate::reader::char_map::{ExpansionOrigin, LogicalLineBuffer, SpannedChar};

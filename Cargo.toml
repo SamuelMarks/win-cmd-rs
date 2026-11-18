@@ -1,6 +1,10 @@
+[workspace]
+members = ["."]
+exclude = ["crates/wincmd-dos"]
+
 [package]
 name = "win-cmd-rs"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -17,13 +21,20 @@ path = "src/lib.rs"
 [[bin]]
 name = "wincmd"
 path = "src/bin/wincmd.rs"
+required-features = ["std"]
 
 [[bin]]
 name = "wincheck"
 path = "src/bin/wincheck.rs"
+required-features = ["std"]
+
+[features]
+default = ["std"]
+std = ["derive_more/std"]
+dos = []
 
 [dependencies]
-derive_more = { version = "2", features = ["display", "error", "from", "into", "deref", "constructor", "is_variant"] }
+derive_more = { version = "2", default-features = false, features = ["display", "error", "from", "into", "deref", "constructor", "is_variant"] }
 
 [lints.rust]
 unsafe_code = "forbid"

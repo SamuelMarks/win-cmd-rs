@@ -8,6 +8,9 @@
 //!   is preserved literally as `%VAR%` (advancing past the closing `%` so `%UNDEF1%_%UNDEF2%`
 //!   never falsely pairs the middle `%_%`).
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::error::CmdError;
 use crate::parser::modifiers::{ParameterModifiers, parse_dollar_env_modifier};
 use crate::parser::var_ops::evaluate_var_expression;

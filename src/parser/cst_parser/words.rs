@@ -1,6 +1,11 @@
 //! `SimpleCommand`, `SET` assignment, redirection, word, and `%` / `!` / `^` sub-word CST rules.
 
-use std::collections::BTreeSet;
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::error::{PegExpected, ProbableMisuseKind};
 use crate::parser::cst::{CstElement, CstNode, CstToken, SyntaxKind};

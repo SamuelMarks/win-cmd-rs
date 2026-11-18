@@ -3,6 +3,10 @@
 //! Converts `FOR` loop variables and percent literals between `ExecutionContext::BatchFile`
 //! (`%%I`, `%%~dpI`, `100%%`) and `ExecutionContext::InteractiveRepl` (`%I`, `%~dpI`, `100%`).
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::vec::Vec;
+
 use crate::linter::rewriter::{CstRewriteRule, RewriteContext};
 use crate::linter::rules::{FixApplicability, RuleId};
 use crate::parser::cst::{CstElement, CstNode, CstToken, SyntaxKind};

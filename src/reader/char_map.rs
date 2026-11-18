@@ -4,6 +4,9 @@
 //! descriptor recording its original [`Span`] in the physical file, whether it was
 //! escaped by a caret (`^`), and which expansion pass produced it.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use derive_more::{Display, IsVariant};
 
 use crate::span::{ByteOffset, SourceId, Span};

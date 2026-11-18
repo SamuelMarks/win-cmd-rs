@@ -5,6 +5,12 @@
 //! and upgrades standalone quoted `"%1"` / `"%1\sub"` / `"%%I"` arguments to `"%~1"` / `"%%~I"`
 //! (`CMD2007`) without mutating multi-word display strings like `ECHO "Usage: %0 %1"`.
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::linter::rewriter::{CstRewriteRule, RewriteContext};
 use crate::linter::rules::{FixApplicability, RuleId};
 use crate::parser::cst::{CstElement, CstNode, CstToken, SyntaxKind};

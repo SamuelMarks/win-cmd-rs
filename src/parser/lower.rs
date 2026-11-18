@@ -2,6 +2,12 @@
 //! `wincmd` runtime execution (`WordPartsMode::Lightweight`) and `wincheck` static analysis
 //! (`WordPartsMode::PopulateSubwordParts`).
 
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::error::CmdError;
 use crate::parser::ast::{
     CommandExpr, ComparisonOp, CompoundBlock, ForFOptions, ForStatement, ForVariant, IfCondition,

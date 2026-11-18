@@ -5,6 +5,11 @@
 //! blocks and `FOR` loops into `!VAR!`, and injects `SETLOCAL EnableDelayedExpansion`
 //! when safe (checking for unescaped literal `!` characters in `Safe` mode).
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::linter::rewriter::{CstRewriteRule, RewriteContext};
 use crate::linter::rules::{FixApplicability, RuleId};
 use crate::parser::cst::{CstElement, CstNode, CstToken, SyntaxKind};
@@ -42,7 +47,12 @@ impl CstRewriteRule for DelayedExpansionBlockPass {
     /// # Returns
     /// Rewritten [`CstNode`].
     fn rewrite_script(&self, root: &CstNode, ctx: &mut RewriteContext) -> CstNode {
-        if ctx.fix_safety < FixApplicability::RecommendedRepair {
+        if ctx.fix_safety < FixApplicability::RecommendedRepair
+            || ctx
+                .linter_config
+                .as_ref()
+                .is_some_and(|c| c.dialect == crate::types::ShellDialect::MsDos622)
+        {
             return root.clone();
         }
         if !ctx.has_setlocal_enable_delayed

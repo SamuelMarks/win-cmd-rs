@@ -1,7 +1,12 @@
 //! Diagnostic output formatters (`TTY`, `GCC`, `JSON`, `SARIF`) and Longest-Common-Subsequence
 //! (LCS) unified diff generation (`--diff`).
 
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 use crate::linter::rewrite_script;
 use crate::linter::rules::{
@@ -30,8 +35,8 @@ pub fn apply_suggested_fixes(original_text: &str, diagnostics: &[Diagnostic]) ->
     let mut fixes: Vec<&SuggestedFix> = diagnostics.iter().filter_map(|d| d.fix.as_ref()).collect();
     fixes.sort_by_key(|b| {
         (
-            std::cmp::Reverse(b.span.start),
-            std::cmp::Reverse(b.span.end),
+            core::cmp::Reverse(b.span.start),
+            core::cmp::Reverse(b.span.end),
         )
     });
 

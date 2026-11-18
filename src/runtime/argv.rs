@@ -1,8 +1,11 @@
 //! Windows `CommandLineToArgvW` command-line parser and `%PATH%` / `%PATHEXT%` / `HKCR` target resolver.
 
-use std::path::PathBuf;
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
-use crate::types::{BS_CHAR, TAB_CHAR};
+use crate::types::{BS_CHAR, NativeBackingPath, TAB_CHAR};
 use crate::vfs::path::WindowsPath;
 
 use super::Interpreter;
@@ -54,7 +57,7 @@ pub fn parse_windows_command_line_argv(raw_tail: &str) -> Vec<String> {
             }
         } else if (ch == ' ' || ch == TAB_CHAR) && !in_quotes {
             if token_started {
-                args.push(std::mem::take(&mut cur));
+                args.push(core::mem::take(&mut cur));
                 token_started = false;
             }
             continue;
@@ -81,8 +84,8 @@ pub enum ResolvedCommandTarget {
     ExternalExecutable {
         /// Full resolved VFS path of the executable.
         full_path: WindowsPath,
-        /// Optional resolved host filesystem path when backed by `HostOsVfs`.
-        host_path: Option<PathBuf>,
+        /// Optional resolved native backing path when backed by `HostOsVfs` or `DosFatVfs`.
+        host_path: Option<NativeBackingPath>,
     },
     /// A file with an extension registered in `ASSOC` and `FTYPE`.
     AssociatedDocument {
@@ -192,7 +195,11 @@ impl Interpreter {
     /// Classified [`ResolvedCommandTarget`].
     #[must_use]
     fn classify_resolved_file(&self, meta: crate::vfs::VfsMetadata) -> ResolvedCommandTarget {
-        let path_ext = std::path::Path::new(&meta.name).extension();
+        let path_ext = meta
+            .name
+            .rsplit_once('.')
+            .filter(|(stem, _)| !stem.is_empty())
+            .map(|(_, ext)| ext);
         if path_ext
             .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
         {

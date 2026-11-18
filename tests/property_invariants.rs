@@ -1,8 +1,9 @@
 //! Property-based invariant test suite for `win-cmd-rs`.
 //!
 //! Exercises lexer/expander invariants, Windows path normalization, `SET /A` 32-bit signed
-//! integer arithmetic properties, and Win32 `FsRtlIsNameInExpression` wildcard matching
-//! across hundreds of generated inputs.
+//! integer arithmetic properties, Win32 `FsRtlIsNameInExpression` wildcard matching, and
+//! MS-DOS FAT timestamps, 8.3 filenames, PSP command tails, OEM codepage bijections, and
+//! `ShellDialect::MsDos622` CST rewriter idempotence across hundreds of generated inputs.
 
 use win_cmd_rs::linter::rewriter::CstRewriter;
 use win_cmd_rs::parser::lexer::WordPartsMode;
@@ -908,5 +909,390 @@ fn prop_bug_repair_cst_rewriter_postconditions() {
             "Expected zero remaining warnings/errors on repaired script:\n{}",
             outcome.rewritten_source
         );
+    }
+}
+
+/// Property: `PackedDosTimestamp` <-> `FileTimestamp` round-trips losslessly at 2-second FAT
+/// granularity and preserves strict chronological monotonicity across every leap year and
+/// boundary date from `1980-01-01 00:00:00` through `2107-12-31 23:59:58`.
+#[test]
+fn prop_packed_dos_timestamp_roundtrip_and_monotonicity() {
+    use win_cmd_rs::dos::types::{DOS_MAX_EPOCH_SECS, DOS_MIN_EPOCH_SECS};
+    use win_cmd_rs::dos::{PackedDosDate, PackedDosTime, PackedDosTimestamp};
+    use win_cmd_rs::vfs::FileTimestamp;
+
+    // Clamping invariants outside [1980-01-01, 2107-12-31].
+    for pre in [0u64, 1, 100_000_000, DOS_MIN_EPOCH_SECS] {
+        let p = PackedDosTimestamp::from_file_timestamp(FileTimestamp::from_epoch_secs(pre));
+        assert_eq!(p.date, PackedDosDate::MIN_1980_01_01);
+        assert_eq!(p.time, PackedDosTime::MIDNIGHT);
+        assert_eq!(
+            p.to_file_timestamp(),
+            Ok(FileTimestamp::from_epoch_secs(DOS_MIN_EPOCH_SECS))
+        );
+    }
+    for post in [
+        DOS_MAX_EPOCH_SECS,
+        DOS_MAX_EPOCH_SECS.saturating_add(1),
+        u64::MAX,
+    ] {
+        let p = PackedDosTimestamp::from_file_timestamp(FileTimestamp::from_epoch_secs(post));
+        assert_eq!(p.date, PackedDosDate::MAX_2107_12_31);
+        assert_eq!(p.time, PackedDosTime::MAX_23_59_58);
+        assert_eq!(
+            p.to_file_timestamp(),
+            Ok(FileTimestamp::from_epoch_secs(DOS_MAX_EPOCH_SECS))
+        );
+    }
+
+    // Exhaustive leap-year & boundary-date sweep across all 128 FAT years (1980..=2107).
+    let mut prev_epoch: Option<u64> = None;
+    let mut prev_packed: Option<PackedDosTimestamp> = None;
+    for year in 1980u32..=2107 {
+        let feb_last = FileTimestamp::days_in_month(year, 2).unwrap_or(28);
+        for (month, day, hour, minute, sec) in [
+            (1u32, 1u32, 0u32, 0u32, 0u64),
+            (2, 28, 12, 30, 44),
+            (2, feb_last, 23, 59, 58),
+            (3, 1, 0, 0, 0),
+            (12, 31, 23, 59, 58),
+        ] {
+            let base =
+                FileTimestamp::from_civil_utc(year, month, day, hour, minute).unwrap_or_default();
+            let even_secs = base.epoch_secs().saturating_add(sec);
+            let odd_secs = even_secs.saturating_add(1);
+            let packed_even =
+                PackedDosTimestamp::from_file_timestamp(FileTimestamp::from_epoch_secs(even_secs));
+            let packed_odd =
+                PackedDosTimestamp::from_file_timestamp(FileTimestamp::from_epoch_secs(odd_secs));
+            assert_eq!(packed_even, packed_odd);
+            assert_eq!(
+                packed_even.to_file_timestamp(),
+                Ok(FileTimestamp::from_epoch_secs(even_secs))
+            );
+            if let (Some(pe), Some(pp)) = (prev_epoch, prev_packed)
+                && even_secs > pe
+            {
+                assert!(pp < packed_even);
+            }
+            prev_epoch = Some(even_secs);
+            prev_packed = Some(packed_even);
+        }
+    }
+
+    // Sorted random 2-second samples across the full 128-year FAT range.
+    let mut rng = PropRng::new(0xD05F_A716_1980_2107);
+    let span = DOS_MAX_EPOCH_SECS.saturating_sub(DOS_MIN_EPOCH_SECS);
+    let mut samples = Vec::with_capacity(512);
+    for _ in 0..512 {
+        let raw = DOS_MIN_EPOCH_SECS.saturating_add(rng.next_u64() % span);
+        samples.push(raw & !1);
+    }
+    samples.sort_unstable();
+    samples.dedup();
+    for pair in samples.windows(2) {
+        let a = pair.first().copied().unwrap_or(DOS_MIN_EPOCH_SECS);
+        let b = pair.get(1).copied().unwrap_or(DOS_MAX_EPOCH_SECS);
+        let pa = PackedDosTimestamp::from_file_timestamp(FileTimestamp::from_epoch_secs(a));
+        let pb = PackedDosTimestamp::from_file_timestamp(FileTimestamp::from_epoch_secs(b));
+        assert_eq!(
+            pa.to_file_timestamp(),
+            Ok(FileTimestamp::from_epoch_secs(a))
+        );
+        assert_eq!(
+            pb.to_file_timestamp(),
+            Ok(FileTimestamp::from_epoch_secs(b))
+        );
+        assert!(pa < pb);
+    }
+}
+
+/// Property: `DosFileName8Dot3` normalization is idempotent on all valid outputs and rejects
+/// every illegal MS-DOS FAT character and multi-dot filename under `StrictDosTruncate`.
+#[test]
+fn prop_dos_filename_8dot3_normalization_idempotence() {
+    use win_cmd_rs::dos::{DosFileName8Dot3, ShortNamePolicy};
+
+    let illegal_bytes: &[u8] = b"\x00\x01\x1F \"*+,/:;<=>?[\\]|\x7F";
+    for &bad in illegal_bytes {
+        assert!(!DosFileName8Dot3::is_legal_fat_8_3_byte(bad));
+        let mut candidate = String::from("FILE");
+        candidate.push(char::from(bad));
+        candidate.push_str(".TXT");
+        assert!(
+            DosFileName8Dot3::normalize(&candidate, ShortNamePolicy::StrictDosTruncate, 1).is_err()
+        );
+        assert!(DosFileName8Dot3::validate_strict(&candidate).is_err());
+    }
+
+    assert!(
+        DosFileName8Dot3::normalize("archive.tar.gz", ShortNamePolicy::StrictDosTruncate, 1)
+            .is_err()
+    );
+
+    let alphabet: &[u8] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-~$#&!()@^`{}' .+*?[]";
+    let mut rng = PropRng::new(0x0008_0003_FA71_6000);
+    for _ in 0..500 {
+        let len = usize::try_from(rng.next_u64() % 20).unwrap_or(0);
+        let mut raw = String::with_capacity(len);
+        for _ in 0..len {
+            let idx = usize::try_from(rng.next_u64()).unwrap_or(0) % alphabet.len();
+            let ch = char::from(alphabet.get(idx).copied().unwrap_or(b'A'));
+            raw.push(ch);
+        }
+
+        if let Ok(norm) = DosFileName8Dot3::normalize(&raw, ShortNamePolicy::StrictDosTruncate, 1) {
+            assert!((1..=8).contains(&norm.stem().len()));
+            assert!(norm.extension().len() <= 3);
+            assert!(
+                norm.stem()
+                    .bytes()
+                    .all(DosFileName8Dot3::is_legal_fat_8_3_byte)
+            );
+            assert!(
+                norm.extension()
+                    .bytes()
+                    .all(DosFileName8Dot3::is_legal_fat_8_3_byte)
+            );
+            assert_eq!(
+                DosFileName8Dot3::validate_strict(norm.as_str()),
+                Ok(norm.clone())
+            );
+            assert_eq!(
+                DosFileName8Dot3::normalize(norm.as_str(), ShortNamePolicy::StrictDosTruncate, 1),
+                Ok(norm)
+            );
+        }
+
+        for tail_idx in [1u8, 2, 12] {
+            if let Ok(w95) =
+                DosFileName8Dot3::normalize(&raw, ShortNamePolicy::Win95NumericTail, tail_idx)
+            {
+                assert!((1..=8).contains(&w95.stem().len()));
+                assert!(w95.extension().len() <= 3);
+                assert_eq!(
+                    DosFileName8Dot3::validate_strict(w95.as_str()),
+                    Ok(w95.clone())
+                );
+                assert_eq!(
+                    DosFileName8Dot3::normalize(
+                        w95.as_str(),
+                        ShortNamePolicy::StrictDosTruncate,
+                        1
+                    ),
+                    Ok(w95)
+                );
+            }
+        }
+    }
+}
+
+/// Property: `PspCommandTail` enforces `<= 126` payload bytes + `0x0D` `CR` terminator across all
+/// argument lengths, rejecting `> 126` bytes under `Strict126BytePsp` and exporting `CMDLINE=`
+/// losslessly under `CmdlineEnvVar`.
+#[test]
+fn prop_psp_command_tail_invariants_and_cmdline_fallback() {
+    use win_cmd_rs::dos::{LongCmdlineTransfer, MAX_PSP_COMMAND_TAIL_BYTES, PspCommandTail};
+    use win_cmd_rs::error::CmdError;
+
+    let mut rng = PropRng::new(0x0080_0126_000D_C0DE);
+    for arg_len in 0usize..=260 {
+        let mut tail = String::with_capacity(arg_len);
+        for _ in 0..arg_len {
+            let ch =
+                char::from(b'a'.saturating_add(u8::try_from(rng.next_u64() % 26).unwrap_or(0)));
+            tail.push(ch);
+        }
+        let expected_formatted = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(" {tail}")
+        };
+
+        let strict_res =
+            PspCommandTail::encode("WINCHECK.EXE", &tail, LongCmdlineTransfer::Strict126BytePsp);
+        let env_res =
+            PspCommandTail::encode("WINCHECK.EXE", &tail, LongCmdlineTransfer::CmdlineEnvVar);
+
+        if expected_formatted.len() <= MAX_PSP_COMMAND_TAIL_BYTES {
+            let (psp_s, env_s) = strict_res.unwrap_or_default();
+            let (psp_e, env_e) = env_res.unwrap_or_default();
+            assert_eq!(psp_s, psp_e);
+            assert_eq!(env_s, None);
+            assert_eq!(env_e, None);
+            assert_eq!(usize::from(psp_s.len_byte()), expected_formatted.len());
+            assert_eq!(psp_s.tail_bytes(), expected_formatted.as_bytes());
+            let block = psp_s.to_psp_block();
+            assert_eq!(block.len(), expected_formatted.len().saturating_add(2));
+            assert_eq!(block.first().copied(), Some(psp_s.len_byte()));
+            assert_eq!(block.last().copied(), Some(0x0D));
+        } else {
+            assert_eq!(
+                strict_res,
+                Err(CmdError::CommandLineTooLong {
+                    length: expected_formatted.len(),
+                    limit: MAX_PSP_COMMAND_TAIL_BYTES,
+                })
+            );
+            let (psp_e, env_e) = env_res.unwrap_or_default();
+            assert_eq!(psp_e.len_byte(), 126);
+            let block = psp_e.to_psp_block();
+            assert_eq!(block.len(), 128);
+            assert_eq!(block.first().copied(), Some(126));
+            assert_eq!(block.last().copied(), Some(0x0D));
+            assert_eq!(env_e, Some(format!("WINCHECK.EXE{expected_formatted}")));
+        }
+    }
+}
+
+/// Property: Single-byte MS-DOS OEM and ANSI codepages (`437`, `850`, `852`, `865`, `866`, `1252`)
+/// form a 256-entry bijection (`encode(decode(byte)) == byte` for every byte excluding `0x00` NUL
+/// and `0x1A` `Ctrl+Z` script-EOF sentinel).
+#[test]
+fn prop_dos_oem_codepage_256_byte_bijection() {
+    use std::collections::BTreeSet;
+    use win_cmd_rs::reader::encoding::{decode_script_bytes, encode_codepage_bytes};
+    use win_cmd_rs::types::CodePage;
+
+    let codepages = [
+        CodePage::OemUnitedStates,
+        CodePage::OemMultilingualLatin1,
+        CodePage::OemLatin2,
+        CodePage::OemNordic,
+        CodePage::OemCyrillic,
+        CodePage::WindowsLatin1,
+    ];
+
+    for cp in codepages {
+        assert_eq!(decode_script_bytes(&[0x00, b'A'], cp), Ok(String::new()));
+        assert_eq!(decode_script_bytes(&[0x1A, b'A'], cp), Ok(String::new()));
+        assert_eq!(encode_codepage_bytes("\0\x1A", cp), vec![0x00, 0x1A]);
+
+        let mut distinct_scalars = BTreeSet::new();
+        for b in 1u8..=u8::MAX {
+            if b == 0x1A {
+                continue;
+            }
+            let decoded = decode_script_bytes(&[b], cp).unwrap_or_default();
+            assert_eq!(decoded.chars().count(), 1);
+            let ch = decoded.chars().next().unwrap_or('\0');
+            assert!(
+                distinct_scalars.insert(ch),
+                "Duplicate Unicode mapping U+{:04X} in {cp:?} at byte 0x{b:02X}",
+                u32::from(ch)
+            );
+            assert_eq!(encode_codepage_bytes(&decoded, cp), vec![b]);
+        }
+        assert_eq!(distinct_scalars.len(), 254);
+
+        let mut rng = PropRng::new(u64::from(cp.id()) ^ 0xA55A_5AA5_C0DE_FA9E);
+        for _ in 0..120 {
+            let len = usize::try_from(1 + (rng.next_u64() % 64)).unwrap_or(1);
+            let mut raw = Vec::with_capacity(len);
+            for _ in 0..len {
+                let mut b = u8::try_from(1 + (rng.next_u64() % 255)).unwrap_or(1);
+                if b == 0x1A {
+                    b = 0x1B;
+                }
+                raw.push(b);
+            }
+            let text = decode_script_bytes(&raw, cp).unwrap_or_default();
+            assert_eq!(encode_codepage_bytes(&text, cp), raw);
+        }
+    }
+}
+
+/// Property: `parse_script_cst` round-trips losslessly and `CstRewriter` with
+/// `ShellDialect::MsDos622` is strictly idempotent (`rewrite(rewrite(s)) == rewrite(s)`) while
+/// producing valid MS-DOS `.BAT` scripts executable on `SimulatedDosKernel`.
+#[test]
+fn prop_msdos622_cst_roundtrip_and_rewriter_idempotence() {
+    use win_cmd_rs::dos::SimulatedDosKernel;
+    use win_cmd_rs::linter::{LinterConfig, lint_script};
+    use win_cmd_rs::span::SourceMap;
+    use win_cmd_rs::types::{CRLF, ExitCode, ShellDialect};
+
+    let dos_cfg = LinterConfig {
+        dialect: ShellDialect::MsDos622,
+        ..LinterConfig::default()
+    };
+    let rewriter = CstRewriter::with_config(ExecutionContext::BatchFile, &dos_cfg);
+
+    let mut rng = PropRng::new(0x0622_D050_C570_1DE4);
+    for idx in 0usize..80 {
+        let val = rng.next_u64() % 1_000;
+        let use_goto_eof = (idx % 2) == 0;
+        let chain_len = 1 + (idx % 3);
+
+        let mut chain_parts = Vec::with_capacity(chain_len);
+        for c in 0..chain_len {
+            chain_parts.push(format!("echo SEG_{val}_{c}"));
+        }
+        let chain_line = chain_parts.join(" & ");
+        let tail_line = if use_goto_eof {
+            "goto :EOF"
+        } else {
+            "echo TAIL_PLAIN"
+        };
+        let script = [
+            "@echo off",
+            "rem DOS portability property test",
+            &format!("set STEP0=V{val}_0"),
+            &chain_line,
+            "echo OUT=%STEP0%",
+            tail_line,
+        ]
+        .join(CRLF)
+            + CRLF;
+
+        let cst0 = parse_script_cst(SourceId(0), &script, ExecutionContext::BatchFile);
+        assert_eq!(cst0.to_source_string(), script);
+
+        let out1 = rewriter.rewrite(&cst0);
+        let cst1 = parse_script_cst(
+            SourceId(1),
+            &out1.rewritten_source,
+            ExecutionContext::BatchFile,
+        );
+        assert_eq!(cst1.to_source_string(), out1.rewritten_source);
+
+        let out2 = rewriter.rewrite(&cst1);
+        assert_eq!(out2.rewritten_source, out1.rewritten_source);
+        assert_eq!(out2.applied_count, 0);
+
+        let mut sm = SourceMap::new();
+        let (_, diags_after) = lint_script(
+            "TEST.BAT",
+            out1.rewritten_source.as_bytes(),
+            &dos_cfg,
+            &mut sm,
+        )
+        .unwrap_or_default();
+        assert_eq!(
+            diags_after,
+            Vec::new(),
+            "Expected zero remaining MsDos622 diagnostics after rewrite:\n{}",
+            out1.rewritten_source
+        );
+
+        let (mut interp, _kernel) = Interpreter::with_dos_kernel(SimulatedDosKernel::new());
+        assert_eq!(
+            interp
+                .proc_env
+                .vfs
+                .write_bytes("C:\\TEST.BAT", out1.rewritten_source.as_bytes()),
+            Ok(())
+        );
+        let mut io = IoStreams::new();
+        let rc = interp.execute_batch_file(
+            "C:\\TEST.BAT",
+            "TEST.BAT",
+            Vec::new(),
+            String::new(),
+            &mut io,
+        );
+        assert_eq!(rc, Ok(ExitCode::SUCCESS));
+        assert!(io.stdout.contains(&format!("OUT=V{val}_0")));
     }
 }

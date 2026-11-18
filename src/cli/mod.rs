@@ -13,18 +13,24 @@ mod wincheck_cli;
 mod wincmd_cli;
 
 pub use self::repl::{
-    repl_open_paren_depth, run_interactive_repl, run_interactive_repl_streaming,
-    write_stream_gracefully,
+    repl_open_paren_depth, run_interactive_repl, run_interactive_repl_byte_streams,
+    strip_odd_trailing_caret,
 };
+#[cfg(feature = "std")]
+pub use self::repl::{run_interactive_repl_streaming, write_stream_gracefully};
 pub use self::wincheck_cli::{
-    WinCheckAction, WinCheckFixMode, execute_wincheck_process, load_file_or_stdin,
-    parse_wincheck_args, run_wincheck_action,
+    WinCheckAction, WinCheckFixMode, execute_wincheck_over_vfs_streams, load_vfs_or_stdin,
+    parse_wincheck_args, run_wincheck_action, run_wincheck_action_with_vfs,
 };
+#[cfg(feature = "std")]
+pub use self::wincheck_cli::{execute_wincheck_process, load_file_or_stdin};
+#[cfg(feature = "std")]
+pub use self::wincmd_cli::execute_wincmd_process;
 pub use self::wincmd_cli::{
     WinCmdAction, WinCmdCliConfig, apply_cmd_c_quote_heuristic,
-    apply_cmd_c_quote_heuristic_with_probe, execute_wincmd_process, join_argv_preserving_quotes,
-    parse_wincmd_args, parse_wincmd_args_with_default_backend, run_wincmd_with_config,
-    unquote_cmd_c_command_string,
+    apply_cmd_c_quote_heuristic_with_probe, execute_wincmd_over_streams,
+    execute_wincmd_with_interpreter_streams, join_argv_preserving_quotes, parse_wincmd_args,
+    parse_wincmd_args_with_default_backend, run_wincmd_with_config, unquote_cmd_c_command_string,
 };
 
 #[cfg(test)]
@@ -1121,5 +1127,459 @@ mod tests {
             ExitCode::SUCCESS
         );
         assert!(eof_io.stdout.contains("eof_flushed"));
+    }
+
+    /// Verifies `run_interactive_repl_streaming` and `#![no_std]` `execute_wincmd_over_streams`.
+    #[test]
+    fn test_portable_wincmd_over_streams_and_streaming_repl() {
+        let mut stream_interp = Interpreter::new();
+        let mut cur_in = Cursor::new(format!("echo stream_ok{CRLF}exit 0{CRLF}").into_bytes());
+        let mut stream_out = Vec::new();
+        let mut stream_err = Vec::new();
+        assert_eq!(
+            run_interactive_repl_streaming(
+                &mut stream_interp,
+                &mut cur_in,
+                &mut stream_out,
+                &mut stream_err
+            ),
+            Ok(ExitCode::SUCCESS)
+        );
+        assert!(String::from_utf8_lossy(&stream_out).contains("stream_ok"));
+
+        let mut dos_interp = Interpreter::new();
+        let mut empty_in = crate::runtime::InMemoryByteReader::new(Vec::new());
+        let mut out_bytes = Vec::new();
+        let mut err_bytes = Vec::new();
+        assert_eq!(
+            execute_wincmd_over_streams(
+                &["/c".to_owned(), "echo dos_stream_ok".to_owned()],
+                VfsBackendMode::InMemoryHermetic,
+                &mut dos_interp,
+                &mut empty_in,
+                &mut out_bytes,
+                &mut err_bytes,
+            ),
+            0
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out_bytes),
+            format!("dos_stream_ok{CRLF}")
+        );
+
+        let mut bad_err_buf = Vec::new();
+        assert_eq!(
+            execute_wincmd_over_streams(
+                &["--unknown-flag".to_owned()],
+                VfsBackendMode::InMemoryHermetic,
+                &mut dos_interp,
+                &mut empty_in,
+                &mut out_bytes,
+                &mut bad_err_buf,
+            ),
+            1
+        );
+        assert_ne!(bad_err_buf, Vec::<u8>::new());
+
+        let mut raw_fail_w = CountdownWriter {
+            ok_writes: 0,
+            kind: std::io::ErrorKind::PermissionDenied,
+            fail_on_flush: false,
+        };
+        let mut fail_adapter = crate::runtime::StdWriteAdapter::new(&mut raw_fail_w, "stderr");
+        assert_eq!(
+            execute_wincmd_over_streams(
+                &["--unknown-flag".to_owned()],
+                VfsBackendMode::InMemoryHermetic,
+                &mut dos_interp,
+                &mut empty_in,
+                &mut out_bytes,
+                &mut fail_adapter,
+            ),
+            1
+        );
+    }
+
+    /// Verifies `#![no_std]` `execute_wincheck_over_vfs_streams` across stdin, VFS `--in-place`, and stream errors.
+    #[test]
+    fn test_portable_wincheck_over_vfs_streams_and_errors() {
+        use crate::vfs::VirtualFileSystem as _;
+        let mut wc_vfs = crate::vfs::InMemoryVfs::new();
+        assert_eq!(
+            wc_vfs.write_bytes(
+                "C:\\clean.bat",
+                format!("@echo off{CRLF}echo hi{CRLF}").as_bytes()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            wc_vfs.write_bytes(
+                "C:\\fixme.bat",
+                format!("@echo off{CRLF}setlocal{CRLF}set X=1   {CRLF}echo \"%X%\"{CRLF}")
+                    .as_bytes()
+            ),
+            Ok(())
+        );
+        let mut stdin_dash = crate::runtime::InMemoryByteReader::new(
+            format!("@echo off{CRLF}echo stdin_ok{CRLF}").into_bytes(),
+        );
+        let mut wc_out = Vec::new();
+        let mut wc_err = Vec::new();
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &["C:\\clean.bat".to_owned(), "-".to_owned()],
+                &mut wc_vfs,
+                &mut stdin_dash,
+                &mut wc_out,
+                &mut wc_err,
+            ),
+            0
+        );
+        let mut empty_stdin = crate::runtime::InMemoryByteReader::new(Vec::new());
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &[
+                    "--fix".to_owned(),
+                    "--in-place".to_owned(),
+                    "C:\\fixme.bat".to_owned(),
+                ],
+                &mut wc_vfs,
+                &mut empty_stdin,
+                &mut wc_out,
+                &mut wc_err,
+            ),
+            0
+        );
+        let fixed_vfs =
+            String::from_utf8_lossy(&wc_vfs.read_bytes("C:\\fixme.bat").unwrap_or_default())
+                .into_owned();
+        assert!(fixed_vfs.contains("set \"X=1\""));
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &["--fix".to_owned(), "C:\\clean.bat".to_owned()],
+                &mut wc_vfs,
+                &mut empty_stdin,
+                &mut wc_out,
+                &mut wc_err,
+            ),
+            0
+        );
+    }
+
+    /// Verifies `execute_wincheck_over_vfs_streams` read-only VFS failure and stream error exit codes.
+    #[test]
+    fn test_portable_wincheck_over_vfs_stream_failure_paths() {
+        use crate::vfs::VirtualFileSystem as _;
+        let mut wc_vfs = crate::vfs::InMemoryVfs::new();
+        assert_eq!(
+            wc_vfs.write_bytes(
+                "C:\\ro.bat",
+                format!("@echo off{CRLF}set Y=2   {CRLF}echo \"%Y%\"{CRLF}").as_bytes()
+            ),
+            Ok(())
+        );
+        assert!(
+            wc_vfs
+                .set_attributes("C:\\ro.bat", crate::vfs::FileAttributeFlags::READ_ONLY)
+                .is_ok()
+        );
+        let mut empty_stdin = crate::runtime::InMemoryByteReader::new(Vec::new());
+        let mut wc_out = Vec::new();
+        let mut wc_err = Vec::new();
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &[
+                    "--fix".to_owned(),
+                    "--in-place".to_owned(),
+                    "C:\\ro.bat".to_owned(),
+                ],
+                &mut wc_vfs,
+                &mut empty_stdin,
+                &mut wc_out,
+                &mut wc_err,
+            ),
+            1
+        );
+        assert!(String::from_utf8_lossy(&wc_err).contains("Access is denied."));
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &["--bad-opt".to_owned()],
+                &mut wc_vfs,
+                &mut empty_stdin,
+                &mut wc_out,
+                &mut wc_err,
+            ),
+            2
+        );
+
+        let mut raw_fail_w2 = CountdownWriter {
+            ok_writes: 0,
+            kind: std::io::ErrorKind::PermissionDenied,
+            fail_on_flush: false,
+        };
+        let mut fail_adapter2 = crate::runtime::StdWriteAdapter::new(&mut raw_fail_w2, "stderr");
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &["--bad-opt".to_owned()],
+                &mut wc_vfs,
+                &mut empty_stdin,
+                &mut wc_out,
+                &mut fail_adapter2,
+            ),
+            1
+        );
+        let mut raw_fail_w3 = CountdownWriter {
+            ok_writes: 0,
+            kind: std::io::ErrorKind::PermissionDenied,
+            fail_on_flush: false,
+        };
+        let mut fail_adapter3 = crate::runtime::StdWriteAdapter::new(&mut raw_fail_w3, "stdout");
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &["--version".to_owned()],
+                &mut wc_vfs,
+                &mut empty_stdin,
+                &mut fail_adapter3,
+                &mut wc_err,
+            ),
+            1
+        );
+        let mut raw_fail_w4 = CountdownWriter {
+            ok_writes: 0,
+            kind: std::io::ErrorKind::PermissionDenied,
+            fail_on_flush: false,
+        };
+        let mut fail_adapter4 = crate::runtime::StdWriteAdapter::new(&mut raw_fail_w4, "stderr");
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &["C:\\missing_file.bat".to_owned()],
+                &mut wc_vfs,
+                &mut empty_stdin,
+                &mut wc_out,
+                &mut fail_adapter4,
+            ),
+            1
+        );
+    }
+
+    /// Verifies `BiosVgaAttribute` & `DumbTeletype` `CLS`/`COLOR` rendering and `CHCP` DOS kernel sync.
+    #[test]
+    fn test_dos_console_render_backends_and_chcp_kernel_sync() {
+        use crate::dos::{DosKernelApi, SimulatedDosKernel};
+        use crate::runtime::{BufferedIoStreams, InMemoryByteReader};
+        use crate::types::{CodePage, ConsoleRenderBackend, ExitCode};
+
+        let (mut interp, shared) = Interpreter::with_dos_kernel(SimulatedDosKernel::new());
+        let mut io = BufferedIoStreams::new();
+        assert_eq!(
+            interp.execute_interactive_line("cls", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(io.stdout, "");
+        assert_eq!(shared.with(|k| k.last_cleared_attr), Some(0x07));
+
+        assert_eq!(
+            interp.execute_interactive_line("color 1F", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(shared.with(|k| k.last_cleared_attr), Some(0x1F));
+        assert_eq!(
+            interp.execute_interactive_line("color", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(shared.with(|k| k.last_cleared_attr), Some(0x07));
+
+        assert_eq!(
+            interp.execute_interactive_line("chcp 866", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            shared.with(DosKernelApi::active_codepage),
+            Ok(CodePage::OemCyrillic)
+        );
+        io.stdout.clear();
+        assert_eq!(
+            interp.execute_interactive_line("chcp", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(io.stdout, format!("Active code page: 866{CRLF}"));
+
+        let mut repl_in = InMemoryByteReader::new(b"color 2E\r\nexit\r\n".to_vec());
+        let mut repl_out = Vec::new();
+        let mut repl_err = Vec::new();
+        assert_eq!(
+            run_interactive_repl_byte_streams(
+                &mut interp,
+                &mut repl_in,
+                &mut repl_out,
+                &mut repl_err
+            ),
+            Ok(ExitCode::SUCCESS)
+        );
+        assert!(!repl_out.contains(&0x1B));
+
+        interp.proc_env.dos_kernel = None;
+        assert_eq!(
+            interp.execute_interactive_line("cls", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            interp.execute_interactive_line("color 0A", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            interp.execute_interactive_line("color 2A", &mut io),
+            ExitCode::SUCCESS
+        );
+        interp.console.render_backend = ConsoleRenderBackend::DumbTeletype;
+        io.stdout.clear();
+        assert_eq!(
+            interp.execute_interactive_line("cls", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(io.stdout, CRLF);
+    }
+
+    /// Verifies `wincmd` & `wincheck` `--dialect`, `/P` `AUTOEXEC.BAT`, `/E:nnnnn`, `/MSG`, and OEM `--encoding` flags.
+    #[test]
+    fn test_cli_dos_dialect_permanent_autoexec_and_wincheck_dialect() {
+        use crate::runtime::{InMemoryByteReader, IoStreams};
+        use crate::types::{ExitCode, ExtensionsMode, ShellDialect, VfsBackendMode};
+
+        assert!(parse_wincmd_args(&["--dialect".to_owned()]).is_err());
+        assert!(parse_wincmd_args(&["--dialect".to_owned(), "bogus".to_owned()]).is_err());
+        assert!(parse_wincmd_args(&["--dialect=bogus".to_owned()]).is_err());
+        assert!(parse_wincmd_args(&["/E:99".to_owned()]).is_err());
+
+        let cfg = parse_wincmd_args(&[
+            "C:\\DOS".to_owned(),
+            "--dialect".to_owned(),
+            "dos622".to_owned(),
+            "/E:1024".to_owned(),
+            "/E:ON".to_owned(),
+            "/MSG".to_owned(),
+            "/P".to_owned(),
+        ]);
+        assert!(cfg.is_ok());
+        let parsed_cfg = cfg.unwrap_or_default();
+        assert_eq!(parsed_cfg.dialect, Some(ShellDialect::MsDos622));
+        assert_eq!(parsed_cfg.dos_env_bytes, Some(1024));
+        assert_eq!(parsed_cfg.command_dir.as_deref(), Some("C:\\DOS"));
+
+        let mut interp = Interpreter::new();
+        assert_eq!(
+            interp
+                .proc_env
+                .vfs
+                .write_bytes("C:/AUTOEXEC.BAT", b"@set AUTO_RAN=yes\r\n"),
+            Ok(())
+        );
+        let mut io = IoStreams::with_stdin("echo %AUTO_RAN%\r\n".to_owned());
+        assert_eq!(
+            run_wincmd_with_config(&parsed_cfg, &mut interp, &mut io),
+            Ok(ExitCode::SUCCESS)
+        );
+        assert!(io.stdout.contains("yes"));
+        assert_eq!(interp.proc_env.env.extensions, ExtensionsMode::Enabled);
+        assert_eq!(
+            interp.lookup_var("COMSPEC").as_deref(),
+            Some("C:\\DOS\\COMMAND.COM")
+        );
+
+        let mut s_interp = Interpreter::new();
+        assert_eq!(
+            s_interp
+                .proc_env
+                .vfs
+                .write_bytes("C:/AUTOEXEC.BAT", b"@echo stream_auto\r\n"),
+            Ok(())
+        );
+        let mut s_in = InMemoryByteReader::new(Vec::new());
+        let mut s_out = Vec::new();
+        let mut s_err = Vec::new();
+        assert_eq!(
+            execute_wincmd_over_streams(
+                &[
+                    "--dialect=freedos".to_owned(),
+                    "/E:OFF".to_owned(),
+                    "/P".to_owned(),
+                ],
+                VfsBackendMode::InMemoryHermetic,
+                &mut s_interp,
+                &mut s_in,
+                &mut s_out,
+                &mut s_err,
+            ),
+            0
+        );
+        assert!(String::from_utf8_lossy(&s_out).contains("stream_auto"));
+
+        let mut no_auto_interp = Interpreter::new();
+        let mut no_auto_io = IoStreams::new();
+        let no_auto_cfg = parse_wincmd_args(&["--dialect=dos622".to_owned(), "/P".to_owned()])
+            .unwrap_or_default();
+        assert_eq!(
+            run_wincmd_with_config(&no_auto_cfg, &mut no_auto_interp, &mut no_auto_io),
+            Ok(ExitCode::SUCCESS)
+        );
+        let mut s_no_auto = Interpreter::new();
+        let mut s_in2 = InMemoryByteReader::new(Vec::new());
+        let mut s_out2 = Vec::new();
+        let mut s_err2 = Vec::new();
+        assert_eq!(
+            execute_wincmd_over_streams(
+                &["/P".to_owned()],
+                VfsBackendMode::InMemoryHermetic,
+                &mut s_no_auto,
+                &mut s_in2,
+                &mut s_out2,
+                &mut s_err2,
+            ),
+            0
+        );
+    }
+
+    /// Verifies `wincheck` `--dialect` and OEM `--encoding` (`cp852`, `cp865`, `cp866`) CLI flags.
+    #[test]
+    fn test_wincheck_dos_dialect_and_oem_encoding_cli_flags() {
+        use crate::runtime::InMemoryByteReader;
+        use crate::vfs::{InMemoryVfs, VirtualFileSystem};
+
+        for enc in ["cp852", "cp865", "cp866"] {
+            assert!(
+                parse_wincheck_args(&["--encoding".to_owned(), enc.to_owned(), "-".to_owned()])
+                    .is_ok()
+            );
+        }
+        assert!(parse_wincheck_args(&["--dialect".to_owned()]).is_err());
+        assert!(
+            parse_wincheck_args(&["--dialect".to_owned(), "bad".to_owned(), "-".to_owned()])
+                .is_err()
+        );
+        assert!(parse_wincheck_args(&["--dialect=dos622".to_owned(), "-".to_owned()]).is_ok());
+
+        let mut wc_vfs = InMemoryVfs::new();
+        assert_eq!(
+            wc_vfs.write_bytes("C:/BUILD.BAT", b"set /a X=1\r\n"),
+            Ok(())
+        );
+        let mut wc_in = InMemoryByteReader::new(Vec::new());
+        let mut wc_out = Vec::new();
+        let mut wc_err = Vec::new();
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &[
+                    "--dialect".to_owned(),
+                    "dos622".to_owned(),
+                    "C:/BUILD.BAT".to_owned(),
+                ],
+                &mut wc_vfs,
+                &mut wc_in,
+                &mut wc_out,
+                &mut wc_err,
+            ),
+            1
+        );
+        assert!(String::from_utf8_lossy(&wc_out).contains("CMD5001"));
     }
 }

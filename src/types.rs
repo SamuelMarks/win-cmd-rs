@@ -5,8 +5,11 @@
 //! file descriptors, code pages, console colors, and interpreter modes—are represented
 //! as validated structs or enums.
 
-use std::cmp::Ordering;
-use std::hash::{Hash, Hasher};
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::{String, ToString};
+use core::cmp::Ordering;
+use core::hash::{Hash, Hasher};
 
 use derive_more::{Constructor, Deref, Display, From, Into, IsVariant};
 
@@ -166,6 +169,10 @@ pub struct DriveLetter(
 );
 
 impl DriveLetter {
+    /// Floppy drive `A:`.
+    pub const A: Self = Self(b'A');
+    /// Floppy drive `B:`.
+    pub const B: Self = Self(b'B');
     /// Drive `C:`.
     pub const C: Self = Self(b'C');
     /// Drive `D:`.
@@ -589,6 +596,15 @@ pub enum CodePage {
     /// OEM Multilingual Latin 1 (`850`).
     #[display("850")]
     OemMultilingualLatin1,
+    /// OEM Central / Eastern European Latin 2 (`852`).
+    #[display("852")]
+    OemLatin2,
+    /// OEM Nordic (`865`).
+    #[display("865")]
+    OemNordic,
+    /// OEM Cyrillic (`866`).
+    #[display("866")]
+    OemCyrillic,
     /// Windows ANSI Latin 1 (`1252`).
     #[display("1252")]
     WindowsLatin1,
@@ -607,7 +623,7 @@ impl CodePage {
     /// Resolves a numeric Windows code page identifier to a [`CodePage`].
     ///
     /// # Arguments
-    /// * `id` - Numeric code page identifier (e.g., `65001`, `437`, `850`, `1252`).
+    /// * `id` - Numeric code page identifier (e.g., `65001`, `437`, `850`, `852`, `865`, `866`, `1252`).
     ///
     /// # Returns
     /// `Ok(CodePage)` if supported.
@@ -619,6 +635,9 @@ impl CodePage {
             65001 => Ok(Self::Utf8),
             437 => Ok(Self::OemUnitedStates),
             850 => Ok(Self::OemMultilingualLatin1),
+            852 => Ok(Self::OemLatin2),
+            865 => Ok(Self::OemNordic),
+            866 => Ok(Self::OemCyrillic),
             1252 => Ok(Self::WindowsLatin1),
             1200 => Ok(Self::Utf16Le),
             1201 => Ok(Self::Utf16Be),
@@ -637,6 +656,9 @@ impl CodePage {
             Self::Utf8 => 65001,
             Self::OemUnitedStates => 437,
             Self::OemMultilingualLatin1 => 850,
+            Self::OemLatin2 => 852,
+            Self::OemNordic => 865,
+            Self::OemCyrillic => 866,
             Self::WindowsLatin1 => 1252,
             Self::Utf16Le => 1200,
             Self::Utf16Be => 1201,
@@ -868,6 +890,30 @@ impl ConsoleColor {
             self.foreground.ansi_fg_code()
         )
     }
+
+    /// Packs this color pair into an IBM PC CGA/EGA/VGA text-mode attribute byte (`(bg << 4) | fg`).
+    ///
+    /// # Returns
+    /// Packed `u8` VGA attribute byte (`0x07` = light-gray on black).
+    #[must_use]
+    pub const fn to_vga_attribute_byte(self) -> u8 {
+        (self.background.as_u8() << 4) | self.foreground.as_u8()
+    }
+}
+
+/// Interactive console screen-clear and color rendering backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Display, IsVariant)]
+pub enum ConsoleRenderBackend {
+    /// Emit standard ANSI / `ANSI.SYS` CSI escape sequences (`ESC[2J`, `ESC[...m`).
+    #[default]
+    #[display("ansi_sys_escape")]
+    AnsiSysEscape,
+    /// Use BIOS `INT 10h AH=06h` / `AH=02h` VGA attribute clearing via [`crate::dos::DosKernelApi`].
+    #[display("bios_vga_attribute")]
+    BiosVgaAttribute,
+    /// Emit plain teletype newlines without ANSI escapes or BIOS interrupts (`CTTY COM1`).
+    #[display("dumb_teletype")]
+    DumbTeletype,
 }
 
 /// Command echo state (`ECHO ON` vs `ECHO OFF`).
@@ -1176,6 +1222,70 @@ pub enum HostBindingMode {
     /// Synchronize working directory and environment with the host OS process.
     #[display("synchronized")]
     Synchronized,
+}
+
+/// Memory footprint and history/recursion budget profile for host vs 4–16 MiB MS-DOS DPMI targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Display, IsVariant)]
+pub enum MemoryProfile {
+    /// Host OS execution with generous default history (`50`), call depth (`256`), and full span provenance.
+    #[default]
+    #[display("host_unbounded")]
+    HostUnbounded,
+    /// Compact 4 MiB 386SX/486SX DPMI profile (`16` history entries, `64` call depth, compact provenance).
+    #[display("dos_compact_4mib")]
+    DosCompact4MiB,
+    /// Standard 8 MiB 486DX DPMI profile (`32` history entries, `128` call depth, compact provenance).
+    #[display("dos_standard_8mib")]
+    DosStandard8MiB,
+    /// Extended 16+ MiB Pentium/DOSBox DPMI profile (`50` history entries, `256` call depth, full provenance).
+    #[display("dos_extended_16mib_plus")]
+    DosExtended16MiBPlus,
+}
+
+/// Command-shell compatibility dialect (`cmd.exe` vs MS-DOS 6.22 `COMMAND.COM` vs `FreeDOS` `FreeCom`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Display, IsVariant)]
+pub enum ShellDialect {
+    /// Windows NT `cmd.exe` compatibility mode (default).
+    #[default]
+    #[display("cmd")]
+    WindowsNtCmd,
+    /// Strict MS-DOS 6.22 `COMMAND.COM` compatibility mode (`/E:OFF` by default, 8.3/126-byte rules).
+    #[display("dos622")]
+    MsDos622,
+    /// `FreeDOS` `FreeCom` compatibility mode.
+    #[display("freedos")]
+    FreeDos,
+}
+
+impl ShellDialect {
+    /// Parses a CLI `--dialect <value>` string (`cmd`, `dos622`, `freedos`).
+    ///
+    /// # Arguments
+    /// * `raw` - Dialect name supplied on the command line.
+    ///
+    /// # Returns
+    /// `Some(ShellDialect)` if recognized, else `None`.
+    #[must_use]
+    pub fn parse_cli_value(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "cmd" | "nt" | "win" | "windows" => Some(Self::WindowsNtCmd),
+            "dos" | "dos622" | "msdos" | "msdos622" => Some(Self::MsDos622),
+            "freedos" | "fdos" => Some(Self::FreeDos),
+            _ => None,
+        }
+    }
+}
+
+/// Primary permanent shell policy (`COMMAND.COM /P`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Display, IsVariant)]
+pub enum PermanentShellMode {
+    /// Normal secondary shell: `EXIT` terminates the shell process.
+    #[default]
+    #[display("transient")]
+    Transient,
+    /// Permanent primary shell (`/P`): runs `C:\AUTOEXEC.BAT` on startup and ignores top-level `EXIT`.
+    #[display("permanent")]
+    Permanent,
 }
 
 /// Console `Ctrl+C` (`SIGINT`) interrupt state.
@@ -1498,6 +1608,748 @@ pub enum QuoteInsertionStrategy {
     /// variables before wrapping the word in double quotes.
     #[display("strip_and_wrap_modifier")]
     StripAndWrapModifier,
+}
+
+/// Standard MS-DOS 2.0–7.1 `INT 21h` / `AH=59h` primary error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
+pub enum DosErrorCode {
+    /// `0x01`: Invalid function number (`EINVAL` / unsupported DOS call).
+    #[display("invalid_function")]
+    InvalidFunction,
+    /// `0x02`: File not found.
+    #[display("file_not_found")]
+    FileNotFound,
+    /// `0x03`: Path (directory) not found.
+    #[display("path_not_found")]
+    PathNotFound,
+    /// `0x04`: Too many open files (no handles available in SFT/JFT).
+    #[display("too_many_open_files")]
+    TooManyOpenFiles,
+    /// `0x05`: Access denied (read-only attribute, directory target, or permission refusal).
+    #[display("access_denied")]
+    AccessDenied,
+    /// `0x06`: Invalid file handle.
+    #[display("invalid_handle")]
+    InvalidHandle,
+    /// `0x07`: Memory control blocks (MCB arena) destroyed.
+    #[display("arena_trashed")]
+    ArenaTrashed,
+    /// `0x08`: Insufficient conventional or DPMI memory.
+    #[display("not_enough_memory")]
+    NotEnoughMemory,
+    /// `0x09`: Invalid memory block address.
+    #[display("invalid_block")]
+    InvalidBlock,
+    /// `0x0A`: Invalid or oversized DOS environment block.
+    #[display("bad_environment")]
+    BadEnvironment,
+    /// `0x0B`: Invalid executable format (`MZ` header corrupt).
+    #[display("bad_format")]
+    BadFormat,
+    /// `0x0C`: Invalid open access mode.
+    #[display("invalid_access")]
+    InvalidAccess,
+    /// `0x0D`: Invalid data.
+    #[display("invalid_data")]
+    InvalidData,
+    /// `0x0F`: Invalid logical drive specified.
+    #[display("invalid_drive")]
+    InvalidDrive,
+    /// `0x10`: Attempted to remove the active current working directory.
+    #[display("attempt_to_remove_current_directory")]
+    AttemptToRemoveCurrentDirectory,
+    /// `0x11`: Not same device (cross-drive `INT 21h AH=56h` rename).
+    #[display("not_same_device")]
+    NotSameDevice,
+    /// `0x12`: No more matching files (`FindFirst`/`FindNext` exhausted).
+    #[display("no_more_files")]
+    NoMoreFiles,
+    /// `0x13`: Attempted to write on a write-protected diskette or volume.
+    #[display("write_protected_disk")]
+    WriteProtectedDisk,
+    /// `0x14`: Unknown block device unit.
+    #[display("unknown_unit")]
+    UnknownUnit,
+    /// `0x15`: Drive not ready (e.g., open floppy door).
+    #[display("drive_not_ready")]
+    DriveNotReady,
+    /// `0x1F`: General hardware or media failure.
+    #[display("general_failure")]
+    GeneralFailure,
+    /// `0x20`: `SHARE.EXE` file sharing violation.
+    #[display("sharing_violation")]
+    SharingViolation,
+    /// `0x21`: File byte-range lock violation.
+    #[display("lock_violation")]
+    LockViolation,
+    /// `0x50`: Target file already exists (`AH=5Bh` create new file).
+    #[display("file_exists")]
+    FileExists,
+    /// `0x52`: Cannot make directory entry (FAT12/FAT16 root directory table full).
+    #[display("cannot_make_directory_entry")]
+    CannotMakeDirectoryEntry,
+    /// Unmapped raw `AX` error code returned by `INT 21h AH=59h`.
+    #[display("dos_error_{_0:#06x}")]
+    UnknownCode(
+        /// Raw 16-bit DOS error number.
+        u16,
+    ),
+}
+
+impl DosErrorCode {
+    /// Decodes a raw 16-bit MS-DOS `AX` error number into [`DosErrorCode`].
+    ///
+    /// # Arguments
+    /// * `raw` - Raw 16-bit DOS error code (`AX` from `INT 21h` or `BX` from `AH=59h`).
+    ///
+    /// # Returns
+    /// Matching [`DosErrorCode`] variant.
+    #[must_use]
+    pub const fn from_raw(raw: u16) -> Self {
+        match raw {
+            0x01 => Self::InvalidFunction,
+            0x02 => Self::FileNotFound,
+            0x03 => Self::PathNotFound,
+            0x04 => Self::TooManyOpenFiles,
+            0x05 => Self::AccessDenied,
+            0x06 => Self::InvalidHandle,
+            0x07 => Self::ArenaTrashed,
+            0x08 => Self::NotEnoughMemory,
+            0x09 => Self::InvalidBlock,
+            0x0A => Self::BadEnvironment,
+            0x0B => Self::BadFormat,
+            0x0C => Self::InvalidAccess,
+            0x0D => Self::InvalidData,
+            0x0F => Self::InvalidDrive,
+            0x10 => Self::AttemptToRemoveCurrentDirectory,
+            0x11 => Self::NotSameDevice,
+            0x12 => Self::NoMoreFiles,
+            0x13 => Self::WriteProtectedDisk,
+            0x14 => Self::UnknownUnit,
+            0x15 => Self::DriveNotReady,
+            0x1F => Self::GeneralFailure,
+            0x20 => Self::SharingViolation,
+            0x21 => Self::LockViolation,
+            0x50 => Self::FileExists,
+            0x52 => Self::CannotMakeDirectoryEntry,
+            other => Self::UnknownCode(other),
+        }
+    }
+
+    /// Returns the canonical 16-bit MS-DOS `AX` numeric value for this error code.
+    ///
+    /// # Returns
+    /// Raw 16-bit MS-DOS error number.
+    #[must_use]
+    pub const fn to_raw(self) -> u16 {
+        match self {
+            Self::InvalidFunction => 0x01,
+            Self::FileNotFound => 0x02,
+            Self::PathNotFound => 0x03,
+            Self::TooManyOpenFiles => 0x04,
+            Self::AccessDenied => 0x05,
+            Self::InvalidHandle => 0x06,
+            Self::ArenaTrashed => 0x07,
+            Self::NotEnoughMemory => 0x08,
+            Self::InvalidBlock => 0x09,
+            Self::BadEnvironment => 0x0A,
+            Self::BadFormat => 0x0B,
+            Self::InvalidAccess => 0x0C,
+            Self::InvalidData => 0x0D,
+            Self::InvalidDrive => 0x0F,
+            Self::AttemptToRemoveCurrentDirectory => 0x10,
+            Self::NotSameDevice => 0x11,
+            Self::NoMoreFiles => 0x12,
+            Self::WriteProtectedDisk => 0x13,
+            Self::UnknownUnit => 0x14,
+            Self::DriveNotReady => 0x15,
+            Self::GeneralFailure => 0x1F,
+            Self::SharingViolation => 0x20,
+            Self::LockViolation => 0x21,
+            Self::FileExists => 0x50,
+            Self::CannotMakeDirectoryEntry => 0x52,
+            Self::UnknownCode(code) => code,
+        }
+    }
+}
+
+/// MS-DOS `INT 21h AH=59h` extended error classification (`BH` register).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
+pub enum DosErrorClass {
+    /// `0x01`: Out of resource (handles, memory, or disk space).
+    #[display("out_of_resource")]
+    OutOfResource,
+    /// `0x02`: Temporary situation (e.g., locked region that may clear).
+    #[display("temporary_situation")]
+    TemporarySituation,
+    /// `0x03`: Authorization / permission problem.
+    #[display("authorization")]
+    Authorization,
+    /// `0x04`: Internal error in MS-DOS system software.
+    #[display("internal_dos")]
+    InternalDos,
+    /// `0x05`: Hardware failure.
+    #[display("hardware_failure")]
+    HardwareFailure,
+    /// `0x06`: System software failure (`CONFIG.SYS` or MCB corruption).
+    #[display("system_failure")]
+    SystemFailure,
+    /// `0x07`: Application program error (invalid arguments or call sequence).
+    #[display("application_error")]
+    ApplicationError,
+    /// `0x08`: File or item not found.
+    #[display("not_found")]
+    NotFound,
+    /// `0x09`: File or disk of invalid format.
+    #[display("bad_format")]
+    BadFormat,
+    /// `0x0A`: File or item locked.
+    #[display("locked")]
+    Locked,
+    /// `0x0B`: Wrong disk in drive, bad spot on disk, or other media failure.
+    #[display("media_failure")]
+    MediaFailure,
+    /// `0x0C`: Collision with existing item (`AlreadyExists`).
+    #[display("already_exists")]
+    AlreadyExists,
+    /// `0x0D` or unrecognized `BH` class byte.
+    #[display("unknown_class_{_0:#04x}")]
+    Unknown(
+        /// Raw `BH` error class byte.
+        u8,
+    ),
+}
+
+impl DosErrorClass {
+    /// Decodes the `BH` register byte returned by `INT 21h AH=59h`.
+    ///
+    /// # Arguments
+    /// * `bh` - Raw `BH` class byte.
+    ///
+    /// # Returns
+    /// Decoded [`DosErrorClass`].
+    #[must_use]
+    pub const fn from_raw(bh: u8) -> Self {
+        match bh {
+            0x01 => Self::OutOfResource,
+            0x02 => Self::TemporarySituation,
+            0x03 => Self::Authorization,
+            0x04 => Self::InternalDos,
+            0x05 => Self::HardwareFailure,
+            0x06 => Self::SystemFailure,
+            0x07 => Self::ApplicationError,
+            0x08 => Self::NotFound,
+            0x09 => Self::BadFormat,
+            0x0A => Self::Locked,
+            0x0B => Self::MediaFailure,
+            0x0C => Self::AlreadyExists,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+/// MS-DOS `INT 21h AH=59h` recommended recovery action (`BL` register).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
+pub enum DosErrorAction {
+    /// `0x01`: Retry a few times before prompting.
+    #[display("retry")]
+    Retry,
+    /// `0x02`: Pause briefly and retry (`DelayedRetry`).
+    #[display("delayed_retry")]
+    DelayedRetry,
+    /// `0x03`: Prompt user to re-enter malformed input (`PromptUserReenter`).
+    #[display("prompt_user_reenter")]
+    PromptUserReenter,
+    /// `0x04`: Abort cleanly after closing open resources (`AbortCleanly`).
+    #[display("abort_cleanly")]
+    AbortCleanly,
+    /// `0x05`: Immediate exit without cleanup (`ImmediateExit`, arena corrupted).
+    #[display("immediate_exit")]
+    ImmediateExit,
+    /// `0x06`: Informational error that may be ignored (`Ignore`).
+    #[display("ignore")]
+    Ignore,
+    /// `0x07`: Retry after user intervention (e.g., inserting floppy disk).
+    #[display("retry_after_user_intervention")]
+    RetryAfterUserIntervention,
+    /// Unrecognized `BL` action code.
+    #[display("unknown_action_{_0:#04x}")]
+    Unknown(
+        /// Raw `BL` recommended action byte.
+        u8,
+    ),
+}
+
+impl DosErrorAction {
+    /// Decodes the `BL` register byte returned by `INT 21h AH=59h`.
+    ///
+    /// # Arguments
+    /// * `bl` - Raw `BL` action byte.
+    ///
+    /// # Returns
+    /// Decoded [`DosErrorAction`].
+    #[must_use]
+    pub const fn from_raw(bl: u8) -> Self {
+        match bl {
+            0x01 => Self::Retry,
+            0x02 => Self::DelayedRetry,
+            0x03 => Self::PromptUserReenter,
+            0x04 => Self::AbortCleanly,
+            0x05 => Self::ImmediateExit,
+            0x06 => Self::Ignore,
+            0x07 => Self::RetryAfterUserIntervention,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+/// MS-DOS `INT 21h AH=59h` error locus (`CH` register) identifying the failing subsystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
+pub enum DosErrorLocus {
+    /// `0x01`: Unknown or unspecified subsystem.
+    #[display("unknown")]
+    Unknown,
+    /// `0x02`: Block storage device (diskette or hard disk).
+    #[display("block_device")]
+    BlockDevice,
+    /// `0x03`: Network redirector (`MSCDEX` / LAN Manager).
+    #[display("network")]
+    Network,
+    /// `0x04`: Character / serial device (`CON`, `PRN`, `AUX`, `COMn`).
+    #[display("serial_device")]
+    SerialDevice,
+    /// `0x05`: RAM / memory arena subsystem.
+    #[display("memory")]
+    Memory,
+    /// Unrecognized `CH` locus byte.
+    #[display("unrecognized_locus_{_0:#04x}")]
+    Unrecognized(
+        /// Raw `CH` locus byte.
+        u8,
+    ),
+}
+
+impl DosErrorLocus {
+    /// Decodes the `CH` register byte returned by `INT 21h AH=59h`.
+    ///
+    /// # Arguments
+    /// * `ch` - Raw `CH` locus byte.
+    ///
+    /// # Returns
+    /// Decoded [`DosErrorLocus`].
+    #[must_use]
+    pub const fn from_raw(ch: u8) -> Self {
+        match ch {
+            0x01 => Self::Unknown,
+            0x02 => Self::BlockDevice,
+            0x03 => Self::Network,
+            0x04 => Self::SerialDevice,
+            0x05 => Self::Memory,
+            other => Self::Unrecognized(other),
+        }
+    }
+}
+
+/// Structured MS-DOS `INT 21h AH=59h` extended error descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
+#[display("{code} (class={class}, action={action}, locus={locus})")]
+pub struct DosExtendedError {
+    /// Primary MS-DOS error code (`AX` / `BX`).
+    pub code: DosErrorCode,
+    /// Error classification (`BH`).
+    pub class: DosErrorClass,
+    /// Recommended recovery action (`BL`).
+    pub action: DosErrorAction,
+    /// Subsystem locus (`CH`).
+    pub locus: DosErrorLocus,
+}
+
+impl DosExtendedError {
+    /// Creates a new [`DosExtendedError`] from explicit `INT 21h AH=59h` register fields.
+    ///
+    /// # Arguments
+    /// * `code` - Primary [`DosErrorCode`] (`AX`).
+    /// * `class` - [`DosErrorClass`] (`BH`).
+    /// * `action` - [`DosErrorAction`] (`BL`).
+    /// * `locus` - [`DosErrorLocus`] (`CH`).
+    ///
+    /// # Returns
+    /// Initialized [`DosExtendedError`].
+    #[must_use]
+    pub const fn new(
+        code: DosErrorCode,
+        class: DosErrorClass,
+        action: DosErrorAction,
+        locus: DosErrorLocus,
+    ) -> Self {
+        Self {
+            code,
+            class,
+            action,
+            locus,
+        }
+    }
+
+    /// Constructs a [`DosExtendedError`] from a [`DosErrorCode`] with sensible default class, action, and locus.
+    ///
+    /// # Arguments
+    /// * `code` - Primary [`DosErrorCode`].
+    ///
+    /// # Returns
+    /// Populated [`DosExtendedError`].
+    #[must_use]
+    pub const fn from_code(code: DosErrorCode) -> Self {
+        let (class, action, locus) = match code {
+            DosErrorCode::FileNotFound | DosErrorCode::PathNotFound | DosErrorCode::NoMoreFiles => {
+                (
+                    DosErrorClass::NotFound,
+                    DosErrorAction::AbortCleanly,
+                    DosErrorLocus::BlockDevice,
+                )
+            }
+            DosErrorCode::AccessDenied
+            | DosErrorCode::AttemptToRemoveCurrentDirectory
+            | DosErrorCode::WriteProtectedDisk => (
+                DosErrorClass::Authorization,
+                DosErrorAction::AbortCleanly,
+                DosErrorLocus::BlockDevice,
+            ),
+            DosErrorCode::SharingViolation | DosErrorCode::LockViolation => (
+                DosErrorClass::Locked,
+                DosErrorAction::DelayedRetry,
+                DosErrorLocus::BlockDevice,
+            ),
+            DosErrorCode::FileExists => (
+                DosErrorClass::AlreadyExists,
+                DosErrorAction::AbortCleanly,
+                DosErrorLocus::BlockDevice,
+            ),
+            DosErrorCode::TooManyOpenFiles
+            | DosErrorCode::NotEnoughMemory
+            | DosErrorCode::CannotMakeDirectoryEntry => (
+                DosErrorClass::OutOfResource,
+                DosErrorAction::AbortCleanly,
+                DosErrorLocus::Memory,
+            ),
+            DosErrorCode::ArenaTrashed | DosErrorCode::InvalidBlock => (
+                DosErrorClass::SystemFailure,
+                DosErrorAction::ImmediateExit,
+                DosErrorLocus::Memory,
+            ),
+            DosErrorCode::DriveNotReady
+            | DosErrorCode::UnknownUnit
+            | DosErrorCode::GeneralFailure => (
+                DosErrorClass::MediaFailure,
+                DosErrorAction::RetryAfterUserIntervention,
+                DosErrorLocus::BlockDevice,
+            ),
+            DosErrorCode::InvalidFunction
+            | DosErrorCode::InvalidHandle
+            | DosErrorCode::BadEnvironment
+            | DosErrorCode::BadFormat
+            | DosErrorCode::InvalidAccess
+            | DosErrorCode::InvalidData
+            | DosErrorCode::InvalidDrive
+            | DosErrorCode::NotSameDevice
+            | DosErrorCode::UnknownCode(_) => (
+                DosErrorClass::ApplicationError,
+                DosErrorAction::AbortCleanly,
+                DosErrorLocus::Unknown,
+            ),
+        };
+        Self {
+            code,
+            class,
+            action,
+            locus,
+        }
+    }
+}
+
+/// Platform-independent I/O error classification compatible with both `std` and `#![no_std]` MS-DOS builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Display)]
+pub enum IoErrorKind {
+    /// Entity (file or path) was not found.
+    #[display("not_found")]
+    NotFound,
+    /// Operation lacked required permissions (`READ_ONLY`, ACL, or write-protect).
+    #[display("permission_denied")]
+    PermissionDenied,
+    /// File operation targeted a directory.
+    #[display("is_a_directory")]
+    IsADirectory,
+    /// Directory operation targeted a regular file.
+    #[display("not_a_directory")]
+    NotADirectory,
+    /// Target file or directory already exists.
+    #[display("already_exists")]
+    AlreadyExists,
+    /// Non-recursive removal targeted a non-empty directory.
+    #[display("directory_not_empty")]
+    DirectoryNotEmpty,
+    /// Non-blocking operation would block or hit a lock contention.
+    #[display("would_block")]
+    WouldBlock,
+    /// Downstream pipe reader closed.
+    #[display("broken_pipe")]
+    BrokenPipe,
+    /// Invalid input parameter.
+    #[display("invalid_input")]
+    InvalidInput,
+    /// Stream data invalid for expected format.
+    #[display("invalid_data")]
+    InvalidData,
+    /// I/O operation timed out.
+    #[display("timed_out")]
+    TimedOut,
+    /// Write call returned `0` bytes unexpectedly.
+    #[display("write_zero")]
+    WriteZero,
+    /// Operation interrupted by signal or `Ctrl+Break`.
+    #[display("interrupted")]
+    Interrupted,
+    /// Operation unsupported on the active VFS or OS (e.g., symlinks on FAT16).
+    #[display("unsupported")]
+    Unsupported,
+    /// Memory allocation or conventional RAM exhausted.
+    #[display("out_of_memory")]
+    OutOfMemory,
+    /// Disk or FAT root directory full.
+    #[display("storage_full")]
+    StorageFull,
+    /// Filesystem or diskette is read-only / write-protected.
+    #[display("read_only_filesystem")]
+    ReadOnlyFilesystem,
+    /// Rename/link attempted across distinct drives or mount points.
+    #[display("crosses_devices")]
+    CrossesDevices,
+    /// Rich MS-DOS `INT 21h AH=59h` extended error payload.
+    #[display("{_0}")]
+    DosExtended(
+        /// Underlying [`DosExtendedError`].
+        DosExtendedError,
+    ),
+    /// Unclassified or custom host I/O error.
+    #[default]
+    #[display("other")]
+    Other,
+}
+
+#[cfg(feature = "std")]
+impl From<std::io::ErrorKind> for IoErrorKind {
+    /// Converts a standard library [`std::io::ErrorKind`] into [`IoErrorKind`].
+    ///
+    /// # Arguments
+    /// * `kind` - Host [`std::io::ErrorKind`].
+    ///
+    /// # Returns
+    /// Corresponding portable [`IoErrorKind`].
+    fn from(kind: std::io::ErrorKind) -> Self {
+        if kind == std::io::ErrorKind::NotFound {
+            Self::NotFound
+        } else if kind == std::io::ErrorKind::PermissionDenied {
+            Self::PermissionDenied
+        } else if kind == std::io::ErrorKind::IsADirectory {
+            Self::IsADirectory
+        } else if kind == std::io::ErrorKind::NotADirectory {
+            Self::NotADirectory
+        } else if kind == std::io::ErrorKind::AlreadyExists {
+            Self::AlreadyExists
+        } else if kind == std::io::ErrorKind::DirectoryNotEmpty {
+            Self::DirectoryNotEmpty
+        } else if kind == std::io::ErrorKind::WouldBlock {
+            Self::WouldBlock
+        } else if kind == std::io::ErrorKind::BrokenPipe {
+            Self::BrokenPipe
+        } else if kind == std::io::ErrorKind::InvalidInput {
+            Self::InvalidInput
+        } else if kind == std::io::ErrorKind::InvalidData {
+            Self::InvalidData
+        } else if kind == std::io::ErrorKind::TimedOut {
+            Self::TimedOut
+        } else if kind == std::io::ErrorKind::WriteZero {
+            Self::WriteZero
+        } else if kind == std::io::ErrorKind::Interrupted {
+            Self::Interrupted
+        } else if kind == std::io::ErrorKind::Unsupported {
+            Self::Unsupported
+        } else if kind == std::io::ErrorKind::OutOfMemory {
+            Self::OutOfMemory
+        } else if kind == std::io::ErrorKind::StorageFull {
+            Self::StorageFull
+        } else if kind == std::io::ErrorKind::ReadOnlyFilesystem {
+            Self::ReadOnlyFilesystem
+        } else if kind == std::io::ErrorKind::CrossesDevices {
+            Self::CrossesDevices
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Portable native backing path resolved by [`crate::vfs::VirtualFileSystem`] implementations.
+///
+/// Stores a UTF-8 path representation for `#![no_std]` / MS-DOS targets (`"C:\\DOS\\MEM.EXE"`),
+/// while additionally retaining the lossless [`std::path::PathBuf`] when compiled with the `std` feature.
+#[derive(Debug, Clone, Default, Display)]
+#[display("{text}")]
+pub struct NativeBackingPath {
+    /// Textual representation of the native path.
+    text: String,
+    /// Lossless host [`std::path::PathBuf`] retained when `std` is enabled.
+    #[cfg(feature = "std")]
+    host_path: std::path::PathBuf,
+}
+
+impl PartialEq for NativeBackingPath {
+    /// Compares two [`NativeBackingPath`] values for equality.
+    ///
+    /// # Arguments
+    /// * `other` - Right-hand [`NativeBackingPath`] operand.
+    ///
+    /// # Returns
+    /// `true` when the native paths represent the same backing path.
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "std")]
+        {
+            self.host_path == other.host_path
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.text == other.text
+        }
+    }
+}
+
+impl Eq for NativeBackingPath {}
+
+impl PartialOrd for NativeBackingPath {
+    /// Partially orders two [`NativeBackingPath`] values.
+    ///
+    /// # Arguments
+    /// * `other` - Right-hand [`NativeBackingPath`] operand.
+    ///
+    /// # Returns
+    /// `Some(Ordering)` between `self` and `other`.
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NativeBackingPath {
+    /// Totally orders two [`NativeBackingPath`] values.
+    ///
+    /// # Arguments
+    /// * `other` - Right-hand [`NativeBackingPath`] operand.
+    ///
+    /// # Returns
+    /// Lexical [`Ordering`] between `self` and `other`.
+    fn cmp(&self, other: &Self) -> Ordering {
+        #[cfg(feature = "std")]
+        {
+            self.host_path.cmp(&other.host_path)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.text.cmp(&other.text)
+        }
+    }
+}
+
+impl Hash for NativeBackingPath {
+    /// Hashes this [`NativeBackingPath`] into `state`.
+    ///
+    /// # Arguments
+    /// * `state` - Mutable [`Hasher`] instance.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        #[cfg(feature = "std")]
+        {
+            self.host_path.hash(state);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.text.hash(state);
+        }
+    }
+}
+
+impl NativeBackingPath {
+    /// Constructs a [`NativeBackingPath`] from a UTF-8 path string (portable across `std` and `no_std`).
+    ///
+    /// # Arguments
+    /// * `path` - Native path string (e.g., `"C:\\DOS\\COMMAND.COM"` or `"/tmp/work"`).
+    ///
+    /// # Returns
+    /// Initialized [`NativeBackingPath`].
+    #[must_use]
+    pub fn from_string(path: impl Into<String>) -> Self {
+        let text = path.into();
+        Self {
+            #[cfg(feature = "std")]
+            host_path: std::path::PathBuf::from(&text),
+            text,
+        }
+    }
+
+    /// Returns the textual representation of this native path.
+    ///
+    /// # Returns
+    /// Borrowed `&str` slice of the path.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Constructs a [`NativeBackingPath`] from a host [`std::path::PathBuf`], preserving arbitrary `OsStr` bytes.
+    ///
+    /// # Arguments
+    /// * `path` - Host [`std::path::PathBuf`].
+    ///
+    /// # Returns
+    /// Initialized [`NativeBackingPath`].
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn from_path_buf(path: std::path::PathBuf) -> Self {
+        let text = path.to_string_lossy().into_owned();
+        Self {
+            text,
+            host_path: path,
+        }
+    }
+
+    /// Borrows the underlying host [`std::path::Path`].
+    ///
+    /// # Returns
+    /// Reference to the host [`std::path::Path`].
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.host_path
+    }
+
+    /// Clones the underlying host [`std::path::PathBuf`].
+    ///
+    /// # Returns
+    /// Owned [`std::path::PathBuf`].
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn to_path_buf(&self) -> std::path::PathBuf {
+        self.host_path.clone()
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<std::path::PathBuf> for NativeBackingPath {
+    /// Converts an owned [`std::path::PathBuf`] into [`NativeBackingPath`].
+    ///
+    /// # Arguments
+    /// * `value` - Owned [`std::path::PathBuf`].
+    ///
+    /// # Returns
+    /// Lossless [`NativeBackingPath`].
+    fn from(value: std::path::PathBuf) -> Self {
+        Self::from_path_buf(value)
+    }
 }
 
 /// Configurable locale formatting rules for `DATE`, `TIME`, `%DATE%`, `%TIME%`, and `DIR`.
@@ -1832,5 +2684,299 @@ mod tests {
         assert!(QuoteInsertionStrategy::default().is_wrap_whole_word());
         assert!(QuoteInsertionStrategy::StripAndWrapModifier.is_strip_and_wrap_modifier());
         assert_eq!(fold_win32_case("caf\u{00E9}"), "CAF\u{00C9}");
+    }
+
+    /// Verifies MS-DOS extended error types, `IoErrorKind` conversions, and `NativeBackingPath`.
+    #[test]
+    fn test_dos_extended_errors_io_error_kind_and_native_backing_path() {
+        let raw_codes: &[(u16, &str)] = &[
+            (0x01, "invalid_function"),
+            (0x02, "file_not_found"),
+            (0x03, "path_not_found"),
+            (0x04, "too_many_open_files"),
+            (0x05, "access_denied"),
+            (0x06, "invalid_handle"),
+            (0x07, "arena_trashed"),
+            (0x08, "not_enough_memory"),
+            (0x09, "invalid_block"),
+            (0x0A, "bad_environment"),
+            (0x0B, "bad_format"),
+            (0x0C, "invalid_access"),
+            (0x0D, "invalid_data"),
+            (0x0F, "invalid_drive"),
+            (0x10, "attempt_to_remove_current_directory"),
+            (0x11, "not_same_device"),
+            (0x12, "no_more_files"),
+            (0x13, "write_protected_disk"),
+            (0x14, "unknown_unit"),
+            (0x15, "drive_not_ready"),
+            (0x1F, "general_failure"),
+            (0x20, "sharing_violation"),
+            (0x21, "lock_violation"),
+            (0x50, "file_exists"),
+            (0x52, "cannot_make_directory_entry"),
+            (0x99, "dos_error_0x0099"),
+        ];
+        for &(raw, expected_str) in raw_codes {
+            let code = DosErrorCode::from_raw(raw);
+            assert_eq!(code.to_raw(), raw);
+            assert_eq!(code.to_string(), expected_str);
+            let ext = DosExtendedError::from_code(code);
+            assert_eq!(ext.code, code);
+            assert!(ext.to_string().starts_with(expected_str));
+        }
+
+        let class_strs = [
+            (0x01, "out_of_resource"),
+            (0x02, "temporary_situation"),
+            (0x03, "authorization"),
+            (0x04, "internal_dos"),
+            (0x05, "hardware_failure"),
+            (0x06, "system_failure"),
+            (0x07, "application_error"),
+            (0x08, "not_found"),
+            (0x09, "bad_format"),
+            (0x0A, "locked"),
+            (0x0B, "media_failure"),
+            (0x0C, "already_exists"),
+            (0x0D, "unknown_class_0x0d"),
+        ];
+        for (bh, s) in class_strs {
+            assert_eq!(DosErrorClass::from_raw(bh).to_string(), s);
+        }
+        let action_strs = [
+            (0x01, "retry"),
+            (0x02, "delayed_retry"),
+            (0x03, "prompt_user_reenter"),
+            (0x04, "abort_cleanly"),
+            (0x05, "immediate_exit"),
+            (0x06, "ignore"),
+            (0x07, "retry_after_user_intervention"),
+            (0x08, "unknown_action_0x08"),
+        ];
+        for (bl, s) in action_strs {
+            assert_eq!(DosErrorAction::from_raw(bl).to_string(), s);
+        }
+        let locus_strs = [
+            (0x01, "unknown"),
+            (0x02, "block_device"),
+            (0x03, "network"),
+            (0x04, "serial_device"),
+            (0x05, "memory"),
+            (0x06, "unrecognized_locus_0x06"),
+        ];
+        for (ch, s) in locus_strs {
+            assert_eq!(DosErrorLocus::from_raw(ch).to_string(), s);
+        }
+    }
+
+    /// Verifies `IoErrorKind` conversions and `NativeBackingPath` ordering/hashing.
+    #[test]
+    fn test_io_error_kind_and_native_backing_path() {
+        let explicit_ext = DosExtendedError::new(
+            DosErrorCode::FileNotFound,
+            DosErrorClass::NotFound,
+            DosErrorAction::AbortCleanly,
+            DosErrorLocus::BlockDevice,
+        );
+        assert_eq!(
+            IoErrorKind::DosExtended(explicit_ext).to_string(),
+            "file_not_found (class=not_found, action=abort_cleanly, locus=block_device)"
+        );
+        assert_eq!(IoErrorKind::default(), IoErrorKind::Other);
+
+        let std_kinds = [
+            (
+                std::io::ErrorKind::NotFound,
+                IoErrorKind::NotFound,
+                "not_found",
+            ),
+            (
+                std::io::ErrorKind::PermissionDenied,
+                IoErrorKind::PermissionDenied,
+                "permission_denied",
+            ),
+            (
+                std::io::ErrorKind::IsADirectory,
+                IoErrorKind::IsADirectory,
+                "is_a_directory",
+            ),
+            (
+                std::io::ErrorKind::NotADirectory,
+                IoErrorKind::NotADirectory,
+                "not_a_directory",
+            ),
+            (
+                std::io::ErrorKind::AlreadyExists,
+                IoErrorKind::AlreadyExists,
+                "already_exists",
+            ),
+            (
+                std::io::ErrorKind::DirectoryNotEmpty,
+                IoErrorKind::DirectoryNotEmpty,
+                "directory_not_empty",
+            ),
+            (
+                std::io::ErrorKind::WouldBlock,
+                IoErrorKind::WouldBlock,
+                "would_block",
+            ),
+            (
+                std::io::ErrorKind::BrokenPipe,
+                IoErrorKind::BrokenPipe,
+                "broken_pipe",
+            ),
+            (
+                std::io::ErrorKind::InvalidInput,
+                IoErrorKind::InvalidInput,
+                "invalid_input",
+            ),
+            (
+                std::io::ErrorKind::InvalidData,
+                IoErrorKind::InvalidData,
+                "invalid_data",
+            ),
+        ];
+        for (std_k, expected_k, expected_disp) in std_kinds {
+            let mapped = IoErrorKind::from(std_k);
+            assert_eq!(mapped, expected_k);
+            assert_eq!(mapped.to_string(), expected_disp);
+        }
+    }
+
+    /// Verifies `IoErrorKind` timeout/resource/device/fallback conversions from `std::io::ErrorKind`.
+    #[test]
+    fn test_io_error_kind_resource_and_fallback_mappings() {
+        let std_kinds = [
+            (
+                std::io::ErrorKind::TimedOut,
+                IoErrorKind::TimedOut,
+                "timed_out",
+            ),
+            (
+                std::io::ErrorKind::WriteZero,
+                IoErrorKind::WriteZero,
+                "write_zero",
+            ),
+            (
+                std::io::ErrorKind::Interrupted,
+                IoErrorKind::Interrupted,
+                "interrupted",
+            ),
+            (
+                std::io::ErrorKind::Unsupported,
+                IoErrorKind::Unsupported,
+                "unsupported",
+            ),
+            (
+                std::io::ErrorKind::OutOfMemory,
+                IoErrorKind::OutOfMemory,
+                "out_of_memory",
+            ),
+            (
+                std::io::ErrorKind::StorageFull,
+                IoErrorKind::StorageFull,
+                "storage_full",
+            ),
+            (
+                std::io::ErrorKind::ReadOnlyFilesystem,
+                IoErrorKind::ReadOnlyFilesystem,
+                "read_only_filesystem",
+            ),
+            (
+                std::io::ErrorKind::CrossesDevices,
+                IoErrorKind::CrossesDevices,
+                "crosses_devices",
+            ),
+            (
+                std::io::ErrorKind::UnexpectedEof,
+                IoErrorKind::Other,
+                "other",
+            ),
+        ];
+        for (std_k, expected_k, expected_disp) in std_kinds {
+            let mapped = IoErrorKind::from(std_k);
+            assert_eq!(mapped, expected_k);
+            assert_eq!(mapped.to_string(), expected_disp);
+        }
+    }
+
+    /// Verifies `NativeBackingPath` string/path conversions, ordering, and hashing.
+    #[test]
+    fn test_native_backing_path_ordering_and_hashing() {
+        let p_a = NativeBackingPath::from_string("C:\\DOS\\A.EXE");
+        let p_b = NativeBackingPath::from(std::path::PathBuf::from("C:\\DOS\\B.EXE"));
+        assert_eq!(p_a.as_str(), "C:\\DOS\\A.EXE");
+        assert_eq!(p_a.to_string(), "C:\\DOS\\A.EXE");
+        assert_eq!(p_a.as_path(), std::path::Path::new("C:\\DOS\\A.EXE"));
+        assert_eq!(
+            p_a.to_path_buf(),
+            std::path::PathBuf::from("C:\\DOS\\A.EXE")
+        );
+        assert!(p_a < p_b);
+        assert_eq!(p_a.partial_cmp(&p_b), Some(Ordering::Less));
+        let mut set = std::collections::HashSet::new();
+        assert!(set.insert(p_a.clone()));
+        assert!(!set.insert(p_a));
+    }
+
+    /// Verifies `MemoryProfile` defaults and exact `Display` representations.
+    #[test]
+    fn test_memory_profile_display_and_default() {
+        assert_eq!(MemoryProfile::default(), MemoryProfile::HostUnbounded);
+        let mp_pairs = [
+            (MemoryProfile::HostUnbounded, "host_unbounded"),
+            (MemoryProfile::DosCompact4MiB, "dos_compact_4mib"),
+            (MemoryProfile::DosStandard8MiB, "dos_standard_8mib"),
+            (
+                MemoryProfile::DosExtended16MiBPlus,
+                "dos_extended_16mib_plus",
+            ),
+        ];
+        for (mp, expected) in mp_pairs {
+            assert_eq!(mp.to_string(), expected);
+        }
+
+        for (id, cp, disp) in [
+            (852, CodePage::OemLatin2, "852"),
+            (865, CodePage::OemNordic, "865"),
+            (866, CodePage::OemCyrillic, "866"),
+        ] {
+            assert_eq!(CodePage::from_id(id), Ok(cp));
+            assert_eq!(cp.id(), id);
+            assert_eq!(cp.to_string(), disp);
+        }
+        let vga_col = ConsoleColor::parse_hex("1F");
+        assert_eq!(vga_col.map(ConsoleColor::to_vga_attribute_byte), Ok(0x1F));
+        assert_eq!(
+            ConsoleRenderBackend::default().to_string(),
+            "ansi_sys_escape"
+        );
+        assert_eq!(
+            ConsoleRenderBackend::BiosVgaAttribute.to_string(),
+            "bios_vga_attribute"
+        );
+        assert_eq!(
+            ConsoleRenderBackend::DumbTeletype.to_string(),
+            "dumb_teletype"
+        );
+        assert_eq!(ShellDialect::default().to_string(), "cmd");
+        assert_eq!(ShellDialect::MsDos622.to_string(), "dos622");
+        assert_eq!(ShellDialect::FreeDos.to_string(), "freedos");
+        assert_eq!(
+            ShellDialect::parse_cli_value("nt"),
+            Some(ShellDialect::WindowsNtCmd)
+        );
+        assert_eq!(
+            ShellDialect::parse_cli_value("msdos622"),
+            Some(ShellDialect::MsDos622)
+        );
+        assert_eq!(
+            ShellDialect::parse_cli_value("fdos"),
+            Some(ShellDialect::FreeDos)
+        );
+        assert_eq!(ShellDialect::parse_cli_value("zsh"), None);
+        assert_eq!(PermanentShellMode::default().to_string(), "transient");
+        assert_eq!(PermanentShellMode::Permanent.to_string(), "permanent");
     }
 }

@@ -10,6 +10,8 @@
 //! Implemented via iterative dynamic-programming state transitions (`O(|pattern| * |name|)` time,
 //! `O(|name|)` space) to guarantee zero exponential backtracking on pathological wildcard chains.
 
+use alloc::vec::Vec;
+
 use crate::types::{CaseSensitivity, fold_win32_char};
 
 /// Translated NT `FsRtlIsNameInExpression` wildcard operator token.

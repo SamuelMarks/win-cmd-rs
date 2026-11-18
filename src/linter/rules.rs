@@ -1,9 +1,12 @@
 //! Rule catalog, diagnostic types, and configuration for the `wincheck` linter.
 //!
 //! Defines [`RuleId`], [`Severity`], [`OutputFormat`], [`FixApplicability`], [`SuggestedFix`],
-//! [`Diagnostic`], [`RuleMetadata`], [`LinterConfig`], and the 50-rule catalog (`CMD0001`–`CMD4010`).
+//! [`Diagnostic`], [`RuleMetadata`], [`LinterConfig`], and the 60-rule catalog (`CMD0001`–`CMD5010`).
 
-use std::collections::BTreeSet;
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeSet;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use derive_more::{Display, IsVariant};
 
@@ -15,7 +18,7 @@ use crate::types::{CodePage, ExecutionContext};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
 #[display("{_0}")]
 pub struct RuleId(
-    /// Canonical uppercase rule identifier string (`"CMD0001"`..`"CMD4010"`).
+    /// Canonical uppercase rule identifier string (`"CMD0001"`..`"CMD5010"`).
     pub String,
 );
 
@@ -208,10 +211,12 @@ pub struct LinterConfig {
     pub fix_safety: FixApplicability,
     /// Fallback [`CodePage`] used when decoding input scripts without a UTF-16 BOM (`Utf8` by default).
     pub codepage: CodePage,
+    /// Target shell dialect (`WindowsNtCmd` by default; `MsDos622` enables `CMD5001`–`CMD5010`).
+    pub dialect: crate::types::ShellDialect,
 }
 
 impl Default for LinterConfig {
-    /// Returns the default [`LinterConfig`] (`Severity::Style`, `BatchFile`, `RecommendedRepair`, `CodePage::Utf8`).
+    /// Returns the default [`LinterConfig`] (`Severity::Style`, `BatchFile`, `RecommendedRepair`, `CodePage::Utf8`, `WindowsNtCmd`).
     ///
     /// # Returns
     /// Default [`LinterConfig`].
@@ -223,6 +228,7 @@ impl Default for LinterConfig {
             exec_context: ExecutionContext::BatchFile,
             fix_safety: FixApplicability::RecommendedRepair,
             codepage: CodePage::Utf8,
+            dialect: crate::types::ShellDialect::WindowsNtCmd,
         }
     }
 }
@@ -622,9 +628,79 @@ const RULE_CATALOG_ENTRIES: &[(&str, Severity, &str, &str, &str)] = &[
         "Prefer standard `REM` over `::` label-comment syntax.",
         "`::` is a degenerate label rather than a true comment command and can misbehave around blocks or line continuations. Prefer `REM`.",
     ),
+    (
+        "CMD5001",
+        Severity::Error,
+        "dos-unsupported-set-switch",
+        "`SET /A` arithmetic and `SET /P` interactive prompts are unsupported in MS-DOS COMMAND.COM.",
+        "MS-DOS COMMAND.COM supports only plain `SET VAR=value` and `SET`. Use `CHOICE` for user prompts or an external DOS utility for integer math.",
+    ),
+    (
+        "CMD5002",
+        Severity::Error,
+        "dos-unsupported-for-variant",
+        "`FOR /F`, `FOR /L`, `FOR /R`, and `FOR /D` switches are unsupported in MS-DOS COMMAND.COM.",
+        "MS-DOS COMMAND.COM supports only plain `FOR %%I IN (set) DO command` wildcard/word iteration.",
+    ),
+    (
+        "CMD5003",
+        Severity::Error,
+        "dos-unsupported-if-syntax",
+        "`IF /I`, `IF DEFINED`, `IF CMDEXTVERSION`, `EQU`–`GEQ`, and `ELSE` are unsupported in MS-DOS COMMAND.COM.",
+        "MS-DOS COMMAND.COM supports only `IF [NOT] ERRORLEVEL n`, `IF [NOT] EXIST file`, and `IF [NOT] s1==s2` without `ELSE`.",
+    ),
+    (
+        "CMD5004",
+        Severity::Error,
+        "dos-compound-or-chaining",
+        "Parenthesized `( ... )` blocks and `&`, `&&`, `||` command chains are unsupported in MS-DOS COMMAND.COM.",
+        "Place commands on separate physical lines and branch with `IF ERRORLEVEL` and `GOTO` labels.",
+    ),
+    (
+        "CMD5005",
+        Severity::Error,
+        "dos-extended-var-syntax",
+        "Delayed `!VAR!`, `%VAR:~...%` / `%VAR:a=b%`, `%*`, and `%~dpnx1` modifiers are unsupported in MS-DOS COMMAND.COM.",
+        "MS-DOS COMMAND.COM supports only immediate `%VAR%`, positional `%0`–`%9` (with `SHIFT`), and `%%I`.",
+    ),
+    (
+        "CMD5006",
+        Severity::Error,
+        "dos-subroutine-or-eof",
+        "`CALL :label`, implicit `GOTO :EOF`, and `EXIT /B` are unsupported in MS-DOS COMMAND.COM.",
+        "Define an explicit `:EOF` label at the end of the `.BAT` file and invoke external `.BAT` files via `CALL OTHER.BAT`.",
+    ),
+    (
+        "CMD5007",
+        Severity::Error,
+        "dos-nt-only-builtin",
+        "`SETLOCAL`, `ENDLOCAL`, `PUSHD`, `POPD`, `ASSOC`, `FTYPE`, and `MKLINK` are unavailable in MS-DOS COMMAND.COM.",
+        "Save and restore variables/directories manually in MS-DOS batch files instead of relying on NT environment/directory stacks.",
+    ),
+    (
+        "CMD5008",
+        Severity::Error,
+        "dos-numeric-fd-redirect",
+        "Numeric handle redirections (`2>`, `2>&1`, `1>&2`) are unsupported in MS-DOS COMMAND.COM.",
+        "MS-DOS COMMAND.COM supports only `<`, `>`, and `>>` on standard input (`0`) and standard output (`1`).",
+    ),
+    (
+        "CMD5009",
+        Severity::Warning,
+        "dos-non-8-3-path",
+        "Filename or path segment violates MS-DOS FAT 8.3 limits or uses `.cmd` instead of `.bat`.",
+        "Restrict filenames to 1–8 base characters and 0–3 extension characters without spaces, and name batch scripts `.BAT`.",
+    ),
+    (
+        "CMD5010",
+        Severity::Warning,
+        "dos-psp-tail-too-long",
+        "External command argument tail exceeds the 126-byte MS-DOS `PSP:0x80` command-line limit.",
+        "Shorten the argument tail to 126 bytes or pass `@response.rsp` when invoking DJGPP/DOS tools.",
+    ),
 ];
 
-/// Returns the complete catalog of all `wincheck` rules (`CMD0001`–`CMD4010`).
+/// Returns the complete catalog of all `wincheck` rules (`CMD0001`–`CMD5010`).
 ///
 /// # Returns
 /// Vector of [`RuleMetadata`] descriptors for every rule in the linter.

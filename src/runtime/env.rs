@@ -6,8 +6,12 @@
 //! `%=ExitCodeAscii%`) when not explicitly overridden by user `SET`, advancing `%RANDOM%` on
 //! every individual expansion and translating POSIX `PATH` segments on host overlay.
 
-use std::cell::Cell;
-use std::collections::BTreeMap;
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::cell::Cell;
 
 use crate::types::{
     BS_STR, DelayedExpansionMode, DriveLetter, EnvVarName, ExitCode, ExtensionsMode,

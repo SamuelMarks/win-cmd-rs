@@ -2,6 +2,11 @@
 //!
 //! Shared between Phase 1 (`%VAR:...%`) and Phase 4 (`!VAR:...!`) variable expansion passes.
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 /// Evaluates a variable operation expression (`VAR`, `VAR:~offset,length`, `VAR:old=new`, `VAR:*old=new`).
 ///
 /// # Arguments

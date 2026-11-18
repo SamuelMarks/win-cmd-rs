@@ -4,6 +4,10 @@
 //! Phase 2 runtime execution ([`super::phase2`]), guaranteeing 100% identical statement
 //! boundaries, `ECHO(` parenthesis handling, `SET /A` operator precedence, and argument tokenization.
 
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::parser::ast::{SpannedWord, WordPart};
 use crate::parser::cst::{CstToken, SyntaxKind};
 use crate::reader::char_map::{ExpansionOrigin, SpannedChar};
@@ -407,7 +411,7 @@ fn collect_segment_words_before(chars: &[SpannedChar], limit: usize) -> Vec<Stri
             }
             if matches!(sc.ch, ' ' | TAB_CHAR | ',' | ';' | '\u{00A0}') {
                 if !cur_word.is_empty() {
-                    words.push(std::mem::take(&mut cur_word));
+                    words.push(core::mem::take(&mut cur_word));
                 }
                 i = i.saturating_add(1);
                 continue;

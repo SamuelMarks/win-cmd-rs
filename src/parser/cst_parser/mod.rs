@@ -4,7 +4,12 @@
 //! Uses [`BatchFrameReader`] and [`super::lexer`] to guarantee 100% lossless round-tripping
 //! (`cst.to_source_string() == raw_text`) without `O(N^2)` slice rescanning or `BTreeMap` leaf cloning.
 
-use std::collections::BTreeSet;
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::error::{PegExpected, ProbableMisuseKind};
 use crate::parser::cst::{CstElement, CstNode, CstScript, CstToken, PegDiagnostic, SyntaxKind};

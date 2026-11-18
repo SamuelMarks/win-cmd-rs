@@ -1,6 +1,12 @@
 //! `wincheck` CLI argument parser, file/stdin loader, `--fix` / `--diff` runner, and process driver.
 
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
+#[cfg(feature = "std")]
 use std::io::{Read, Write};
 
 use derive_more::{Display, IsVariant};
@@ -8,14 +14,14 @@ use derive_more::{Display, IsVariant};
 use crate::error::{CliErrorReason, CliTool, CliUsageFailure, CmdError};
 use crate::linter::{
     LinterConfig, OutputFormat, RuleId, Severity, all_rule_metadata, explain_rule,
-    format_diagnostics, generate_unified_diff, lint_script, rewrite_script,
+    format_diagnostics, generate_unified_diff, lint_script_with_vfs, rewrite_script,
 };
 use crate::reader::encoding::encode_script_preserving_bom;
-use crate::runtime::IoStreams;
+use crate::runtime::{ByteStreamRead, ByteStreamWrite, IoStreams, write_byte_stream_gracefully};
 use crate::span::{ByteOffset, SourceMap};
 use crate::types::{CodePage, ExecutionContext, ExitCode, LF_CHAR};
+use crate::vfs::VirtualFileSystem;
 
-use super::repl::write_stream_gracefully;
 use super::wincmd_cli::exit_code_to_u8;
 
 /// Fix/output mode for `wincheck` file inspection.
@@ -109,6 +115,12 @@ pub fn parse_wincheck_args(args: &[String]) -> Result<WinCheckAction, CmdError> 
                 i = i.saturating_add(2);
                 continue;
             }
+            "--dialect" => {
+                let dial_str = next_required_cli_value(args, i, arg)?;
+                config.dialect = parse_wincheck_dialect_str(dial_str)?;
+                i = i.saturating_add(2);
+                continue;
+            }
             "--explain" => {
                 let code = next_required_cli_value(args, i, arg)?;
                 return Ok(WinCheckAction::ExplainRule(code.to_owned()));
@@ -140,6 +152,10 @@ pub fn parse_wincheck_args(args: &[String]) -> Result<WinCheckAction, CmdError> 
             _ if arg.starts_with("--encoding=") => {
                 let enc_str = arg.get("--encoding=".len()..).unwrap_or("");
                 config.codepage = parse_wincheck_encoding_str(enc_str)?;
+            }
+            _ if arg.starts_with("--dialect=") => {
+                let dial_str = arg.get("--dialect=".len()..).unwrap_or("");
+                config.dialect = parse_wincheck_dialect_str(dial_str)?;
             }
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(CmdError::from(CliUsageFailure::new(
@@ -222,6 +238,9 @@ fn parse_wincheck_encoding_str(enc_str: &str) -> Result<CodePage, CmdError> {
         "ascii" | "20127" => Ok(CodePage::Ascii),
         "cp437" | "437" | "oem" => Ok(CodePage::OemUnitedStates),
         "cp850" | "850" => Ok(CodePage::OemMultilingualLatin1),
+        "cp852" | "852" => Ok(CodePage::OemLatin2),
+        "cp865" | "865" => Ok(CodePage::OemNordic),
+        "cp866" | "866" => Ok(CodePage::OemCyrillic),
         "cp1252" | "1252" | "windows-1252" => Ok(CodePage::WindowsLatin1),
         "utf16" | "utf16le" | "utf-16" | "utf-16le" | "1200" => Ok(CodePage::Utf16Le),
         "utf16be" | "utf-16be" | "1201" => Ok(CodePage::Utf16Be),
@@ -231,6 +250,26 @@ fn parse_wincheck_encoding_str(enc_str: &str) -> Result<CodePage, CmdError> {
             CliErrorReason::InvalidEncodingValue(enc_str.to_owned()),
         ))),
     }
+}
+
+/// Parses a `wincheck --dialect` argument string into [`crate::types::ShellDialect`].
+///
+/// # Arguments
+/// * `dial_str` - Dialect identifier (`"cmd"`, `"dos622"`, `"freedos"`).
+///
+/// # Returns
+/// `Ok(ShellDialect)` if recognized.
+///
+/// # Errors
+/// Returns [`CmdError::CliUsage`] on unrecognized dialect names.
+fn parse_wincheck_dialect_str(dial_str: &str) -> Result<crate::types::ShellDialect, CmdError> {
+    crate::types::ShellDialect::parse_cli_value(dial_str).ok_or_else(|| {
+        CmdError::from(CliUsageFailure::new(
+            CliTool::WinCheck,
+            "--dialect",
+            CliErrorReason::InvalidModeValue(dial_str.to_owned()),
+        ))
+    })
 }
 
 /// Parses a `wincheck --format` argument string into [`OutputFormat`].
@@ -327,10 +366,36 @@ fn parse_wincheck_mode_str(mode_str: &str) -> Result<ExecutionContext, CmdError>
 ///
 /// # Arguments
 /// * `list` - Comma-separated `CMDxxxx` string.
-/// * `set` - Destination [`std::collections::BTreeSet`] of [`RuleId`]s.
-fn insert_comma_rule_ids(list: &str, set: &mut std::collections::BTreeSet<RuleId>) {
+/// * `set` - Destination [`BTreeSet`] of [`RuleId`]s.
+fn insert_comma_rule_ids(list: &str, set: &mut BTreeSet<RuleId>) {
     for item in list.split(',').filter(|s| !s.is_empty()) {
         set.insert(RuleId::new(item));
+    }
+}
+
+/// Loads raw script bytes from `vfs` or from `stdin` when `path == "-"`.
+///
+/// # Arguments
+/// * `path` - VFS path or `"-"` for standard input.
+/// * `vfs` - [`VirtualFileSystem`] backend read when `path != "-"`.
+/// * `stdin` - [`ByteStreamRead`] stream read when `path == "-"`.
+///
+/// # Returns
+/// `Ok(Vec<u8>)` containing raw script bytes.
+///
+/// # Errors
+/// Returns [`CmdError`] mapped from VFS or `stdin` read failures.
+pub fn load_vfs_or_stdin(
+    path: &str,
+    vfs: &dyn VirtualFileSystem,
+    stdin: &mut dyn ByteStreamRead,
+) -> Result<Vec<u8>, CmdError> {
+    if path == "-" {
+        let mut buf = Vec::new();
+        stdin.read_all_bytes(&mut buf)?;
+        Ok(buf)
+    } else {
+        vfs.read_bytes(path)
     }
 }
 
@@ -348,12 +413,12 @@ fn insert_comma_rule_ids(list: &str, set: &mut std::collections::BTreeSet<RuleId
 ///
 /// # Errors
 /// Returns [`CmdError`] mapped from host filesystem or `stdin` read failures.
+#[cfg(feature = "std")]
 pub fn load_file_or_stdin(path: &str, stdin: &mut dyn Read) -> Result<Vec<u8>, CmdError> {
     if path == "-" {
+        let mut adapter = crate::runtime::StdReadAdapter(stdin);
         let mut buf = Vec::new();
-        stdin
-            .read_to_end(&mut buf)
-            .map_err(|err| CmdError::from_io_error(&err, "-", "read"))?;
+        adapter.read_all_bytes(&mut buf)?;
         Ok(buf)
     } else {
         std::fs::read(path).map_err(|err| CmdError::from_io_error(&err, path, "read"))
@@ -371,8 +436,27 @@ pub fn load_file_or_stdin(path: &str, stdin: &mut dyn Read) -> Result<Vec<u8>, C
 ///
 /// # Errors
 /// Returns [`CmdError`] (`FileNotFound`, `AccessDenied`, or `IoFailure`) via [`CmdError::from_io_error`].
+#[cfg(feature = "std")]
 fn write_file_to_disk(path: &str, data: &[u8]) -> Result<(), CmdError> {
     std::fs::write(path, data).map_err(|err| CmdError::from_io_error(&err, path, "write"))
+}
+
+/// Fallback no-op writer returning [`CmdError::UnsupportedOperation`] when `--in-place` is invoked without a VFS or `std` disk writer.
+///
+/// # Arguments
+/// * `_path` - Unused destination path.
+/// * `_data` - Unused byte buffer.
+///
+/// # Returns
+/// Always returns `Err`.
+///
+/// # Errors
+/// Returns [`CmdError::UnsupportedOperation`].
+#[cfg(not(feature = "std"))]
+fn unsupported_in_place_writer(_path: &str, _data: &[u8]) -> Result<(), CmdError> {
+    Err(CmdError::UnsupportedOperation {
+        operation: "wincheck --in-place without VFS".to_owned(),
+    })
 }
 
 /// Executes a [`WinCheckAction`] using `file_loader` to read files and writes output to `io`.
@@ -400,11 +484,15 @@ where
     L: FnMut(&str) -> Result<Vec<u8>, CmdError>,
 {
     let mut raw_stdout: Option<Vec<u8>> = None;
-    let mut disk_writer = write_file_to_disk;
+    #[cfg(feature = "std")]
+    let mut default_writer = write_file_to_disk;
+    #[cfg(not(feature = "std"))]
+    let mut default_writer = unsupported_in_place_writer;
     let code = run_wincheck_action_dyn(
         action,
         &mut file_loader,
-        &mut disk_writer,
+        &mut default_writer,
+        None,
         io,
         &mut raw_stdout,
     )?;
@@ -414,12 +502,64 @@ where
     Ok(code)
 }
 
+/// Executes a [`WinCheckAction`] reading files, resolving `source-path` directives, and writing
+/// `--in-place` fixes directly through `vfs`.
+///
+/// # Arguments
+/// * `action` - Parsed [`WinCheckAction`].
+/// * `vfs` - Mutable [`VirtualFileSystem`] backend (e.g., `InMemoryVfs` or MS-DOS `DosFatVfs`).
+/// * `stdin` - [`ByteStreamRead`] stream read when `"-"` is passed as a file argument.
+/// * `io` - Mutable [`IoStreams`] for formatted text output.
+///
+/// # Returns
+/// `Ok((ExitCode, Option<Vec<u8>>))` containing the exit code and optional raw `--fix` stdout bytes.
+///
+/// # Errors
+/// Returns [`CmdError`] if a rule ID is unknown or VFS reading/writing/decoding fails.
+pub fn run_wincheck_action_with_vfs(
+    action: &WinCheckAction,
+    vfs: &mut dyn VirtualFileSystem,
+    stdin: &mut dyn ByteStreamRead,
+    io: &mut IoStreams,
+) -> Result<(ExitCode, Option<Vec<u8>>), CmdError> {
+    let mut raw_stdout: Option<Vec<u8>> = None;
+    let vfs_snapshot = vfs.clone_box();
+    let mut writer_err: Option<CmdError> = None;
+    let mut pending_writes: Vec<(String, Vec<u8>)> = Vec::new();
+    let code = {
+        let mut loader = |path: &str| load_vfs_or_stdin(path, &*vfs_snapshot, stdin);
+        let mut writer = |path: &str, data: &[u8]| -> Result<(), CmdError> {
+            pending_writes.push((path.to_owned(), data.to_vec()));
+            Ok(())
+        };
+        run_wincheck_action_dyn(
+            action,
+            &mut loader,
+            &mut writer,
+            Some(&*vfs_snapshot),
+            io,
+            &mut raw_stdout,
+        )?
+    };
+    for (path, data) in pending_writes {
+        if let Err(err) = vfs.write_bytes(&path, &data) {
+            writer_err = Some(err);
+            break;
+        }
+    }
+    if let Some(err) = writer_err {
+        return Err(err);
+    }
+    Ok((code, raw_stdout))
+}
+
 /// Dynamic-dispatch implementation of [`run_wincheck_action`] compiled once across all loaders.
 ///
 /// # Arguments
 /// * `action` - Parsed [`WinCheckAction`].
 /// * `file_loader` - Dynamic file-loading callback.
 /// * `file_writer` - Dynamic file-writing callback used by `--in-place`.
+/// * `source_vfs` - Optional [`VirtualFileSystem`] for `REM wincheck source-path=` resolution.
 /// * `io` - Mutable [`IoStreams`] for text output.
 /// * `raw_stdout` - Optional raw byte buffer populated when `--fix` writes encoded script bytes to stdout.
 ///
@@ -432,6 +572,7 @@ fn run_wincheck_action_dyn(
     action: &WinCheckAction,
     file_loader: &mut dyn FnMut(&str) -> Result<Vec<u8>, CmdError>,
     file_writer: &mut FileWriterFn<'_>,
+    source_vfs: Option<&dyn VirtualFileSystem>,
     io: &mut IoStreams,
     raw_stdout: &mut Option<Vec<u8>>,
 ) -> Result<ExitCode, CmdError> {
@@ -499,6 +640,7 @@ fn run_wincheck_action_dyn(
             },
             file_loader,
             file_writer,
+            source_vfs,
             io,
             raw_stdout,
         ),
@@ -524,6 +666,7 @@ struct WinCheckLintSpec<'a> {
 /// * `spec` - Bundled [`WinCheckLintSpec`] options.
 /// * `file_loader` - Callback loading raw bytes per file.
 /// * `file_writer` - Callback writing raw bytes per file in `ApplyFixInPlace` mode.
+/// * `source_vfs` - Optional [`VirtualFileSystem`] for `REM wincheck source-path=` directives.
 /// * `io` - Mutable [`IoStreams`] output buffer.
 /// * `raw_stdout` - Optional raw stdout byte sink for `ApplyFix`.
 ///
@@ -536,6 +679,7 @@ fn run_wincheck_lint_files(
     spec: &WinCheckLintSpec<'_>,
     file_loader: &mut dyn FnMut(&str) -> Result<Vec<u8>, CmdError>,
     file_writer: &mut FileWriterFn<'_>,
+    source_vfs: Option<&dyn VirtualFileSystem>,
     io: &mut IoStreams,
     raw_stdout: &mut Option<Vec<u8>>,
 ) -> Result<ExitCode, CmdError> {
@@ -549,7 +693,7 @@ fn run_wincheck_lint_files(
 
     for path in files {
         let raw = file_loader(path)?;
-        let (source_id, diags) = lint_script(path, &raw, config, &mut sm)?;
+        let (source_id, diags) = lint_script_with_vfs(path, &raw, config, &mut sm, source_vfs)?;
         let (orig_str, bom_len) = sm
             .get_file(source_id)
             .map(|sf| (sf.decoded_text.clone(), sf.raw_byte_offset(ByteOffset(0)).0))
@@ -578,7 +722,8 @@ fn run_wincheck_lint_files(
                     *raw_stdout = Some(encoded_out.clone());
                 }
                 let mut post_sm = SourceMap::new();
-                let (_, rem_diags) = lint_script(path, &encoded_out, config, &mut post_sm)?;
+                let (_, rem_diags) =
+                    lint_script_with_vfs(path, &encoded_out, config, &mut post_sm, source_vfs)?;
                 post_fix_diags.extend(rem_diags);
             }
         }
@@ -609,6 +754,53 @@ fn run_wincheck_lint_files(
     }
 }
 
+/// Executes the `#![no_std]`-compatible `wincheck` CLI over a [`VirtualFileSystem`] and portable byte streams.
+///
+/// # Arguments
+/// * `args` - Command-line arguments excluding `argv[0]`.
+/// * `vfs` - Mutable [`VirtualFileSystem`] backend (such as `InMemoryVfs` or MS-DOS `DosFatVfs`).
+/// * `stdin` - Standard input reader (read when `"-"` is passed as a file argument).
+/// * `stdout` - Standard output writer.
+/// * `stderr` - Standard error writer.
+///
+/// # Returns
+/// Process exit status byte (`0` when clean/fixed, `1` on diagnostics or file/I/O errors, `2` on CLI usage or unknown rule ID errors).
+pub fn execute_wincheck_over_vfs_streams(
+    args: &[String],
+    vfs: &mut dyn VirtualFileSystem,
+    stdin: &mut dyn ByteStreamRead,
+    stdout: &mut dyn ByteStreamWrite,
+    stderr: &mut dyn ByteStreamWrite,
+) -> u8 {
+    let action = match parse_wincheck_args(args) {
+        Ok(act) => act,
+        Err(err) => {
+            let msg = format!("{}{LF_CHAR}", err.cmd_exe_message());
+            if write_byte_stream_gracefully(stderr, msg.as_bytes()).is_err() {
+                return 1;
+            }
+            return exit_code_to_u8(err.exit_code());
+        }
+    };
+
+    let mut io = IoStreams::new();
+    let (code, raw_stdout) = match run_wincheck_action_with_vfs(&action, vfs, stdin, &mut io) {
+        Ok(pair) => pair,
+        Err(err) => {
+            write!(io.stderr, "{}{LF_CHAR}", err.cmd_exe_message()).unwrap_or(());
+            (err.exit_code(), None)
+        }
+    };
+
+    let out_bytes = raw_stdout.as_deref().unwrap_or(io.stdout.as_bytes());
+    if write_byte_stream_gracefully(stdout, out_bytes).is_err()
+        || write_byte_stream_gracefully(stderr, io.stderr.as_bytes()).is_err()
+    {
+        return 1;
+    }
+    exit_code_to_u8(code)
+}
+
 /// Executes the standalone `wincheck` CLI process over live `stdin`, `stdout`, and `stderr`.
 ///
 /// # Arguments
@@ -619,6 +811,7 @@ fn run_wincheck_lint_files(
 ///
 /// # Returns
 /// Process exit status byte (`0` when clean/fixed, `1` on diagnostics or file/I/O errors, `2` on CLI usage or unknown rule ID errors).
+#[cfg(feature = "std")]
 pub fn execute_wincheck_process(
     args: &[String],
     stdin: &mut dyn Read,
@@ -629,7 +822,7 @@ pub fn execute_wincheck_process(
         Ok(act) => act,
         Err(err) => {
             let msg = format!("{}{LF_CHAR}", err.cmd_exe_message());
-            if write_stream_gracefully(stderr, msg.as_bytes()).is_err() {
+            if super::repl::write_stream_gracefully(stderr, msg.as_bytes()).is_err() {
                 return 1;
             }
             return exit_code_to_u8(err.exit_code());
@@ -643,6 +836,7 @@ pub fn execute_wincheck_process(
         &action,
         &mut |path| load_file_or_stdin(path, stdin),
         &mut disk_writer,
+        None,
         &mut io,
         &mut raw_stdout,
     ) {
@@ -654,8 +848,8 @@ pub fn execute_wincheck_process(
     };
 
     let out_bytes = raw_stdout.as_deref().unwrap_or(io.stdout.as_bytes());
-    if write_stream_gracefully(stdout, out_bytes).is_err()
-        || write_stream_gracefully(stderr, io.stderr.as_bytes()).is_err()
+    if super::repl::write_stream_gracefully(stdout, out_bytes).is_err()
+        || super::repl::write_stream_gracefully(stderr, io.stderr.as_bytes()).is_err()
     {
         return 1;
     }

@@ -73,6 +73,7 @@ tests/fixtures/**/*.bin      binary
 *.s       text eol=lf
 *.S       text eol=lf
 *.asm     text eol=lf
+*.ld      text eol=lf
 CMakeLists.txt text eol=lf
 *.cmake   text eol=lf
 Makefile  text eol=lf

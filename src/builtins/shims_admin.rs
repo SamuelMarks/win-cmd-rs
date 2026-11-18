@@ -6,7 +6,12 @@
 //! `CHOICE /C` & `/D` and `TIMEOUT /T <seconds>` strictly, and syncs live `Command Processor`
 //! Registry settings on `REG ADD`, `REG DELETE`, and `REG IMPORT`.
 
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 use crate::error::CmdError;
 use crate::parser::ast::SpannedWord;
@@ -91,6 +96,42 @@ struct ChoiceOptions {
     message: Option<String>,
 }
 
+/// Parses MS-DOS 6.x `CHOICE /T[:]c,nn` (either quoted in one token or comma-split across two tokens).
+///
+/// # Arguments
+/// * `u` - Unquoted `/T...` token.
+/// * `args` - Full argument slice.
+/// * `i` - Current index in `args`.
+/// * `cmd_span` - Command [`Span`] for syntax errors.
+///
+/// # Returns
+/// `Ok((Option<char>, consumed_arg_count))`.
+///
+/// # Errors
+/// Returns [`CmdError::SyntaxError`] on malformed character or timeout integer.
+fn parse_choice_dos_timeout_spec(
+    u: &str,
+    args: &[SpannedWord],
+    i: usize,
+    cmd_span: Span,
+) -> Result<(Option<char>, usize), CmdError> {
+    let spec = u.get(2..).unwrap_or("").trim_start_matches(':');
+    if let Some((ch_str, secs_str)) = spec.split_once(',') {
+        if ch_str.chars().count() != 1 || secs_str.parse::<u32>().is_err() {
+            return Err(CmdError::SyntaxError { span: cmd_span });
+        }
+        Ok((ch_str.chars().next(), 1))
+    } else {
+        let Some(next) = args.get(i.saturating_add(1)) else {
+            return Err(CmdError::SyntaxError { span: cmd_span });
+        };
+        if spec.chars().count() != 1 || next.unquoted().parse::<u32>().is_err() {
+            return Err(CmdError::SyntaxError { span: cmd_span });
+        }
+        Ok((spec.chars().next(), 2))
+    }
+}
+
 /// Parses and validates `CHOICE` switches (`/C`, `/N`, `/CS`, `/T`, `/D`, `/M`).
 ///
 /// # Arguments
@@ -117,7 +158,7 @@ fn parse_choice_options(args: &[SpannedWord], cmd_span: Span) -> Result<ChoiceOp
         let upper = u.to_ascii_uppercase();
         if upper == "/N" {
             opts.hide_choices = true;
-        } else if upper == "/CS" {
+        } else if upper == "/CS" || upper == "/S" {
             opts.case_sensitive = true;
         } else if upper == "/C" {
             let Some(next) = args.get(i.saturating_add(1)) else {
@@ -162,6 +203,11 @@ fn parse_choice_options(args: &[SpannedWord], cmd_span: Span) -> Result<ChoiceOp
             }
             i = i.saturating_add(2);
             continue;
+        } else if upper.starts_with("/T") {
+            let (def_ch, consumed) = parse_choice_dos_timeout_spec(u, args, i, cmd_span)?;
+            opts.default_ch = def_ch;
+            i = i.saturating_add(consumed);
+            continue;
         } else if upper == "/M" {
             let Some(next) = args.get(i.saturating_add(1)) else {
                 return Err(CmdError::SyntaxError { span: cmd_span });
@@ -169,6 +215,8 @@ fn parse_choice_options(args: &[SpannedWord], cmd_span: Span) -> Result<ChoiceOp
             opts.message = Some(next.unquoted().to_owned());
             i = i.saturating_add(2);
             continue;
+        } else if !u.starts_with('/') && opts.message.is_none() {
+            opts.message = Some(u.to_owned());
         } else {
             return Err(CmdError::SyntaxError { span: cmd_span });
         }

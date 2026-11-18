@@ -6,8 +6,13 @@
 //! Also supports importing and exporting standard `.reg` files (`Windows Registry Editor Version 5.00`)
 //! and Wine registry files (`WINE REGISTRY Version 2`).
 
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 use derive_more::{Display, IsVariant};
 

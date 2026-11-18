@@ -1,6 +1,12 @@
 //! AST statement, pipeline, redirection, `FOR` / `IF` control-flow, and batch-frame execution engine.
 
-use std::collections::BTreeMap;
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::builtins::{BuiltinInvocation, dispatch_builtin};
 use crate::error::{CmdError, ExecutionLimitFailure, LimitKind};
@@ -290,6 +296,7 @@ impl Interpreter {
     fn run_top_batch_frame(&mut self, io: &mut dyn CmdIo) -> Result<(), CmdError> {
         let mut last_known_raw_len: usize = 0;
         while let Some(top_frame) = self.exec.call_stack().last().cloned() {
+            self.poll_dos_ctrl_break();
             if self.exec.interrupt_state == InterruptState::Pending {
                 self.exec.interrupt_state = InterruptState::Clear;
                 let _interrupt_flow = self.handle_ctrl_c_interrupt(io);
@@ -558,7 +565,7 @@ impl Interpreter {
         let left_flow =
             left_shell.execute_command_expr(left, ExecutionContext::PipeSubshell, &mut left_io);
         self.proc_env.vfs =
-            std::mem::replace(&mut left_shell.proc_env.vfs, Box::new(InMemoryVfs::new()));
+            core::mem::replace(&mut left_shell.proc_env.vfs, Box::new(InMemoryVfs::new()));
         restore_vfs_cwds(self.proc_env.vfs.as_mut(), &saved_cwds);
 
         if !left_io.stderr.is_empty() {
@@ -566,6 +573,10 @@ impl Interpreter {
         }
         if let FlowControl::Abort(err) = left_flow {
             return FlowControl::Abort(err);
+        }
+        self.poll_dos_ctrl_break();
+        if self.exec.interrupt_state == InterruptState::Pending {
+            return self.handle_ctrl_c_interrupt(io);
         }
 
         let (pipe_bytes, pipe_cp) = match self.config.pipe_execution_mode {
@@ -581,7 +592,7 @@ impl Interpreter {
         let right_flow =
             right_shell.execute_command_expr(right, ExecutionContext::PipeSubshell, &mut right_io);
         self.proc_env.vfs =
-            std::mem::replace(&mut right_shell.proc_env.vfs, Box::new(InMemoryVfs::new()));
+            core::mem::replace(&mut right_shell.proc_env.vfs, Box::new(InMemoryVfs::new()));
         restore_vfs_cwds(self.proc_env.vfs.as_mut(), &saved_cwds);
 
         self.exec.last_exit_code = right_shell.exec.last_exit_code();
@@ -632,10 +643,10 @@ impl Interpreter {
 
         let saved_inputs = new_inputs
             .as_ref()
-            .map(|m| std::mem::replace(&mut self.exec.active_input_handles, m.clone()));
+            .map(|m| core::mem::replace(&mut self.exec.active_input_handles, m.clone()));
         let saved_sinks = sinks
             .as_ref()
-            .map(|s| std::mem::replace(&mut self.exec.active_output_sinks, s.clone()));
+            .map(|s| core::mem::replace(&mut self.exec.active_output_sinks, s.clone()));
 
         let stdin_override = new_inputs.and_then(|mut m| m.remove(&0).flatten());
         let needs_capture = sinks.as_ref().is_some_and(|s| {
@@ -666,7 +677,7 @@ impl Interpreter {
             self.exec.active_output_sinks = prev_out;
         }
 
-        let chunks = std::mem::take(&mut redir_io.output_chunks);
+        let chunks = core::mem::take(&mut redir_io.output_chunks);
         if let Some(active_sinks) = sinks
             && !chunks.is_empty()
             && let Err(err) = self.flush_output_sinks(&active_sinks, &chunks, io)
@@ -979,7 +990,7 @@ impl Interpreter {
             let mut sub_io = BufferedIoStreams::new();
             let res = sub.execute_interactive_line_checked(cmd_str, &mut sub_io);
             self.proc_env.vfs =
-                std::mem::replace(&mut sub.proc_env.vfs, Box::new(InMemoryVfs::new()));
+                core::mem::replace(&mut sub.proc_env.vfs, Box::new(InMemoryVfs::new()));
             restore_vfs_cwds(self.proc_env.vfs.as_mut(), &saved_cwds);
             if let Err(err) = res {
                 return FlowControl::Abort(err);
@@ -1235,10 +1246,10 @@ impl Interpreter {
 
         let saved_inputs = new_inputs
             .as_ref()
-            .map(|m| std::mem::replace(&mut self.exec.active_input_handles, m.clone()));
+            .map(|m| core::mem::replace(&mut self.exec.active_input_handles, m.clone()));
         let saved_sinks = sinks
             .as_ref()
-            .map(|s| std::mem::replace(&mut self.exec.active_output_sinks, s.clone()));
+            .map(|s| core::mem::replace(&mut self.exec.active_output_sinks, s.clone()));
 
         let stdin_override = new_inputs.and_then(|mut m| m.remove(&0).flatten());
         let needs_capture = sinks.as_ref().is_some_and(|s| {
@@ -1280,7 +1291,7 @@ impl Interpreter {
             self.exec.active_output_sinks = prev_out;
         }
 
-        let chunks = std::mem::take(&mut redir_io.output_chunks);
+        let chunks = core::mem::take(&mut redir_io.output_chunks);
         if let Some(active_sinks) = sinks
             && !chunks.is_empty()
             && let Err(err) = self.flush_output_sinks(&active_sinks, &chunks, io)

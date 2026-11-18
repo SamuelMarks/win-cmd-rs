@@ -6,8 +6,12 @@
 //! stripping from legacy MS-DOS `...` multi-dot climbing, and implements collision-free NT 8.3
 //! short filename generation (`PROGRA~1`..`PROGRA~4` and 4-hex-digit hash `PRxxxx~1` for `>=5`).
 
-use std::cmp::Ordering;
-use std::hash::{Hash, Hasher};
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::cmp::Ordering;
+use core::hash::{Hash, Hasher};
 
 use derive_more::{Display, IsVariant};
 

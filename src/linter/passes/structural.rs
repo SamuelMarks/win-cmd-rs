@@ -6,6 +6,12 @@
 //! (`CMD4001`), bare `.bat` -> `CALL` (`CMD3003`), and gates `EXIT` -> `EXIT /B` (`CMD3004`)
 //! behind [`crate::linter::rules::FixApplicability::UnsafeOptIn`].
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::linter::rewriter::{CstRewriteRule, RewriteContext};
 use crate::linter::rules::{FixApplicability, RuleId};
 use crate::parser::cst::{CstElement, CstNode, CstToken, SyntaxKind};

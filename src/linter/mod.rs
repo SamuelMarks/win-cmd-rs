@@ -21,6 +21,12 @@ pub use crate::linter::rules::{
     SuggestedFix, all_rule_metadata, explain_rule,
 };
 
+use alloc::borrow::ToOwned;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::error::CmdError;
 use crate::linter::directives::{
     SuppressionTable, check_file_encoding_and_lines, convert_peg_diagnostics,
@@ -30,6 +36,7 @@ use crate::parser::peg::{lower_cst_to_ast, parse_script_cst};
 use crate::reader::encoding::decode_script_bytes;
 use crate::span::{SourceFile, SourceId, SourceMap};
 use crate::types::{CodePage, ExecutionContext};
+use crate::vfs::VirtualFileSystem;
 
 /// Analyzes a batch script buffer and returns all triggered [`Diagnostic`]s sorted by span.
 ///
@@ -50,13 +57,38 @@ pub fn lint_script(
     config: &LinterConfig,
     source_map: &mut SourceMap,
 ) -> Result<(SourceId, Vec<Diagnostic>), CmdError> {
+    lint_script_with_vfs(file_name, raw_bytes, config, source_map, None)
+}
+
+/// Analyzes a batch script buffer with an optional [`VirtualFileSystem`] for `source-path` directives.
+///
+/// # Arguments
+/// * `file_name` - Display name or path of the script.
+/// * `raw_bytes` - Raw undecoded script bytes.
+/// * `config` - [`LinterConfig`] filtering rules and severities.
+/// * `source_map` - Mutable [`SourceMap`] to register the file for span formatting.
+/// * `vfs` - Optional [`VirtualFileSystem`] used to resolve `REM wincheck source-path=...` files.
+///
+/// # Returns
+/// `Ok((SourceId, Vec<Diagnostic>))` containing the registered source ID and filtered diagnostics.
+///
+/// # Errors
+/// Returns [`CmdError`] if UTF-8 script decoding fails fatally.
+pub fn lint_script_with_vfs(
+    file_name: &str,
+    raw_bytes: &[u8],
+    config: &LinterConfig,
+    source_map: &mut SourceMap,
+    vfs: Option<&dyn VirtualFileSystem>,
+) -> Result<(SourceId, Vec<Diagnostic>), CmdError> {
     let decoded = decode_script_bytes(raw_bytes, config.codepage)?;
-    Ok(lint_decoded_script(
+    Ok(lint_decoded_script_with_vfs(
         file_name,
         raw_bytes.to_vec(),
         decoded,
         config,
         source_map,
+        vfs,
     ))
 }
 
@@ -78,6 +110,29 @@ pub fn lint_decoded_script(
     config: &LinterConfig,
     source_map: &mut SourceMap,
 ) -> (SourceId, Vec<Diagnostic>) {
+    lint_decoded_script_with_vfs(file_name, raw_bytes, decoded, config, source_map, None)
+}
+
+/// Analyzes an already-decoded script string with an optional [`VirtualFileSystem`] for `source-path` directives.
+///
+/// # Arguments
+/// * `file_name` - Display name or path of the script.
+/// * `raw_bytes` - Original raw script bytes stored in [`SourceFile`].
+/// * `decoded` - Decoded UTF-8 script text.
+/// * `config` - [`LinterConfig`] filtering rules and severities.
+/// * `source_map` - Mutable [`SourceMap`] to register the file for span formatting.
+/// * `vfs` - Optional [`VirtualFileSystem`] used to resolve `REM wincheck source-path=...` files.
+///
+/// # Returns
+/// `(SourceId, Vec<Diagnostic>)` containing the registered source ID and filtered diagnostics.
+pub fn lint_decoded_script_with_vfs(
+    file_name: &str,
+    raw_bytes: Vec<u8>,
+    decoded: String,
+    config: &LinterConfig,
+    source_map: &mut SourceMap,
+    vfs: Option<&dyn VirtualFileSystem>,
+) -> (SourceId, Vec<Diagnostic>) {
     let source_id = source_map.next_source_id();
     let sf = SourceFile::new(source_id, file_name.to_owned(), raw_bytes, decoded);
 
@@ -85,8 +140,12 @@ pub fn lint_decoded_script(
     let mut suppressions = SuppressionTable::default();
     check_file_encoding_and_lines(&sf, &mut raw_diags, &mut suppressions);
 
-    let external_vars =
-        collect_source_path_vars(&sf.name, &suppressions.source_paths, config.exec_context);
+    let external_vars = collect_source_path_vars(
+        &sf.name,
+        &suppressions.source_paths,
+        config.exec_context,
+        vfs,
+    );
     let cst = parse_script_cst(source_id, &sf.decoded_text, config.exec_context);
     convert_peg_diagnostics(&cst.diagnostics, &mut raw_diags);
     let parsed = lower_cst_to_ast(&cst);
@@ -96,6 +155,7 @@ pub fn lint_decoded_script(
         &external_vars,
         &mut raw_diags,
     );
+    passes::dos_compat::analyze_msdos_portability(&sf.name, &parsed, config, &mut raw_diags);
 
     let mut filtered: Vec<Diagnostic> = raw_diags
         .into_iter()
@@ -116,6 +176,39 @@ pub fn lint_decoded_script(
     (source_id, filtered)
 }
 
+/// Loads raw bytes for a `source-path` candidate from `vfs` when provided, or from `std::fs` on `std` builds.
+///
+/// # Arguments
+/// * `candidate` - Path resolved relative to the caller script's parent directory.
+/// * `raw_sp` - Unmodified `source-path` operand string.
+/// * `vfs` - Optional [`VirtualFileSystem`] backend.
+///
+/// # Returns
+/// `Some(Vec<u8>)` when readable, or `None`.
+#[must_use]
+fn read_sourced_script_bytes(
+    candidate: &str,
+    raw_sp: &str,
+    vfs: Option<&dyn VirtualFileSystem>,
+) -> Option<Vec<u8>> {
+    if let Some(vfs_ref) = vfs {
+        return vfs_ref
+            .read_bytes(candidate)
+            .or_else(|_| vfs_ref.read_bytes(raw_sp))
+            .ok();
+    }
+    #[cfg(feature = "std")]
+    {
+        std::fs::read(candidate)
+            .or_else(|_| std::fs::read(raw_sp))
+            .ok()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        None
+    }
+}
+
 /// Collects uppercase `SET` variable names defined in external batch scripts referenced by
 /// `REM wincheck source-path=<path>` (resolved relative to `caller_file`'s directory or CWD).
 ///
@@ -123,6 +216,7 @@ pub fn lint_decoded_script(
 /// * `caller_file` - File name/path of the script being linted.
 /// * `source_paths` - Slice of `source-path=` strings declared in directives.
 /// * `exec_ctx` - Active [`ExecutionContext`].
+/// * `vfs` - Optional [`VirtualFileSystem`] backend.
 ///
 /// # Returns
 /// Set of uppercase variable names assigned in readable referenced scripts.
@@ -131,14 +225,15 @@ fn collect_source_path_vars(
     caller_file: &str,
     source_paths: &[String],
     exec_ctx: ExecutionContext,
-) -> std::collections::BTreeSet<String> {
-    let mut vars = std::collections::BTreeSet::new();
-    let parent_dir = std::path::Path::new(caller_file).parent();
+    vfs: Option<&dyn VirtualFileSystem>,
+) -> BTreeSet<String> {
+    let mut vars = BTreeSet::new();
+    let parent_prefix = caller_file
+        .rfind([crate::types::BS_CHAR, '/'])
+        .and_then(|idx| caller_file.get(..=idx));
     for sp in source_paths {
-        let candidate = parent_dir
-            .filter(|p| !p.as_os_str().is_empty())
-            .map_or_else(|| std::path::PathBuf::from(sp), |p| p.join(sp));
-        let Ok(raw) = std::fs::read(&candidate).or_else(|_| std::fs::read(sp)) else {
+        let candidate = parent_prefix.map_or_else(|| sp.clone(), |prefix| format!("{prefix}{sp}"));
+        let Some(raw) = read_sourced_script_bytes(&candidate, sp, vfs) else {
             continue;
         };
         let decoded = decode_script_bytes(&raw, CodePage::Utf8).unwrap_or_default();
@@ -147,12 +242,12 @@ fn collect_source_path_vars(
         let mut ext_diags = Vec::new();
         let mut ext_state = passes::AnalyzerState {
             script_text: &decoded,
-            defined_labels: std::collections::BTreeSet::new(),
+            defined_labels: BTreeSet::new(),
             delayed_expansion: crate::types::DelayedExpansionMode::Disabled,
             has_setlocal: false,
-            assigned_vars: std::collections::BTreeMap::new(),
-            referenced_vars: std::collections::BTreeMap::new(),
-            current_block_modified_vars: std::collections::BTreeSet::new(),
+            assigned_vars: BTreeMap::new(),
+            referenced_vars: BTreeMap::new(),
+            current_block_modified_vars: BTreeSet::new(),
             block_depth: 0,
             in_pipeline: false,
             after_robocopy: false,
@@ -487,6 +582,7 @@ mod tests {
             exec_context: ExecutionContext::BatchFile,
             fix_safety: FixApplicability::RecommendedRepair,
             codepage: CodePage::Utf8,
+            dialect: crate::types::ShellDialect::WindowsNtCmd,
         };
         let (_, extra_diags) =
             lint_script("extra.bat", extra_script.as_bytes(), &filter_cfg, &mut sm)
@@ -827,5 +923,133 @@ mod tests {
         );
         assert!(!bare_diags.iter().any(|d| d.rule_id.as_str() == "CMD2012"));
         assert!(std::fs::remove_dir_all(&tmp_dir).is_ok());
+    }
+
+    /// Verifies `lint_decoded_script` and `lint_script_with_vfs` resolving `source-path` over `VirtualFileSystem`.
+    #[test]
+    fn test_lint_decoded_script_and_vfs_source_path() {
+        use crate::vfs::VirtualFileSystem as _;
+        let mut sm = SourceMap::new();
+        let (_, decoded_diags) = lint_decoded_script(
+            "direct.bat",
+            b"@echo off\r\n".to_vec(),
+            "@echo off\r\n".to_owned(),
+            &LinterConfig::default(),
+            &mut sm,
+        );
+        assert_eq!(decoded_diags, Vec::new());
+
+        let mut mem_vfs = crate::vfs::InMemoryVfs::new();
+        assert!(
+            mem_vfs
+                .create_dir("C:\\dir", crate::types::DirCreationDepth::CreateParents)
+                .is_ok()
+        );
+        assert!(
+            mem_vfs
+                .write_bytes("C:\\dir\\defs.bat", b"@echo off\r\nset VFS_SHARED=1\r\n")
+                .is_ok()
+        );
+        assert!(
+            mem_vfs
+                .write_bytes("C:\\root_defs.bat", b"@echo off\r\nset ROOT_SHARED=1\r\n")
+                .is_ok()
+        );
+        let vfs_caller = format!(
+            "@echo off{CRLF}REM wincheck source-path=defs.bat{CRLF}REM wincheck source-path=C:\\root_defs.bat{CRLF}REM wincheck source-path=missing.bat{CRLF}echo \"%VFS_SHARED%\" \"%ROOT_SHARED%\"{CRLF}"
+        );
+        let (_, vfs_diags) = lint_script_with_vfs(
+            "C:\\dir\\caller.bat",
+            vfs_caller.as_bytes(),
+            &LinterConfig::default(),
+            &mut sm,
+            Some(&mem_vfs),
+        )
+        .unwrap_or((SourceId(0), Vec::new()));
+        assert_eq!(vfs_diags, Vec::new());
+    }
+
+    /// Verifies all 10 MS-DOS `COMMAND.COM` portability lint rules (`CMD5001`–`CMD5010`) and `--explain`.
+    #[test]
+    fn test_msdos_portability_rules_cmd5001_through_cmd5010() {
+        assert_eq!(all_rule_metadata().len(), 60);
+        for code in [
+            "CMD5001", "CMD5002", "CMD5003", "CMD5004", "CMD5005", "CMD5006", "CMD5007", "CMD5008",
+            "CMD5009", "CMD5010",
+        ] {
+            assert!(explain_rule(code).is_ok());
+        }
+
+        let long_tail = "a".repeat(130);
+        let script = [
+            "@echo off",
+            ":: comment line",
+            ":sub",
+            "set PLAIN=1",
+            "set /a X=1+2",
+            "set /p ANS=Prompt:",
+            "for /l %%I in (1,1,3) do echo %%I",
+            "for %%F in (%~1) do echo %%~nF",
+            "if \"a\"==\"b\" echo eq",
+            "if /i \"%A%\" EQU \"b\" (:inner\r\necho yes) < C:\\in.txt > C:\\out.txt else echo no",
+            "if defined FOO echo %FOO:~0,2%",
+            "if cmdextversion 2 echo !DELAYED! %*",
+            "if exist C:\\longdirectoryname\\file.txt if errorlevel 1 echo ok",
+            "echo one & echo two && echo three || echo four",
+            "echo pipe_left | copy /y .\\src.txt ..\\verylongdest.html",
+            "call",
+            "call :sub",
+            "call helper.cmd",
+            "1:bad",
+            "\"quotedok\"",
+            "\"\"",
+            "app.exe",
+            &format!("exttool.exe {long_tail}"),
+            "goto",
+            "goto sub",
+            "goto :EOF",
+            "exit 0",
+            "exit /b 0",
+            "setlocal",
+            "echo err 2> C:\\err.log 2>&1",
+        ]
+        .join(CRLF);
+
+        let mut sm = SourceMap::new();
+        let dos_cfg = LinterConfig {
+            dialect: crate::types::ShellDialect::MsDos622,
+            ..LinterConfig::default()
+        };
+        let (_, diags_cmd) = lint_script("script.cmd", script.as_bytes(), &dos_cfg, &mut sm)
+            .unwrap_or((SourceId(0), Vec::new()));
+        let codes: BTreeSet<&str> = diags_cmd.iter().map(|d| d.rule_id.as_str()).collect();
+        for expected in [
+            "CMD5001", "CMD5002", "CMD5003", "CMD5004", "CMD5005", "CMD5006", "CMD5007", "CMD5008",
+            "CMD5009", "CMD5010",
+        ] {
+            assert!(codes.contains(expected));
+        }
+
+        let (_, diags_long_leaf) =
+            lint_script("verylongscript.bat", b"@rem\r\n", &dos_cfg, &mut sm)
+                .unwrap_or((SourceId(0), Vec::new()));
+        assert!(
+            diags_long_leaf
+                .iter()
+                .any(|d| d.rule_id.as_str() == "CMD5009")
+        );
+        let (_, diags_empty_name) =
+            lint_script("", b"@echo off\r\ngoto :EOF\r\n:EOF\r\n", &dos_cfg, &mut sm)
+                .unwrap_or((SourceId(0), Vec::new()));
+        assert_eq!(diags_empty_name, Vec::new());
+        let (_, diags_stdin_name) = lint_script("<stdin>", b"@echo off\r\n", &dos_cfg, &mut sm)
+            .unwrap_or((SourceId(0), Vec::new()));
+        assert_eq!(diags_stdin_name, Vec::new());
+
+        let mut inc_cfg = LinterConfig::default();
+        inc_cfg.included_rules.insert(RuleId::new("CMD5001"));
+        let (_, inc_diags) = lint_script("-", b"set /a Z=2\r\n", &inc_cfg, &mut sm)
+            .unwrap_or((SourceId(0), Vec::new()));
+        assert_eq!(inc_diags.len(), 1);
     }
 }

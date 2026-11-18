@@ -9,6 +9,9 @@
 //! # Invariant
 //! For any input string `src`, `parse_script_cst(id, src, ctx).to_source_string() == src`.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use derive_more::{Display, IsVariant};
 
 use crate::error::{PegExpected, ProbableMisuseKind};

@@ -87,13 +87,14 @@ fn extract_preceding_doc_block(lines: &[&str], item_line_idx: usize) -> String {
     docs.join(nl)
 }
 
-/// Strips optional `pub(...)` / `const` qualifiers from the front of a trimmed declaration line.
+/// Strips optional `pub(...)`, `const`, `unsafe`, and `extern "C"` qualifiers from the front
+/// of a trimmed declaration line.
 ///
 /// # Arguments
 /// * `trimmed` - Trimmed source line.
 ///
 /// # Returns
-/// Remainder of `trimmed` after stripping leading visibility and `const` modifiers.
+/// Remainder of `trimmed` after stripping leading visibility, `const`, `unsafe`, and `extern` modifiers.
 #[must_use]
 fn strip_vis_and_const(trimmed: &str) -> &str {
     let mut rest = trimmed;
@@ -111,6 +112,12 @@ fn strip_vis_and_const(trimmed: &str) -> &str {
     }
     if let Some(after_const) = rest.strip_prefix("const ") {
         rest = after_const.trim_start();
+    }
+    if let Some(after_unsafe) = rest.strip_prefix("unsafe ") {
+        rest = after_unsafe.trim_start();
+    }
+    if let Some(after_extern) = rest.strip_prefix("extern \"C\" ") {
+        rest = after_extern.trim_start();
     }
     rest
 }
@@ -582,37 +589,64 @@ fn audit_file_documentation(path: &Path, failures: &mut Vec<String>) {
 
         let doc = extract_preceding_doc_block(&lines, idx);
         let line_no = idx.saturating_add(1);
-        audit_fn_doc_sections(
+        let safety = if trimmed.contains("unsafe fn ") || trimmed.contains("unsafe extern ") {
+            FnSafetyKind::UnsafeFn
+        } else {
+            FnSafetyKind::Safe
+        };
+        let subject = FnAuditSubject {
             path,
             line_no,
-            &fn_name,
-            &params,
-            ret_type.as_deref(),
-            &doc,
-            failures,
-        );
+            fn_name: &fn_name,
+            params: &params,
+            ret_type: ret_type.as_deref(),
+            safety,
+            doc: &doc,
+        };
+        audit_fn_doc_sections(&subject, failures);
     }
 }
 
-/// Validates `# Arguments`, `# Returns`, and `# Errors` sections of a single function's doc block.
+/// Safety classification of a Rust function declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FnSafetyKind {
+    /// Safe Rust `fn` item.
+    Safe,
+    /// Explicit `unsafe fn` or `unsafe extern "C" fn` item requiring a `# Safety` doc section.
+    UnsafeFn,
+}
+
+/// Extracted signature and preceding doc-comment context for a single Rust function item.
+struct FnAuditSubject<'a> {
+    /// Source file path for failure diagnostics.
+    path: &'a Path,
+    /// 1-based line number of the function declaration.
+    line_no: usize,
+    /// Parsed function identifier.
+    fn_name: &'a str,
+    /// Ordered list of non-`self` parameter identifiers.
+    params: &'a [String],
+    /// Optional non-unit return type string.
+    ret_type: Option<&'a str>,
+    /// Whether the declaration is an explicit `unsafe fn` requiring `# Safety`.
+    safety: FnSafetyKind,
+    /// Joined preceding `///` doc lines.
+    doc: &'a str,
+}
+
+/// Validates `# Arguments`, `# Returns`, `# Errors`, and `# Safety` sections of a function's doc block.
 ///
 /// # Arguments
-/// * `path` - File path for failure diagnostics.
-/// * `line_no` - 1-based line number of the function declaration.
-/// * `fn_name` - Parsed function identifier.
-/// * `params` - Ordered list of non-`self` parameter names.
-/// * `ret_type` - Optional non-unit return type string.
-/// * `doc` - Joined preceding `///` doc lines.
+/// * `subject` - Extracted [`FnAuditSubject`] metadata and docstring.
 /// * `failures` - Accumulator of documentation violation messages.
-fn audit_fn_doc_sections(
-    path: &Path,
-    line_no: usize,
-    fn_name: &str,
-    params: &[String],
-    ret_type: Option<&str>,
-    doc: &str,
-    failures: &mut Vec<String>,
-) {
+fn audit_fn_doc_sections(subject: &FnAuditSubject<'_>, failures: &mut Vec<String>) {
+    let path = subject.path;
+    let line_no = subject.line_no;
+    let fn_name = subject.fn_name;
+    let params = subject.params;
+    let ret_type = subject.ret_type;
+    let doc = subject.doc;
+
     if doc.is_empty() {
         failures.push(format!(
             "{}:{line_no}: fn `{fn_name}` lacks `///` documentation",
@@ -621,13 +655,20 @@ fn audit_fn_doc_sections(
         return;
     }
 
-    for section in ["# Arguments", "# Returns", "# Errors"] {
+    for section in ["# Arguments", "# Returns", "# Errors", "# Safety"] {
         if doc.lines().filter(|l| l.trim() == section).count() > 1 {
             failures.push(format!(
                 "{}:{line_no}: fn `{fn_name}` has duplicate `{section}` doc header",
                 path.display()
             ));
         }
+    }
+
+    if subject.safety == FnSafetyKind::UnsafeFn && !doc.contains("# Safety") {
+        failures.push(format!(
+            "{}:{line_no}: unsafe fn `{fn_name}` lacks `# Safety` documentation section",
+            path.display()
+        ));
     }
 
     if !params.is_empty() {
@@ -680,15 +721,41 @@ fn audit_fn_doc_sections(
     }
 }
 
-/// Enforces 100% file, module, type, field, variant, function, argument, return, and error
-/// documentation across every `.rs` file in `src/` and `tests/`.
+/// Enforces 100% file, module, type, field, variant, function, argument, return, safety, and error
+/// documentation across every `.rs` file in `src/`, `tests/`, and `crates/wincmd-dos/`.
 #[test]
 fn test_hundred_percent_documentation_coverage_gate() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     collect_rs_files(&root.join("src"), &mut files);
     collect_rs_files(&root.join("tests"), &mut files);
-    assert!(files.len() >= 45);
+    collect_rs_files(&root.join("crates/wincmd-dos/src"), &mut files);
+    collect_rs_files(&root.join("crates/wincmd-dos/tests"), &mut files);
+    assert!(files.len() >= 60);
+
+    for required_rel in [
+        "src/dos/mod.rs",
+        "src/dos/types.rs",
+        "src/dos/kernel.rs",
+        "src/dos/sim.rs",
+        "src/dos/console.rs",
+        "src/vfs/dos.rs",
+        "src/runtime/dos_exec.rs",
+        "crates/wincmd-dos/src/lib.rs",
+        "crates/wincmd-dos/src/alloc_djgpp.rs",
+        "crates/wincmd-dos/src/panic_dos.rs",
+        "crates/wincmd-dos/src/ffi.rs",
+        "crates/wincmd-dos/src/djgpp_kernel.rs",
+        "crates/wincmd-dos/src/stub_verify.rs",
+        "crates/wincmd-dos/src/bin/wincmd.rs",
+        "crates/wincmd-dos/src/bin/wincheck.rs",
+        "crates/wincmd-dos/tests/dos_binaries.rs",
+    ] {
+        assert!(
+            files.contains(&root.join(required_rel)),
+            "Expected `{required_rel}` to be audited by documentation gate"
+        );
+    }
 
     let mut failures = Vec::new();
     for file in &files {
@@ -885,21 +952,23 @@ fn test_zero_banned_antipatterns_and_lint_escapes_gate() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut violations = Vec::new();
 
-    let cargo_toml = fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
-    for (idx, line) in cargo_toml.lines().enumerate() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('#') && trimmed.contains("= \"allow\"") {
-            violations.push(format!(
-                "Cargo.toml:{}: blanket lint suppression `{trimmed}` is forbidden",
-                idx.saturating_add(1)
-            ));
-        }
-        for crate_ban in ["anyhow", "thiserror", "eyre", "snafu"] {
-            if trimmed.starts_with(crate_ban) {
+    for manifest_rel in ["Cargo.toml", "crates/wincmd-dos/Cargo.toml"] {
+        let cargo_toml = fs::read_to_string(root.join(manifest_rel)).unwrap_or_default();
+        for (idx, line) in cargo_toml.lines().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('#') && trimmed.contains("= \"allow\"") {
                 violations.push(format!(
-                    "Cargo.toml:{}: banned error crate `{crate_ban}`",
+                    "{manifest_rel}:{}: blanket lint suppression `{trimmed}` is forbidden",
                     idx.saturating_add(1)
                 ));
+            }
+            for crate_ban in ["anyhow", "thiserror", "eyre", "snafu"] {
+                if trimmed.starts_with(crate_ban) {
+                    violations.push(format!(
+                        "{manifest_rel}:{}: banned error crate `{crate_ban}`",
+                        idx.saturating_add(1)
+                    ));
+                }
             }
         }
     }
@@ -907,6 +976,8 @@ fn test_zero_banned_antipatterns_and_lint_escapes_gate() {
     let mut files = Vec::new();
     collect_rs_files(&root.join("src"), &mut files);
     collect_rs_files(&root.join("tests"), &mut files);
+    collect_rs_files(&root.join("crates/wincmd-dos/src"), &mut files);
+    collect_rs_files(&root.join("crates/wincmd-dos/tests"), &mut files);
 
     let banned_everywhere = [
         "#[allow(",
@@ -931,9 +1002,10 @@ fn test_zero_banned_antipatterns_and_lint_escapes_gate() {
     ];
 
     let src_dir = root.join("src");
+    let dos_src_dir = root.join("crates/wincmd-dos/src");
     for path in &files {
         let content = fs::read_to_string(path).unwrap_or_default();
-        if path.starts_with(&src_dir) {
+        if path.starts_with(&src_dir) || path.starts_with(&dos_src_dir) {
             audit_no_raw_bool_params(path, &content, &mut violations);
         }
 
@@ -976,12 +1048,14 @@ fn test_zero_banned_antipatterns_and_lint_escapes_gate() {
 }
 
 /// Enforces that `CmdError` in `src/error.rs` is the sole `#[derive(..., Error, ...)]` type
-/// in the crate and that every `CmdError` variant is constructed in non-test `src/` code.
+/// across the workspace (`src/` and `crates/wincmd-dos/`) and that every `CmdError` variant
+/// is constructed in non-test production code.
 #[test]
 fn test_unified_cmd_error_architecture_gate() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut src_files = Vec::new();
     collect_rs_files(&root.join("src"), &mut src_files);
+    collect_rs_files(&root.join("crates/wincmd-dos/src"), &mut src_files);
     src_files.sort();
 
     let mut prod_sources: Vec<(PathBuf, String)> = Vec::new();
@@ -1072,4 +1146,96 @@ fn test_unified_cmd_error_architecture_gate() {
         Vec::<String>::new(),
         "Unconstructed CmdError variants in production code: {unconstructed:?}"
     );
+}
+
+/// Verifies all 60 `wincheck` lint rules (`CMD0001`–`CMD4010` + `CMD5001`–`CMD5010`) have unique
+/// `RuleId`s, non-empty `--explain` documentation, and deterministic test triggers for every
+/// MS-DOS portability rule (`CMD5001`–`CMD5010`).
+#[test]
+fn test_all_sixty_lint_rules_catalog_and_dos_portability_gate() {
+    use std::collections::BTreeSet;
+    use win_cmd_rs::linter::{LinterConfig, RuleId, all_rule_metadata, explain_rule, lint_script};
+    use win_cmd_rs::span::SourceMap;
+    use win_cmd_rs::types::{CRLF, ShellDialect};
+
+    let catalog = all_rule_metadata();
+    assert_eq!(catalog.len(), 60, "Expected exactly 60 lint rules");
+
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
+    for meta in &catalog {
+        assert!(
+            seen_ids.insert(meta.id.clone()),
+            "Duplicate RuleId `{}`",
+            meta.id
+        );
+        assert!(
+            seen_names.insert(meta.name),
+            "Duplicate rule name `{}`",
+            meta.name
+        );
+        assert!(meta.name.trim().len() >= 5);
+        assert!(meta.summary.trim().len() >= 15);
+        assert!(meta.explanation.trim().len() >= 25);
+        assert_eq!(explain_rule(meta.id.as_str()), Ok(meta.clone()));
+    }
+
+    for num in 1..=10 {
+        assert!(seen_ids.contains(&RuleId::new(&format!("CMD50{num:02}"))));
+    }
+
+    let long_arg = "X".repeat(132);
+    let dos_fixture = [
+        "@echo off",
+        "set /a X=1+2",
+        "for /L %%I in (1,1,3) do echo %%I",
+        "if /I \"%A%\"==\"b\" echo hi",
+        "echo one & echo two",
+        "echo %~dp0",
+        "call :sub",
+        "setlocal",
+        "echo err 2>NUL",
+        "call C:\\verylongfilename.bat",
+        &format!("exttool.exe {long_arg}"),
+        ":sub",
+        "exit /b 0",
+    ]
+    .join(CRLF)
+        + CRLF;
+
+    let dos_cfg = LinterConfig {
+        dialect: ShellDialect::MsDos622,
+        ..LinterConfig::default()
+    };
+    let mut sm = SourceMap::new();
+    let (_, dos_diags) =
+        lint_script("BUILD.CMD", dos_fixture.as_bytes(), &dos_cfg, &mut sm).unwrap_or_default();
+    let triggered: BTreeSet<String> = dos_diags
+        .iter()
+        .map(|d| d.rule_id.as_str().to_owned())
+        .collect();
+    for code in [
+        "CMD5001", "CMD5002", "CMD5003", "CMD5004", "CMD5005", "CMD5006", "CMD5007", "CMD5008",
+        "CMD5009", "CMD5010",
+    ] {
+        assert!(
+            triggered.contains(code),
+            "Expected MS-DOS portability rule `{code}` to fire on DOS fixture, got: {triggered:?}"
+        );
+    }
+
+    let nt_cfg = LinterConfig {
+        dialect: ShellDialect::WindowsNtCmd,
+        ..LinterConfig::default()
+    };
+    let mut sm_nt = SourceMap::new();
+    let (_, nt_diags) =
+        lint_script("BUILD.CMD", dos_fixture.as_bytes(), &nt_cfg, &mut sm_nt).unwrap_or_default();
+    for d in &nt_diags {
+        assert!(
+            !d.rule_id.as_str().starts_with("CMD50"),
+            "DOS rule `{}` must not fire in WindowsNtCmd dialect",
+            d.rule_id
+        );
+    }
 }

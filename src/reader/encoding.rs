@@ -4,6 +4,11 @@
 //! Windows-1252, OEM CP437, and OEM CP850, plus `0x1A` (`Ctrl+Z` / `SUB`) EOF handling
 //! and incremental raw-byte single-line decoding for mid-script `CHCP` switches.
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use crate::error::CmdError;
 use crate::span::ByteOffset;
 use crate::types::CodePage;
@@ -67,6 +72,89 @@ const WIN1252_HIGH_TABLE: [char; 128] = [
     '\u{00F0}', '\u{00F1}', '\u{00F2}', '\u{00F3}', '\u{00F4}', '\u{00F5}', '\u{00F6}', '\u{00F7}',
     '\u{00F8}', '\u{00F9}', '\u{00FA}', '\u{00FB}', '\u{00FC}', '\u{00FD}', '\u{00FE}', '\u{00FF}',
 ];
+
+/// Upper half (`0x80..=0xFF`) lookup table for OEM Code Page 852 (Central / Eastern Europe Latin 2).
+const CP852_HIGH_TABLE: [char; 128] = [
+    '\u{00C7}', '\u{00FC}', '\u{00E9}', '\u{00E2}', '\u{00E4}', '\u{016F}', '\u{0107}', '\u{00E7}',
+    '\u{0142}', '\u{00EB}', '\u{0150}', '\u{0151}', '\u{00EE}', '\u{0179}', '\u{00C4}', '\u{0106}',
+    '\u{00C9}', '\u{0139}', '\u{013A}', '\u{00F4}', '\u{00F6}', '\u{013D}', '\u{013E}', '\u{015A}',
+    '\u{015B}', '\u{00D6}', '\u{00DC}', '\u{0164}', '\u{0165}', '\u{0141}', '\u{00D7}', '\u{010D}',
+    '\u{00E1}', '\u{00ED}', '\u{00F3}', '\u{00FA}', '\u{0104}', '\u{0105}', '\u{017D}', '\u{017E}',
+    '\u{0118}', '\u{0119}', '\u{00AC}', '\u{017A}', '\u{010C}', '\u{015F}', '\u{00AB}', '\u{00BB}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{00C1}', '\u{00C2}', '\u{011A}',
+    '\u{015E}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255D}', '\u{017B}', '\u{017C}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252C}', '\u{251C}', '\u{2500}', '\u{253C}', '\u{0102}', '\u{0103}',
+    '\u{255A}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256C}', '\u{00A4}',
+    '\u{0111}', '\u{0110}', '\u{010E}', '\u{00CB}', '\u{010F}', '\u{0147}', '\u{00CD}', '\u{00CE}',
+    '\u{011B}', '\u{2518}', '\u{250C}', '\u{2588}', '\u{2584}', '\u{0162}', '\u{016E}', '\u{2580}',
+    '\u{00D3}', '\u{00DF}', '\u{00D4}', '\u{0143}', '\u{0144}', '\u{0148}', '\u{0160}', '\u{0161}',
+    '\u{0154}', '\u{00DA}', '\u{0155}', '\u{0170}', '\u{00FD}', '\u{00DD}', '\u{0163}', '\u{00B4}',
+    '\u{00AD}', '\u{02DD}', '\u{02DB}', '\u{02C7}', '\u{02D8}', '\u{00A7}', '\u{00F7}', '\u{00B8}',
+    '\u{00B0}', '\u{00A8}', '\u{02D9}', '\u{0171}', '\u{0158}', '\u{0159}', '\u{25A0}', '\u{00A0}',
+];
+
+/// Upper half (`0x80..=0xFF`) lookup table for OEM Code Page 865 (Nordic).
+const CP865_HIGH_TABLE: [char; 128] = [
+    '\u{00C7}', '\u{00FC}', '\u{00E9}', '\u{00E2}', '\u{00E4}', '\u{00E0}', '\u{00E5}', '\u{00E7}',
+    '\u{00EA}', '\u{00EB}', '\u{00E8}', '\u{00EF}', '\u{00EE}', '\u{00EC}', '\u{00C4}', '\u{00C5}',
+    '\u{00C9}', '\u{00E6}', '\u{00C6}', '\u{00F4}', '\u{00F6}', '\u{00F2}', '\u{00FB}', '\u{00F9}',
+    '\u{00FF}', '\u{00D6}', '\u{00DC}', '\u{00F8}', '\u{00A3}', '\u{00D8}', '\u{20A7}', '\u{0192}',
+    '\u{00E1}', '\u{00ED}', '\u{00F3}', '\u{00FA}', '\u{00F1}', '\u{00D1}', '\u{00AA}', '\u{00BA}',
+    '\u{00BF}', '\u{2310}', '\u{00AC}', '\u{00BD}', '\u{00BC}', '\u{00A1}', '\u{00AB}', '\u{00A4}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255D}', '\u{255C}', '\u{255B}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252C}', '\u{251C}', '\u{2500}', '\u{253C}', '\u{255E}', '\u{255F}',
+    '\u{255A}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256C}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256B}',
+    '\u{256A}', '\u{2518}', '\u{250C}', '\u{2588}', '\u{2584}', '\u{258C}', '\u{2590}', '\u{2580}',
+    '\u{03B1}', '\u{00DF}', '\u{0393}', '\u{03C0}', '\u{03A3}', '\u{03C3}', '\u{00B5}', '\u{03C4}',
+    '\u{03A6}', '\u{0398}', '\u{03A9}', '\u{03B4}', '\u{221E}', '\u{03C6}', '\u{03B5}', '\u{2229}',
+    '\u{2261}', '\u{00B1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00F7}', '\u{2248}',
+    '\u{00B0}', '\u{2219}', '\u{00B7}', '\u{221A}', '\u{207F}', '\u{00B2}', '\u{25A0}', '\u{00A0}',
+];
+
+/// Upper half (`0x80..=0xFF`) lookup table for OEM Code Page 866 (Cyrillic).
+const CP866_HIGH_TABLE: [char; 128] = [
+    '\u{0410}', '\u{0411}', '\u{0412}', '\u{0413}', '\u{0414}', '\u{0415}', '\u{0416}', '\u{0417}',
+    '\u{0418}', '\u{0419}', '\u{041A}', '\u{041B}', '\u{041C}', '\u{041D}', '\u{041E}', '\u{041F}',
+    '\u{0420}', '\u{0421}', '\u{0422}', '\u{0423}', '\u{0424}', '\u{0425}', '\u{0426}', '\u{0427}',
+    '\u{0428}', '\u{0429}', '\u{042A}', '\u{042B}', '\u{042C}', '\u{042D}', '\u{042E}', '\u{042F}',
+    '\u{0430}', '\u{0431}', '\u{0432}', '\u{0433}', '\u{0434}', '\u{0435}', '\u{0436}', '\u{0437}',
+    '\u{0438}', '\u{0439}', '\u{043A}', '\u{043B}', '\u{043C}', '\u{043D}', '\u{043E}', '\u{043F}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255D}', '\u{255C}', '\u{255B}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252C}', '\u{251C}', '\u{2500}', '\u{253C}', '\u{255E}', '\u{255F}',
+    '\u{255A}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256C}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256B}',
+    '\u{256A}', '\u{2518}', '\u{250C}', '\u{2588}', '\u{2584}', '\u{258C}', '\u{2590}', '\u{2580}',
+    '\u{0440}', '\u{0441}', '\u{0442}', '\u{0443}', '\u{0444}', '\u{0445}', '\u{0446}', '\u{0447}',
+    '\u{0448}', '\u{0449}', '\u{044A}', '\u{044B}', '\u{044C}', '\u{044D}', '\u{044E}', '\u{044F}',
+    '\u{0401}', '\u{0451}', '\u{0404}', '\u{0454}', '\u{0407}', '\u{0457}', '\u{040E}', '\u{045E}',
+    '\u{00B0}', '\u{2219}', '\u{00B7}', '\u{221A}', '\u{2116}', '\u{00A4}', '\u{25A0}', '\u{00A0}',
+];
+
+/// Returns the 128-entry `0x80..=0xFF` lookup table for single-byte OEM/ANSI codepages.
+///
+/// # Arguments
+/// * `cp` - Target [`CodePage`].
+///
+/// # Returns
+/// Static 128-entry table reference for 8-bit table codepages, or `&CP437_HIGH_TABLE` fallback.
+#[must_use]
+const fn oem_high_table_for(cp: CodePage) -> &'static [char; 128] {
+    match cp {
+        CodePage::OemMultilingualLatin1 => &CP850_HIGH_TABLE,
+        CodePage::OemLatin2 => &CP852_HIGH_TABLE,
+        CodePage::OemNordic => &CP865_HIGH_TABLE,
+        CodePage::OemCyrillic => &CP866_HIGH_TABLE,
+        CodePage::WindowsLatin1 => &WIN1252_HIGH_TABLE,
+        CodePage::OemUnitedStates
+        | CodePage::Utf8
+        | CodePage::Ascii
+        | CodePage::Utf16Le
+        | CodePage::Utf16Be => &CP437_HIGH_TABLE,
+    }
+}
 
 /// Detected Byte Order Mark (BOM) at the start of a byte buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,17 +269,16 @@ pub fn decode_physical_line_at(
         }
         CodePage::Utf8 => decode_byte_line_at(raw, content_start, SingleByteCodePage::Utf8),
         CodePage::Ascii => decode_byte_line_at(raw, content_start, SingleByteCodePage::Ascii),
-        CodePage::OemUnitedStates => {
-            decode_byte_line_at(raw, content_start, SingleByteCodePage::OemUnitedStates)
-        }
-        CodePage::OemMultilingualLatin1 => decode_byte_line_at(
+        CodePage::OemUnitedStates
+        | CodePage::OemMultilingualLatin1
+        | CodePage::OemLatin2
+        | CodePage::OemNordic
+        | CodePage::OemCyrillic
+        | CodePage::WindowsLatin1 => decode_byte_line_at(
             raw,
             content_start,
-            SingleByteCodePage::OemMultilingualLatin1,
+            SingleByteCodePage::LookupTable(oem_high_table_for(effective_cp)),
         ),
-        CodePage::WindowsLatin1 => {
-            decode_byte_line_at(raw, content_start, SingleByteCodePage::WindowsLatin1)
-        }
     }
 }
 
@@ -202,12 +289,8 @@ enum SingleByteCodePage {
     Utf8,
     /// Strict 7-bit US-ASCII (`20127`).
     Ascii,
-    /// OEM United States (`437`).
-    OemUnitedStates,
-    /// OEM Multilingual Latin 1 (`850`).
-    OemMultilingualLatin1,
-    /// Windows-1252 Western European (`1252`).
-    WindowsLatin1,
+    /// Single-byte 8-bit OEM/ANSI encoding backed by a 128-entry `0x80..=0xFF` table.
+    LookupTable(&'static [char; 128]),
 }
 
 /// Decodes a single physical line for 8-bit/UTF-8 codepages starting at `content_start`.
@@ -265,7 +348,7 @@ fn decode_byte_line_at(
     let chars_with_raw_spans = match codepage {
         SingleByteCodePage::Utf8 => {
             let decoded =
-                std::str::from_utf8(line_bytes).map_err(|err| CmdError::EncodingFailure {
+                core::str::from_utf8(line_bytes).map_err(|err| CmdError::EncodingFailure {
                     offset: ByteOffset(content_start.saturating_add(err.valid_up_to())),
                     codepage: CodePage::Utf8,
                     detail: err.to_string(),
@@ -296,14 +379,8 @@ fn decode_byte_line_at(
                 })
                 .collect()
         }
-        SingleByteCodePage::OemUnitedStates => {
-            decode_table_spanned(line_bytes, content_start, &CP437_HIGH_TABLE)
-        }
-        SingleByteCodePage::OemMultilingualLatin1 => {
-            decode_table_spanned(line_bytes, content_start, &CP850_HIGH_TABLE)
-        }
-        SingleByteCodePage::WindowsLatin1 => {
-            decode_table_spanned(line_bytes, content_start, &WIN1252_HIGH_TABLE)
+        SingleByteCodePage::LookupTable(table) => {
+            decode_table_spanned(line_bytes, content_start, table)
         }
     };
 
@@ -519,7 +596,7 @@ pub fn decode_script_bytes(raw: &[u8], codepage: CodePage) -> Result<String, Cmd
         (DetectedBom::Utf8, _) | (_, CodePage::Utf8) => {
             let payload = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
             let truncated = truncate_at_eof_or_nul(payload);
-            match std::str::from_utf8(truncated) {
+            match core::str::from_utf8(truncated) {
                 Ok(s) => Ok(s.to_owned()),
                 Err(err) => Err(CmdError::EncodingFailure {
                     offset: ByteOffset(err.valid_up_to()),
@@ -540,17 +617,17 @@ pub fn decode_script_bytes(raw: &[u8], codepage: CodePage) -> Result<String, Cmd
             }
             Ok(truncated.iter().map(|&b| char::from(b)).collect())
         }
-        (_, CodePage::OemUnitedStates) => {
+        (
+            _,
+            CodePage::OemUnitedStates
+            | CodePage::OemMultilingualLatin1
+            | CodePage::OemLatin2
+            | CodePage::OemNordic
+            | CodePage::OemCyrillic
+            | CodePage::WindowsLatin1,
+        ) => {
             let truncated = truncate_at_eof_or_nul(raw);
-            Ok(decode_table(truncated, &CP437_HIGH_TABLE))
-        }
-        (_, CodePage::OemMultilingualLatin1) => {
-            let truncated = truncate_at_eof_or_nul(raw);
-            Ok(decode_table(truncated, &CP850_HIGH_TABLE))
-        }
-        (_, CodePage::WindowsLatin1) => {
-            let truncated = truncate_at_eof_or_nul(raw);
-            Ok(decode_table(truncated, &WIN1252_HIGH_TABLE))
+            Ok(decode_table(truncated, oem_high_table_for(codepage)))
         }
     }
 }
@@ -630,9 +707,12 @@ pub fn encode_codepage_bytes(text: &str, codepage: CodePage) -> Vec<u8> {
             .chars()
             .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
             .collect(),
-        CodePage::OemUnitedStates => encode_table(text, &CP437_HIGH_TABLE),
-        CodePage::OemMultilingualLatin1 => encode_table(text, &CP850_HIGH_TABLE),
-        CodePage::WindowsLatin1 => encode_table(text, &WIN1252_HIGH_TABLE),
+        CodePage::OemUnitedStates
+        | CodePage::OemMultilingualLatin1
+        | CodePage::OemLatin2
+        | CodePage::OemNordic
+        | CodePage::OemCyrillic
+        | CodePage::WindowsLatin1 => encode_table(text, oem_high_table_for(codepage)),
         CodePage::Utf16Le => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
         CodePage::Utf16Be => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
     }
@@ -1046,5 +1126,28 @@ mod tests {
             encode_script_preserving_bom("hi", &[0xFE, 0xFF, 0x00, b'x'], CodePage::Utf8),
             vec![0xFE, 0xFF, 0x00, b'h', 0x00, b'i']
         );
+    }
+
+    /// Verifies exact 128-entry round-trip encoding and decoding for OEM codepages 437, 850, 852, 865, and 866.
+    #[test]
+    fn test_oem_codepage_852_865_866_round_trip() {
+        assert_eq!(oem_high_table_for(CodePage::Utf8), &CP437_HIGH_TABLE);
+
+        for cp in [
+            CodePage::OemUnitedStates,
+            CodePage::OemMultilingualLatin1,
+            CodePage::OemLatin2,
+            CodePage::OemNordic,
+            CodePage::OemCyrillic,
+        ] {
+            let high_bytes: Vec<u8> = (0x80u8..=0xFFu8).collect();
+            let decoded = decode_script_bytes(&high_bytes, cp).unwrap_or_default();
+            assert_eq!(decoded.chars().count(), 128);
+            assert_eq!(encode_codepage_bytes(&decoded, cp), high_bytes);
+            let phys = decode_physical_line_at(&high_bytes, ByteOffset(0), cp)
+                .ok()
+                .flatten();
+            assert_eq!(phys.map(|p| p.chars_with_raw_spans.len()), Some(128));
+        }
     }
 }

@@ -3,9 +3,10 @@
 [![doc coverage](https://img.shields.io/badge/doc%20coverage-100.0%25-brightgreen)](https://docs.rs/win-cmd-rs)
 [![test coverage](https://img.shields.io/badge/test%20coverage-100.0%25-brightgreen)](#)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](#quality--engineering-standards)
+[![CI](https://github.com/SamuelMarks/win-cmd-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelMarks/win-cmd-rs/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-A cross-platform, bug-for-bug and quirk-for-quirk compatible **Windows Command Prompt (`cmd.exe`) interpreter (`wincmd`)** and **`ShellCheck`-style static analysis & linting engine (`wincheck`)** written in 100% safe Rust.
+A cross-platform, bug-for-bug and quirk-for-quirk compatible **Windows Command Prompt (`cmd.exe`) & MS-DOS (`COMMAND.COM`) interpreter (`wincmd` / `WINCMD.EXE`)** and **`ShellCheck`-style static analysis & linting engine (`wincheck` / `WINCHECK.EXE`)** written in `#![no_std]` + `alloc` safe Rust.
 
 ---
 
@@ -13,8 +14,10 @@ A cross-platform, bug-for-bug and quirk-for-quirk compatible **Windows Command P
 
 1. [Overview](#overview)
 2. [Key Features](#key-features)
-3. [Installation & Building](#installation--building)
-4. [`wincmd` — The Cross-Platform `cmd.exe` Interpreter](#wincmd--the-cross-platform-cmdexe-interpreter)
+3. [Installation, Building & MS-DOS Cross-Compilation](#installation-building--ms-dos-cross-compilation)
+   - [MS-DOS Hardware & OS Requirements](#ms-dos-hardware--os-requirements)
+   - [Cross-Compiling `WINCMD.EXE` & `WINCHECK.EXE` for MS-DOS](#cross-compiling-wincmdexe--wincheckexe-for-ms-dos)
+4. [`wincmd` — The Cross-Platform `cmd.exe` & `COMMAND.COM` Interpreter](#wincmd--the-cross-platform-cmdexe--commandcom-interpreter)
    - [CLI Synopsis & Flags](#wincmd-cli-synopsis--flags)
    - [The `/C` and `/K` Quote-Stripping Heuristic](#the-c-and-k-quote-stripping-heuristic)
    - [Interactive REPL](#interactive-repl)
@@ -22,7 +25,7 @@ A cross-platform, bug-for-bug and quirk-for-quirk compatible **Windows Command P
    - [CLI Synopsis & Options](#wincheck-cli-synopsis--options)
    - [Output Formats (`tty`, `json`, `sarif`, `gcc`)](#output-formats-tty-json-sarif-gcc)
    - [Inline Suppression Directives](#inline-suppression-directives)
-   - [Complete Rule Catalog (`CMD0001` – `CMD4010`)](#complete-rule-catalog-cmd0001--cmd4010)
+   - [Complete Rule Catalog (`CMD0001` – `CMD5010`)](#complete-rule-catalog-cmd0001--cmd5010)
 6. [Architecture & Authentic `cmd.exe` Pipeline](#architecture--authentic-cmdexe-pipeline)
    - [Phase 0: Byte-Offset Script Reader, Encodings & Line Continuation](#phase-0-byte-offset-script-reader-encodings--line-continuation)
    - [Phase 1: Immediate `%` Expansion, `%~` Modifiers & Variable Slicing](#phase-1-immediate--expansion--modifiers--variable-slicing)
@@ -30,10 +33,11 @@ A cross-platform, bug-for-bug and quirk-for-quirk compatible **Windows Command P
    - [Phase 3: `FOR` Loop Variable Expansion](#phase-3-for-loop-variable-expansion)
    - [Phase 4: Delayed Expansion (`!VAR!`) & Caret Pass Quirk](#phase-4-delayed-expansion-var--caret-pass-quirk)
    - [`SET /A` 32-Bit Signed Arithmetic Engine](#set-a-32-bit-signed-arithmetic-engine)
-   - [Virtual File System (`InMemoryVfs` & `HostOsVfs`), 8.3 Short Names & Win32 Globs](#virtual-file-system-inmemoryvfs--hostosvfs-83-short-names--win32-globs)
+   - [Virtual File System (`InMemoryVfs`, `HostOsVfs` & `DosFatVfs`), 8.3 Short Names & Win32 Globs](#virtual-file-system-inmemoryvfs-hostosvfs--dosfatvfs-83-short-names--win32-globs)
 7. [Built-In Commands & Cross-Platform Utility Shims](#built-in-commands--cross-platform-utility-shims)
 8. [Rust Library Usage (`win_cmd_rs`)](#rust-library-usage-win_cmd_rs)
    - [Executing Commands & Scripts in an In-Memory Sandbox](#executing-commands--scripts-in-an-in-memory-sandbox)
+   - [Simulating MS-DOS (`SimulatedDosKernel`) & `#![no_std]` Embedding](#simulating-ms-dos-simulateddoskernel--no_std-embedding)
    - [Programmatic Static Analysis & Auto-Fixing](#programmatic-static-analysis--auto-fixing)
 9. [Repository Structure](#repository-structure)
 10. [Quality & Engineering Standards](#quality--engineering-standards)
@@ -43,23 +47,23 @@ A cross-platform, bug-for-bug and quirk-for-quirk compatible **Windows Command P
 
 ## Overview
 
-Windows Batch (`.bat` / `.cmd`) scripts power countless build systems, legacy enterprise workflows, CI/CD pipelines, and developer toolchains, yet testing or analyzing them on Linux or macOS—or catching subtle `cmd.exe` parsing footguns before execution—has historically been nearly impossible.
+Windows and MS-DOS Batch (`.bat` / `.cmd`) scripts power countless build systems, legacy enterprise workflows, retrocomputing environments, CI/CD pipelines, and developer toolchains, yet testing or analyzing them on Linux or macOS—or running modern static analysis directly on real MS-DOS—has historically been nearly impossible.
 
-`win-cmd-rs` solves both problems in a single, dependency-minimal Rust crate (`derive_more` only):
+`win-cmd-rs` solves all of these problems in a `#![no_std]` + `alloc`, dependency-minimal Rust core (`derive_more` only):
 
-- **`wincmd`**: An authentic, deterministic `cmd.exe` interpreter that reproduces Windows Command Prompt's multi-pass expansion pipeline, byte-offset script reading (including self-modifying batch scripts!), `SETLOCAL` environment stacks, per-drive working directories, 8.3 short filenames, Win32 `FsRtlIsNameInExpression` wildcard matching, live Windows Registry (`HKLM`/`HKCU`) integration, and 50+ built-in commands, aliases, and cross-platform utility shims across Linux, macOS, and Windows.
-- **`wincheck`**: A `ShellCheck`-style static analyzer and lossless CST tree-rewriting engine built specifically for `.bat`, `.cmd`, and interactive `cmd.exe` inputs. It detects 50 distinct classes of batch bugs (`CMD0001`–`CMD4010`), including probable syntax misuses (`IF a = b`, `IF (a == b)`, missing `IN`/`DO` in `FOR`), `.bat` (`%%`) vs. interactive REPL (`%`) dialect mismatches, stale `%VAR%` reads inside `( ... )` blocks, `IF ERRORLEVEL 0` traps, unquoted `SET` trailing spaces, `ROBOCOPY` exit code misinterpretations, and catastrophic `RD /S /Q "%UNSET_VAR%"` root deletions.
-- **`win_cmd_rs` (Library)**: A cleanly architected Rust library exposing the unified lexer (`parser::lexer`), multi-pass expander, linear-precedence lossless CST parser (`parser::cst_parser`, `parser::peg`), deterministic CST-to-AST lowerer (`parser::lower`), Concrete Syntax Tree (`parser::cst`), AST (`parser::ast`), composable CST tree-rewriter (`linter::rewriter`), Virtual File System (`InMemoryVfs` and `HostOsVfs`), runtime interpreter, and linter for embedding in IDEs, CI runners, security sandboxes, and build tools.
+- **`wincmd` (`WINCMD.EXE`)**: An authentic, deterministic `cmd.exe` and MS-DOS `COMMAND.COM` interpreter that reproduces multi-pass `%`/`!` expansion, byte-offset script reading (including self-modifying batch scripts!), `SETLOCAL` environment stacks, per-drive working directories, FAT 8.3 & DOS 7 LFN filenames, Win32 `FsRtlIsNameInExpression` wildcard matching, live Windows Registry (`HKLM`/`HKCU`) integration, and 55+ built-in commands (`TRUENAME`, `CTTY`, `LH`, `MEM`, etc.) across Linux, macOS, Windows, and 32-bit Protected-Mode MS-DOS (`DJGPP` + `CWSDPMI`).
+- **`wincheck` (`WINCHECK.EXE`)**: A `ShellCheck`-style static analyzer and lossless CST tree-rewriting engine built specifically for `.bat`, `.cmd`, MS-DOS `COMMAND.COM`, and interactive `cmd.exe` inputs. It detects **60 distinct classes of batch bugs (`CMD0001`–`CMD5010`)**, including syntax misuses (`IF a = b`, missing `IN`/`DO` in `FOR`), `.bat` (`%%`) vs. REPL (`%`) mismatches, stale `%VAR%` reads inside `( ... )` blocks, `IF ERRORLEVEL 0` traps, `RD /S /Q "%UNSET_VAR%"` root deletions, and 10 MS-DOS `COMMAND.COM` portability rules (`CMD5001`–`CMD5010` via `--dialect dos622`).
+- **`win_cmd_rs` (`#![no_std]` + `alloc` Library)**: A cleanly architected `#![forbid(unsafe_code)]` Rust library exposing the unified lexer (`parser::lexer`), multi-pass expander, lossless CST parser (`parser::cst_parser`), CST-to-AST lowerer (`parser::lower`), composable CST tree-rewriter (`linter::rewriter`), Virtual File Systems (`InMemoryVfs`, `DosFatVfs`, and `std`-gated `HostOsVfs`), `DosKernelApi` + `SimulatedDosKernel`, runtime interpreter, and linter.
 
 > **Companion Documentation**
-> - **[`USAGE.md`](USAGE.md)** — Complete CLI guide, batch scripting cookbook, `wincheck` CI/editor integration recipes, and Rust library embedding reference.
-> - **[`ARCHITECTURE.md`](ARCHITECTURE.md)** — Deep technical walkthrough with Mermaid architecture, sequence, state-machine, CST/AST, VFS, and multi-pass pipeline diagrams.
+> - **[`USAGE.md`](USAGE.md)** — Complete CLI guide, `--dialect` & MS-DOS `COMMAND.COM` reference, batch scripting cookbook, CI/editor recipes, and `#![no_std]` Rust embedding examples.
+> - **[`ARCHITECTURE.md`](ARCHITECTURE.md)** — Deep technical walkthrough with Mermaid architecture, `#![no_std]` boundary, `DosKernelApi` / `%TEMP%` spooling, DPMI memory layout, CST/AST, and VFS diagrams.
 
 ---
 
 ## Key Features
 
-- **Authentic 5-Stage `cmd.exe` Execution Pipeline**: Implements Phase 0 (raw-byte-offset seeking, mid-script `CHCP` switching & `^` line continuation), Phase 1 (`%VAR%`, `%0`–`%9`, `%*`, `%~dpnx1` modifiers, `%VAR:~start,len%`, `%VAR:old=new%`), Phase 2 (quote/caret state machine, compound `(...)` blocks, redirections), Phase 3 (`%%I` `FOR` variables), and Phase 4 (`!VAR!` delayed expansion with the authentic `!`-triggered caret pass).
+- **Authentic 5-Stage `cmd.exe` & `COMMAND.COM` Execution Pipeline**: Implements Phase 0 (raw-byte-offset seeking, mid-script `CHCP` switching across CP437/850/852/865/866/1252/UTF-8/UTF-16 & `^` line continuation), Phase 1 (`%VAR%`, `%0`–`%9`, `%*`, `%~dpnx1` modifiers, `%VAR:~start,len%`, `%VAR:old=new%`), Phase 2 (quote/caret state machine, compound `(...)` blocks, redirections), Phase 3 (`%%I` `FOR` variables), and Phase 4 (`!VAR!` delayed expansion with the authentic `!`-triggered caret pass).
 - **Unified Linear-Precedence CST Parser & Lossless CST (`src/parser/cst_parser/`, `src/parser/lexer.rs`, `src/parser/lower.rs`, `src/parser/cst.rs`)**:
   - Parses scripts into a 100% lossless Concrete Syntax Tree (`parse_script_cst(id, src, exec_context).to_source_string() == src`) preserving UTF-8 BOMs, `CRLF`/`LF` line endings, `^\r\n` continuations, comments, interleaved redirections, and sub-word tokens (`%VAR%`, `!VAR!`, `%1`, `%%I`, `%~dp0`).
   - Tracks farthest-failure byte offsets and expected grammar sets (`PegExpected`) to pinpoint exact syntax error locations without aborting on the first error.
@@ -70,22 +74,26 @@ Windows Batch (`.bat` / `.cmd`) scripts power countless build systems, legacy en
     2. **Structural Syntax Fix Pass**: Repairs `IF a = b` -> `IF a == b`, `IF (a == b)` -> `IF a == b`, missing `IN`/`DO` in `FOR` loops, unparenthesized `IF ... ELSE ...` -> `IF ... (...) ELSE (...)`, `::` in blocks -> `REM`, broken carets, `SET` assignments, `CD /D`, `CALL`, `EXIT /B`, and `ECHO(`.
     3. **Execution Mode Percent Dialect Pass**: Converts `FOR` loop variables and percent literals between `.bat` mode (`%%I`, `%%~dpI`, `100%%`) and interactive REPL mode (`%I`, `%~dpI`, `100%`).
     4. **Variable & Path Quoting Pass**: Automatically quotes unquoted variables and parameters in path commands, `IF EXIST`, `IF` comparisons, and redirection targets (`> "%LOG%"`), applying smart quote-stripping modifiers (`%1` -> `"%~1"`, `"%1"` -> `"%~1"`, `%%I` -> `"%%~I"`).
-- **Dual Virtual File System Backends**:
-  - `InMemoryVfs`: Deterministic, sandboxed multi-drive (`C:`, `D:`, ...) and UNC (`\\server\share`) filesystem with Windows file attributes (`R`, `A`, `S`, `H`, `D`, `L`), real inode hardlinks & reparse-point symlinks/junctions, collision-free NT `PROGRA~1` 8.3 short names, reserved DOS devices (`NUL`, `CON`, `PRN`, `AUX`, `CLOCK$`, `COM1`–`COM9`, `LPT1`–`LPT9`), and simulated I/O fault injection.
+    5. **MS-DOS Portability Pass**: Under `--dialect dos622`, splits unconditional `&` command chains onto sequential physical lines (`CMD5004`) and rewrites `GOTO :EOF` to an explicit `:EOF` label appended at the end of the `.BAT` file (`CMD5006`).
+- **Triple Virtual File System Backends (`InMemoryVfs`, `HostOsVfs` & `DosFatVfs`)**:
+  - `InMemoryVfs`: Deterministic, `#![no_std]` sandboxed multi-drive (`C:`, `D:`, ...) and UNC (`\\server\share`) filesystem with Windows file attributes, inode hardlinks & reparse-point symlinks/junctions, NT `PROGRA~1` 8.3 short names, reserved DOS devices (`NUL`, `CON`, `PRN`, `AUX`, `CLOCK$`, `COM1`–`COM9`, `LPT1`–`LPT9`), and simulated I/O fault injection.
   - `HostOsVfs`: Maps Windows drive letters onto host POSIX or Windows directories (mounting `/` on `Z:\` on Linux/macOS by default) with transparent case-insensitive path resolution and optional `--host-root` sandbox containment.
-- **50+ Built-In Commands & Windows Utility Shims**: Full implementations of `ECHO`, `SET` (including `/A` and `/P`), `IF`, `FOR` (`/D`, `/R`, `/L`, `/F`), `CALL`, `GOTO`, `SETLOCAL`, `ENDLOCAL`, `SHIFT`, `EXIT`, `PAUSE`, `START`, `CD`/`CHDIR`, `PUSHD`, `POPD`, `DIR`, `COPY`, `MOVE`, `DEL`/`ERASE`, `REN`/`RENAME`, `RD`/`RMDIR`, `MD`/`MKDIR`, `MKLINK`, `TYPE`, `ASSOC`, `FTYPE`, `DOSKEY`, `PROMPT`, `PATH`, `COLOR`, `TITLE`, `CHCP`, `MODE`, `CLS`, `VER`, `VOL`, `DATE`, `TIME`, `VERIFY`, plus cross-platform shims for `CMD`, `REG`, `WHERE`, `FIND`, `FINDSTR`, `CHOICE`, `TIMEOUT`, `ATTRIB`, `SORT`, `MORE`, `FC`, `COMP`, `TREE`, `XCOPY`, `ROBOCOPY`, `HOSTNAME`, and `WHOAMI`.
-- **50 Static Analysis Rules & Safe Auto-Fixer**: `wincheck` provides rich diagnostics in `tty`, `json`, `sarif` (v2.1.0), and `gcc` formats, built-in rule documentation (`--explain CMD2001`), inline `REM wincheck disable=...` suppressions, unified diff generation (`--diff`), and full BOM/encoding-preserving CST script rewriting (`--fix`, `--in-place`, `--unsafe-fixes`, `--encoding <ENC>`, and `--mode <batch|repl>`).
-- **Uncompromising Safety & Quality**: `#![forbid(unsafe_code)]`, zero `.unwrap()` / `.expect()` / `panic!()` / `slice[i]` indexing across the entire codebase, 100% rustdoc coverage, and 100% function, line, and branch test coverage.
+  - `DosFatVfs<K: DosKernelApi>`: Authentic MS-DOS FAT12/FAT16/FAT32 and DOS 7 `INT 21h AX=71xxh` LFN filesystem enforcing strict 8.3 truncation on pure DOS drives, 2-second `PackedDosTimestamp` granularity, native FAT attribute bits (`INT 21h AX=4300h/4301h`), cross-drive copy+delete `MOVE` fallback, and non-blocking `INT 11h`/`AX=4409h` drive probing.
+- **Native 32-Bit Protected-Mode MS-DOS Port (`crates/wincmd-dos/`)**:
+  - Compiles directly from `#![no_std]` + `alloc` Rust (`-Z build-std=core,alloc,panic_abort`) against DJGPP `libc` (`i586-pc-msdosdjgpp`) and `CWSDPMI.EXE`, keeping the real-mode DOS stub under ~40 KiB so ~550+ KiB of conventional memory remains free to `EXEC` (`INT 21h AH=4Bh`) real-mode `.COM`/`.EXE` child programs with `%TEMP%` single-tasking pipeline spooling and BIOS `INT 16h` scan-code `DOSKEY` line editing.
+- **55+ Built-In Commands & Utility Shims**: Full implementations of `ECHO`, `SET` (`/A`, `/P`), `IF`, `FOR` (`/D`, `/R`, `/L`, `/F`), `CALL`, `GOTO`, `SETLOCAL`, `ENDLOCAL`, `SHIFT`, `EXIT`, `PAUSE`, `START`, `CD`/`CHDIR`, `PUSHD`, `POPD`, `DIR`, `COPY`, `MOVE`, `DEL`/`ERASE`, `REN`/`RENAME`, `RD`/`RMDIR`, `MD`/`MKDIR`, `MKLINK`, `TYPE`, `ASSOC`, `FTYPE`, `DOSKEY`, `PROMPT`, `PATH`, `COLOR`, `TITLE`, `CHCP`, `MODE`, `CLS`, `VER`, `VOL`, `DATE`, `TIME`, `VERIFY`, MS-DOS `TRUENAME`, `CTTY`, `LH`/`LOADHIGH`, `MEM`, plus cross-platform shims for `CMD`, `REG`, `WHERE`, `FIND`, `FINDSTR`, `CHOICE` (both NT and MS-DOS 6.x `/C[:]keys /S /T[:]c,nn` syntax), `TIMEOUT`, `ATTRIB`, `SORT`, `MORE`, `FC`, `COMP`, `TREE`, `XCOPY`, `ROBOCOPY`, `HOSTNAME`, and `WHOAMI`.
+- **60 Static Analysis Rules & Safe Auto-Fixer**: `wincheck` provides rich diagnostics in `tty`, `json`, `sarif` (v2.1.0), and `gcc` formats, built-in rule documentation (`--explain CMD2001`, `--explain CMD5001`), inline `REM wincheck disable=...` suppressions, unified diff generation (`--diff`), and full BOM/encoding-preserving CST script rewriting (`--fix`, `--in-place`, `--unsafe-fixes`, `--dialect <cmd|dos622|freedos>`, `--encoding <ENC>`, and `--mode <batch|repl>`).
+- **Uncompromising Safety & Quality**: `#![forbid(unsafe_code)]` across the entire core `win-cmd-rs` crate, zero `.unwrap()` / `.expect()` / `panic!()` / `slice[i]` indexing across the workspace, 100% rustdoc coverage, and 100% function, line, and branch test coverage.
 
 ---
 
-## Installation & Building
+## Installation, Building & MS-DOS Cross-Compilation
 
-### Prerequisites
+### Prerequisites (Host Linux, macOS & Windows)
 
 - **Rust**: `1.88` or newer (Edition 2024)
 
-### Build from Source
+### Build from Source (Host OS)
 
 ```bash
 git clone https://github.com/SamuelMarks/win-cmd-rs.git
@@ -93,29 +101,49 @@ cd win-cmd-rs
 
 # Build release binaries (`wincmd` and `wincheck`)
 cargo build --release
+
+# Verify pure `#![no_std]` + `alloc` core without `std`
+cargo check --lib --no-default-features
 ```
 
-The compiled binaries will be available at:
-- `target/release/wincmd`
-- `target/release/wincheck`
+The compiled host binaries will be available at `target/release/wincmd` and `target/release/wincheck` (or install via `cargo install --path .`).
 
-### Install via Cargo
+### MS-DOS Hardware & OS Requirements
+
+| Requirement | Specification |
+| :--- | :--- |
+| **CPU** | **Intel 80386 or newer** (32-bit x86 protected mode; soft-float ABI—no 80387 FPU required). On 16-bit 8086/8088/80286 CPUs, the embedded MZ real-mode CPU guard cleanly prints `"This program requires an 80386 or newer processor."` via `INT 21h AH=09h` and exits (`ERRORLEVEL 1`) without hanging. |
+| **Memory** | **4–8 MiB XMS / DPMI RAM** (`MemoryProfile::DosCompact4MiB` / `DosStandard8MiB`); leaves **~550+ KiB** of the 640 KiB conventional memory arena free for child `.COM`/`.EXE` programs. |
+| **DPMI Host** | DPMI 0.9+ provider (`CWSDPMI.EXE` in the same directory or `%PATH%`, or built-in DPMI under Windows 9x / DOSEMU2 / QDPMI / HDPMI32). |
+| **Compatible DOS Environments** | MS-DOS 5.0+ / 6.22, IBM PC-DOS, DR-DOS, FreeDOS 1.2 / 1.3+, Windows 95 / 98 / ME DOS mode (including `INT 21h AX=71xxh` LFN), DOSBox-X, and QEMU (`qemu-system-i386`). |
+
+### Cross-Compiling `WINCMD.EXE` & `WINCHECK.EXE` for MS-DOS
+
+With the [DJGPP cross-toolchain (`i586-pc-msdosdjgpp-gcc`)](https://github.com/andrewwutw/build-djgpp) on your `PATH` and Rust `nightly` (`rustup component add --toolchain nightly rust-src`):
 
 ```bash
-cargo install --path .
+cargo +nightly build --manifest-path crates/wincmd-dos/Cargo.toml \
+  -Z build-std=core,alloc,panic_abort \
+  -Z json-target-spec \
+  --target targets/i586-pc-msdosdjgpp.json \
+  --no-default-features \
+  --release
 ```
+
+Copy `wincmd.exe` (`WINCMD.EXE`), `wincheck.exe` (`WINCHECK.EXE`), and `CWSDPMI.EXE` onto any FAT12/FAT16/FAT32 floppy or hard disk image.
 
 ---
 
-## `wincmd` — The Cross-Platform `cmd.exe` Interpreter
+## `wincmd` — The Cross-Platform `cmd.exe` & `COMMAND.COM` Interpreter
 
-`wincmd` can run interactively as a Read-Eval-Print Loop (REPL), execute single command strings via `/C` or `/K`, or execute `.bat` / `.cmd` batch scripts directly. By default, the `wincmd` binary runs against the host filesystem (`HostOsVfs::from_host_env()`, mapping POSIX `/` onto `Z:\`); pass `--hermetic` / `--in-memory` for an isolated in-memory sandbox or `--host-root <dir>` to confine `C:\` to a sandboxed host directory.
+`wincmd` can run interactively as a Read-Eval-Print Loop (REPL), execute single command strings via `/C` or `/K`, or execute `.bat` / `.cmd` batch scripts directly. By default, the host `wincmd` binary runs against `HostOsVfs::from_host_env()` (mapping POSIX `/` onto `Z:\`); on MS-DOS, `WINCMD.EXE` runs directly against `DosFatVfs<DjgppDosKernel>`.
 
 ### `wincmd` CLI Synopsis & Flags
 
 ```text
-WINCMD [/A | /U] [/Q] [/D] [/E:ON | /E:OFF] [/F:ON | /F:OFF] [/V:ON | /V:OFF]
-       [/T:bf] [--in-memory | --hermetic | --host-native | --host-root <dir>]
+WINCMD [drive:\path] [/A | /U] [/Q] [/D] [/P] [/MSG] [/E:ON | /E:OFF | /E:nnnnn]
+       [/F:ON | /F:OFF] [/V:ON | /V:OFF] [/T:bf] [--dialect <cmd|dos622|freedos>]
+       [--in-memory | --hermetic | --host-native | --host-root <dir>]
        [[/S] [/C | /K] string] [--script <file> [args...]]
 ```
 
@@ -127,11 +155,16 @@ WINCMD [/A | /U] [/Q] [/D] [/E:ON | /E:OFF] [/F:ON | /F:OFF] [/V:ON | /V:OFF]
 | `/Q` | Turns `ECHO OFF` initially. |
 | `/D` | Disables execution of `AutoRun` commands from `HKLM` and `HKCU` `Command Processor` registry keys. |
 | `/A` / `/U` | Formats internal pipe and redirected file output as ANSI/codepage (`/A`) or UTF-16LE (`/U`). |
-| `/E:ON` / `/E:OFF` | Enables (`ON`, default) or disables (`OFF`) Command Extensions. |
+| `/E:ON` / `/E:OFF` | Enables (`ON`, default in `cmd`/`freedos`) or disables (`OFF`, default in `dos622`) Command Extensions. |
+| `/E:nnnnn` | Sets MS-DOS `COMMAND.COM` environment size budget in bytes (`160..=32768`). |
+| `/P` | Permanent primary shell mode (`COMMAND.COM /P`): runs `C:\AUTOEXEC.BAT` on startup and ignores top-level `EXIT`. |
+| `/MSG` | Enables resident extended DOS error messages (`COMMAND.COM /MSG` compatibility). |
+| `[drive:\path]` | Positional `COMMAND.COM` startup directory setting `%COMSPEC%` (e.g., `WINCMD C:\DOS /P`). |
 | `/V:ON` / `/V:OFF` | Enables (`ON`) or disables (`OFF`, default) `!VAR!` Delayed Environment Variable Expansion. |
 | `/F:ON` / `/F:OFF` | Enables or disables file and directory name completion characters. |
 | `/T:bf` | Sets the initial background (`b`) and foreground (`f`) console hex color nibbles (e.g., `/T:0A`). |
-| `--host-native` | Mounts the host OS filesystem and imports the host environment (default for the `wincmd` binary). |
+| `--dialect <DIALECT>` | Selects shell dialect: `cmd` (Windows NT `cmd.exe`, default), `dos622` (MS-DOS 6.22 `COMMAND.COM`), or `freedos`. |
+| `--host-native` | Mounts the host OS filesystem and imports the host environment (default for the host `wincmd` binary). |
 | `--host-root <dir>` | Sandboxes `C:\` onto `<dir>` on the host OS, preventing symlink traversal outside `<dir>`. |
 | `--in-memory`, `--hermetic` | Runs in a 100% isolated in-memory `InMemoryVfs` without touching the host disk. |
 | `--script <file> [args...]` | Executes `<file>` as a batch script with optional positional arguments `%1`..`%9`. |
@@ -205,13 +238,14 @@ Usage: wincheck [OPTIONS] <FILES...|->
 | :--- | :--- |
 | `<FILES...>\|-` | One or more `.bat` / `.cmd` script paths to lint (or `-` for standard input). |
 | `-f, --format <FMT>` | Output format: `tty` (default), `json`, `sarif`, or `gcc`. |
-| `-m, --mode <batch\|repl>` | Target execution dialect: `batch` (`.bat`/`.cmd`, default) or `repl` (interactive REPL / `cmd /C`). |
+| `-m, --mode <batch\|repl>` | Target execution context: `batch` (`.bat`/`.cmd`, default) or `repl` (interactive REPL / `cmd /C`). |
+| `--dialect <cmd\|dos622\|freedos>` | Target shell dialect: `cmd` (default), `dos622` (enables `CMD5001`–`CMD5010` MS-DOS `COMMAND.COM` checks), or `freedos`. |
 | `-S, --severity <SEV>` | Minimum severity threshold to report: `error`, `warning`, `info`, or `style` (default: `style`). |
-| `--encoding <ENC>` | Fallback input encoding when no BOM is present: `utf8` (default), `ascii`, `cp437`, `cp850`, `cp1252`, `utf16le`, `utf16be`. |
-| `-i, --include <RULES>` | Comma-separated list of rule IDs to explicitly include (e.g., `CMD2001,CMD3007`). |
+| `--encoding <ENC>` | Fallback input encoding when no BOM is present: `utf8` (default), `ascii`, `cp437`, `cp850`, `cp852`, `cp865`, `cp866`, `cp1252`, `utf16le`, `utf16be`. |
+| `-i, --include <RULES>` | Comma-separated list of rule IDs to explicitly include (e.g., `CMD2001,CMD5001`). |
 | `-e, --exclude <RULES>` | Comma-separated list of rule IDs to suppress (e.g., `CMD4006,CMD1009`). |
 | `--explain <CMDxxxx>` | Prints detailed Markdown documentation and bad/good code examples for a rule ID. |
-| `--list-rules` | Prints a formatted catalog table of all 50 rules with severities and summaries. |
+| `--list-rules` | Prints a formatted catalog table of all 60 rules (`CMD0001`–`CMD5010`) with severities and summaries. |
 | `--diff` | Computes automatic fixes via `CstRewriter` and outputs a unified diff of the changes. |
 | `--fix, --stdout` | Rewrites a single script (or `-` stdin) via `CstRewriter` preserving BOM/encoding and outputs the fixed script to `stdout`. |
 | `--in-place` | Writes CST-rewritten script(s) back to disk in place preserving BOM/encoding (required when fixing multiple files). |
@@ -284,7 +318,7 @@ Supported directive clauses:
 - `enable=CMDxxxx,CMDyyyy` / `enable=all` — Re-enables previously disabled rule(s) or all rules.
 - `source-path=...` — Declares base path metadata for cross-script `CALL` resolution.
 
-### Complete Rule Catalog (`CMD0001` – `CMD4010`)
+### Complete Rule Catalog (`CMD0001` – `CMD5010`)
 
 #### Directive & Meta Rules (`CMD0xxx`)
 
@@ -361,6 +395,21 @@ Supported directive clauses:
 | `CMD4009` | Warning | `ambiguous-multifile-copy-dest` | `COPY` or `MOVE` with multiple sources into a destination not ending with `\` is ambiguous if the directory is missing. | — |
 | `CMD4010` | Style | `prefer-rem-over-double-colon` | Prefer standard `REM` over `::` label-comment syntax. | — |
 
+#### MS-DOS `COMMAND.COM` Portability Rules (`CMD5xxx`, active with `--dialect dos622`)
+
+| Rule ID | Severity | Name | Summary | Auto-Fix |
+| :--- | :--- | :--- | :--- | :---: |
+| `CMD5001` | Error | `dos-unsupported-set-switch` | `SET /A` arithmetic and `SET /P` interactive prompts are unsupported in MS-DOS `COMMAND.COM`. | — |
+| `CMD5002` | Error | `dos-unsupported-for-variant` | `FOR /F`, `FOR /L`, `FOR /R`, and `FOR /D` switches are unsupported in MS-DOS `COMMAND.COM`. | — |
+| `CMD5003` | Error | `dos-unsupported-if-syntax` | `IF /I`, `IF DEFINED`, `IF CMDEXTVERSION`, `EQU`–`GEQ`, and `ELSE` are unsupported in MS-DOS `COMMAND.COM`. | — |
+| `CMD5004` | Error | `dos-compound-or-chaining` | Parenthesized `( ... )` blocks and `&`, `&&`, `\|\|` command chains are unsupported in MS-DOS `COMMAND.COM`. | Split `&` lines |
+| `CMD5005` | Error | `dos-extended-var-syntax` | Delayed `!VAR!`, `%VAR:~...%` / `%VAR:a=b%`, `%*`, and `%~dpnx1` modifiers are unsupported in MS-DOS `COMMAND.COM`. | — |
+| `CMD5006` | Error | `dos-subroutine-or-eof` | `CALL :label`, implicit `GOTO :EOF`, and `EXIT /B` are unsupported in MS-DOS `COMMAND.COM`. | Append `:EOF` |
+| `CMD5007` | Error | `dos-nt-only-builtin` | `SETLOCAL`, `ENDLOCAL`, `PUSHD`, `POPD`, `ASSOC`, `FTYPE`, and `MKLINK` are unavailable in MS-DOS `COMMAND.COM`. | — |
+| `CMD5008` | Error | `dos-numeric-fd-redirect` | Numeric handle redirections (`2>`, `2>&1`, `1>&2`) are unsupported in MS-DOS `COMMAND.COM`. | — |
+| `CMD5009` | Warning | `dos-non-8-3-path` | Filename or path segment violates MS-DOS FAT 8.3 limits or uses `.cmd` instead of `.bat`. | — |
+| `CMD5010` | Warning | `dos-psp-tail-too-long` | External command argument tail exceeds the 126-byte MS-DOS `PSP:0x80` command-line limit. | — |
+
 ---
 
 ## Architecture & Authentic `cmd.exe` Pipeline
@@ -371,7 +420,7 @@ Unlike POSIX shells (`sh`, `bash`, `zsh`) that lex and parse a script into an AS
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ Phase 0: Byte-Offset Script Reader (`src/reader/`)                         │
 │  • Seeks to `current_offset: ByteOffset` in VFS (supports self-modifying!) │
-│  • Decodes CP437 / CP850 / Windows-1252 / UTF-8 / UTF-16LE/BE & `0x1A` EOF │
+│  • Decodes CP437/850/852/865/866/1252 / UTF-8 / UTF-16LE/BE & `0x1A` EOF   │
 │  • Joins `^` line continuations into `LogicalLineBuffer` of `SpannedChar`  │
 └───────────────────────────────────────┬────────────────────────────────────┘
                                         ▼
@@ -404,7 +453,7 @@ Unlike POSIX shells (`sh`, `bash`, `zsh`) that lex and parse a script into an AS
 ### Phase 0: Byte-Offset Script Reader, Encodings & Line Continuation
 
 - **Byte-Offset Seeking**: `BatchFrameReader` tracks `current_offset: ByteOffset`. Before fetching each statement, it reads the file from the `VirtualFileSystem` at `current_offset`. If a batch script appends commands to itself (`echo echo Added dynamically >> "%~f0"`), `wincmd` executes the newly appended lines just like native `cmd.exe`.
-- **Codepages & `0x1A` SUB EOF**: Supports `CodePage::Utf8` (`65001`), `OemUnitedStates` (`437`), `OemMultilingualLatin1` (`850`), `WindowsLatin1` (`1252`), `Utf16Le` (`1200`), `Utf16Be` (`1201`), and `Ascii` (`20127`), with full `0x80..=0xFF` lookup tables for OEM box-drawing characters and `0x1A` (`Ctrl+Z`) logical EOF truncation.
+- **Codepages & `0x1A` SUB EOF**: Supports `CodePage::Utf8` (`65001`), `OemUnitedStates` (`437`), `OemMultilingualLatin1` (`850`), `OemLatin2` (`852`), `OemNordic` (`865`), `OemCyrillic` (`866`), `WindowsLatin1` (`1252`), `Utf16Le` (`1200`), `Utf16Be` (`1201`), and `Ascii` (`20127`), with full 256-entry lookup tables for OEM box-drawing/international characters, live `DosKernelApi` `CHCP` synchronization, and `0x1A` (`Ctrl+Z`) logical EOF truncation.
 - **Physical-to-Logical Span Mapping**: Every character in `LogicalLineBuffer` is a `SpannedChar` tracking its exact `Span` and `ExpansionOrigin` (`LiteralSource`, `CaretContinuation`, `PositionalParam`, `ImmediateEnvVar`, `ForVariable`, `DelayedEnvVar`).
 
 ### Phase 1: Immediate `%` Expansion, `%~` Modifiers & Variable Slicing
@@ -464,39 +513,40 @@ Unlike POSIX shells (`sh`, `bash`, `zsh`) that lex and parse a script into an AS
 9. `+`, `-`, `~`, `!` (Unary plus, negation, bitwise NOT, logical NOT)
 10. `( expr )` (Parenthesized grouping and implicit bare-identifier variable dereferencing)
 
-### Virtual File System (`InMemoryVfs` & `HostOsVfs`), 8.3 Short Names & Win32 Globs
+### Virtual File System (`InMemoryVfs`, `HostOsVfs` & `DosFatVfs`), 8.3 Short Names & Win32 Globs
 
 - **Per-Drive Working Directories**: Tracks the active drive (`C:`) plus independent current working directories for every mounted drive (`=C:`, `=D:` hidden environment variables), so `C:foo\bar` resolves relative to `C:`'s CWD even when `D:` is active.
-- **Win32 Path Normalization**: Handles drive-absolute (`C:\a`), drive-relative (`C:a`), root-relative (`\a`), relative (`.\a`, `..\a`), UNC (`\\server\share\a`), and extended device paths (`\\?\C:\a`), stripping trailing dots and spaces per Win32 rules.
+- **Win32 & MS-DOS FAT Path Normalization**: Handles drive-absolute (`C:\a`), drive-relative (`C:a`), root-relative (`\a`), relative (`.\a`, `..\a`), UNC (`\\server\share\a`), and extended device paths (`\\?\C:\a`). On `DosFatVfs`, `LfnSupportMode::Disabled8Dot3Only` enforces authentic `COMMAND.COM` 8.3 stem/extension truncation while `LfnSupportMode::EnabledInt21Ax71` preserves DOS 7 long filenames alongside 8.3 short names.
 - **Win32 `FsRtlIsNameInExpression` Globbing**: Implements `DOS_STAR` (`*`), `DOS_QM` (`?` matching 1 char, or 0 chars before `.` or at end of name), and `DOS_DOT` (`.` matching literal `.` or end of filename so `*.*` matches extensionless files and `*.` matches only extensionless files).
 
 ---
 
 ## Built-In Commands & Cross-Platform Utility Shims
 
-### Core `cmd.exe` Built-In Commands
+### Core `cmd.exe` & MS-DOS `COMMAND.COM` Built-In Commands
 
 | Category | Commands |
 | :--- | :--- |
 | **Environment & Scope** | `SET` (list, prefix filter, assign, `/A` arithmetic, `/P` prompt), `SETLOCAL` (`EnableExtensions`, `DisableExtensions`, `EnableDelayedExpansion`, `DisableDelayedExpansion`), `ENDLOCAL`, `PATH`, `PROMPT`, `ASSOC`, `FTYPE` |
-| **Control Flow & Batch** | `IF` (`/I`, `NOT`, `ERRORLEVEL`, `EXIST`, `DEFINED`, `CMDEXTVERSION`, `==`, `EQU`, `NEQ`, `LSS`, `LEQ`, `GTR`, `GEQ`), `FOR` (`/D`, `/R`, `/L`, `/F`), `CALL` (batch file, `:subroutine`, command twice-expansion), `GOTO` (`:label`, `:EOF`), `SHIFT` (`/0`..`/8`), `EXIT` (`/B [code]`), `PAUSE`, `START` (`/B`, `/I`, `/WAIT`, `/MIN`, `/MAX`, `/D <dir>`) |
-| **Filesystem & Navigation** | `CD` / `CHDIR` (`/D`), `MD` / `MKDIR`, `RD` / `RMDIR` (`/S`, `/Q`), `PUSHD`, `POPD`, `DIR` (`/B`, `/S`, `/A`, `/O`, `/W`, `/D`, `/L`, `/X`), `COPY` (`/A`, `/B`, `/Y`, `/-Y`, `a+b` concatenation), `DEL` / `ERASE` (`/P`, `/F`, `/S`, `/Q`, `/A`), `REN` / `RENAME` (with wildcard masks), `MOVE` (`/Y`, `/-Y`), `TYPE`, `MKLINK` (`/D`, `/H`, `/J`), `<Drive>:` (`C:`, `D:`, `Z:`) |
-| **Console, System & Shell** | `ECHO` (`ON`, `OFF`, message), `REM`, `CLS`, `COLOR`, `TITLE`, `CHCP`, `MODE` (`CON`, `COLS=c`, `LINES=n`), `VER`, `VOL`, `DATE` (`/T`), `TIME` (`/T`), `VERIFY` (`ON`, `OFF`), `DOSKEY` (`/MACROS`, `/HISTORY`, `/REINSTALL`, `/LISTSIZE=n`) |
+| **Control Flow & Batch** | `IF` (`/I`, `NOT`, `ERRORLEVEL`, `EXIST`, `DEFINED`, `CMDEXTVERSION`, `==`, `EQU`, `NEQ`, `LSS`, `LEQ`, `GTR`, `GEQ`), `FOR` (`/D`, `/R`, `/L`, `/F`), `CALL` (batch file, `:subroutine`, command twice-expansion), `GOTO` (`:label`, `:EOF`), `SHIFT` (`/0`..`/8`), `EXIT` (`/B [code]`), `PAUSE`, `START` (`/B`, `/I`, `/WAIT`, `/MIN`, `/MAX`, `/D <dir>`), `LH` / `LOADHIGH` (`/L:...`, `/S`) |
+| **Filesystem & Navigation** | `CD` / `CHDIR` (`/D`), `MD` / `MKDIR`, `RD` / `RMDIR` (`/S`, `/Q`), `PUSHD`, `POPD`, `DIR` (`/B`, `/S`, `/A`, `/O`, `/W`, `/D`, `/L`, `/X`), `COPY` (`/A`, `/B`, `/Y`, `/-Y`, `a+b` concatenation), `DEL` / `ERASE` (`/P`, `/F`, `/S`, `/Q`, `/A`), `REN` / `RENAME` (with wildcard masks), `MOVE` (`/Y`, `/-Y`), `TYPE`, `TRUENAME`, `MKLINK` (`/D`, `/H`, `/J`), `<Drive>:` (`A:`, `C:`, `D:`, `Z:`) |
+| **Console, System & Shell** | `ECHO` (`ON`, `OFF`, message), `REM`, `CLS` (BIOS `INT 10h` or ANSI CSI), `COLOR`, `TITLE`, `CHCP`, `CTTY` (`CON`, `AUX`, `COM1`–`COM4`, `NUL`), `MODE` (`CON`, `COLS=c`, `LINES=n`), `VER`, `VOL`, `DATE` (`/T`), `TIME` (`/T`), `VERIFY` (`ON`, `OFF`), `DOSKEY` (`/MACROS`, `/HISTORY`, `/REINSTALL`, `/LISTSIZE=n`) |
 
-### Cross-Platform Windows Utility Shims
+### Cross-Platform Windows & MS-DOS Utility Shims
 
-To allow real-world Windows `.bat` scripts to run unmodified on Linux and macOS, `wincmd` includes built-in cross-platform shims for standard Windows system utilities:
+To allow real-world Windows and MS-DOS `.bat` scripts to run unmodified everywhere, `wincmd` includes built-in shims for standard system utilities:
 
 | Utility Shim | Supported Switches & Behavior |
 | :--- | :--- |
 | `CMD` | Spawns nested `cmd.exe` subshells (`/C`, `/K`, `/S`, `/Q`, `/D`, `/A`, `/U`, `/E:ON\|OFF`, `/V:ON\|OFF`, `/T:bf`) honoring live `Command Processor` Registry defaults. |
+| `MEM` | Reports conventional 640 KiB and extended XMS/DPMI memory tables (`/C`, `/D`, `/F`, `/M`, `/P`) from live `DosKernelApi::memory_stats()` or deterministic defaults. |
 | `REG` | Queries and modifies the Windows/Wine Registry (`QUERY`, `ADD`, `DELETE`, `COPY`, `EXPORT`, `IMPORT` across `HKLM`, `HKCU`, `HKCR`, `HKU`, `HKCC`). |
 | `WHERE` | Searches `%PATH%` or `/R <dir>` using `%PATHEXT%` (`/Q` quiet exit code, `/F` quoted output, `/T` size & timestamp). |
 | `FIND` | Searches for literal strings in files or `stdin` (`/V` invert, `/C` count only, `/N` line numbers, `/I` case-insensitive). |
 | `FINDSTR` | Searches files or `stdin` using literals or `O(\|P\| * \|L\|)` regexes (`/B`, `/E`, `/L`, `/R`, `/S`, `/I`, `/X`, `/V`, `/N`, `/M`, `/C:"..."`). |
-| `CHOICE` | Prompts user to select from choice keys (`/C`, `/N`, `/CS`, `/T`, `/D`, `/M`) and sets `ERRORLEVEL` to the 1-based key index. |
+| `CHOICE` | Prompts user to select from choice keys (both Windows NT `/C keys /N /CS /T nn /D c /M msg` and MS-DOS 6.x `/C[:]keys /S /T[:]c,nn`) and sets `ERRORLEVEL` to the 1-based key index. |
 | `TIMEOUT` | Pauses execution for `/T <seconds>` (`-1..=99999`, `/NOBREAK`). |
-| `ATTRIB` | Displays or modifies Windows `R`, `A`, `S`, `H` file attributes (`+R`, `-R`, `+A`, `-A`, `+S`, `-S`, `+H`, `-H`, `/S`, `/D`). |
+| `ATTRIB` | Displays or modifies `R`, `A`, `S`, `H` file attributes (`+R`, `-R`, `+A`, `-A`, `+S`, `-S`, `+H`, `-H`, `/S`, `/D`). |
 | `SORT` | Sorts input lines alphabetically (`/R` reverse, `/+n` start column, `/O <file>` output file, `/UNIQUE` / `/UNIQ` deduplicate). |
 | `MORE` | Renders input streams with optional line skipping (`+n`), blank-line squeezing (`/S`), and tab expansion. |
 | `FC` | Compares two files in text or binary mode (`/B` binary, `/C` case-insensitive, `/N` line numbers, `/W` compress whitespace). |
@@ -510,11 +560,13 @@ To allow real-world Windows `.bat` scripts to run unmodified on Linux and macOS,
 
 ## Rust Library Usage (`win_cmd_rs`)
 
-Add `win-cmd-rs` to your `Cargo.toml`:
+Add `win-cmd-rs` to your `Cargo.toml` (disable default features for `#![no_std]` + `alloc` environments):
 
 ```toml
 [dependencies]
-win-cmd-rs = "0.1.0"
+win-cmd-rs = "0.0.1"
+# Or for `#![no_std]` + `alloc` targets (MS-DOS DJGPP, kernels, sandboxes):
+# win-cmd-rs = { version = "0.0.1", default-features = false }
 ```
 
 ### Executing Commands & Scripts in an In-Memory Sandbox
@@ -543,7 +595,7 @@ fn main() -> Result<(), CmdError> {
 }
 ```
 
-To run against a directory on the host OS instead, initialize the interpreter with `HostOsVfs`:
+To run against a directory on the host OS instead (`std` feature), initialize the interpreter with `HostOsVfs`:
 
 ```rust
 use std::path::PathBuf;
@@ -554,16 +606,38 @@ let vfs = HostOsVfs::new(PathBuf::from("/tmp/sandbox_c_drive"));
 let mut interp = Interpreter::with_vfs(Box::new(vfs));
 ```
 
+### Simulating MS-DOS (`SimulatedDosKernel`) & `#![no_std]` Embedding
+
+Both host tests and `#![no_std]` callers can run `Interpreter` and `DosFatVfs` over `SimulatedDosKernel` (or a custom `DosKernelApi` implementation):
+
+```rust
+use win_cmd_rs::dos::SimulatedDosKernel;
+use win_cmd_rs::error::CmdError;
+use win_cmd_rs::runtime::{Interpreter, IoStreams};
+use win_cmd_rs::types::{ExitCode, ShellDialect};
+
+fn main() -> Result<(), CmdError> {
+    let (mut interp, _kernel) = Interpreter::with_dos_kernel(SimulatedDosKernel::new());
+    interp.apply_shell_dialect(ShellDialect::MsDos622);
+
+    interp.proc_env.vfs.write_bytes(r"C:\LONGFILENAME.TXT", b"DOS83\r\n")?;
+    let mut io = IoStreams::new();
+    assert_eq!(interp.execute_interactive_line(r"truename .\LONGFILENAME.TXT", &mut io), ExitCode::SUCCESS);
+    assert_eq!(io.stdout, "C:\\LONGFILE.TXT\r\n");
+    Ok(())
+}
+```
+
 ### Programmatic Static Analysis & Auto-Fixing
 
-Use `win_cmd_rs::linter` to lint batch scripts, format diagnostics, or apply lossless automatic fixes in Rust:
+Use `win_cmd_rs::linter` to lint batch scripts (for either Windows `cmd.exe` or MS-DOS `COMMAND.COM`), format diagnostics, or apply lossless automatic fixes in Rust:
 
 ```rust
 use win_cmd_rs::linter::{
     LinterConfig, OutputFormat, format_diagnostics, lint_script, rewrite_script,
 };
 use win_cmd_rs::span::SourceMap;
-use win_cmd_rs::types::ExecutionContext;
+use win_cmd_rs::types::{ExecutionContext, ShellDialect};
 
 fn main() -> Result<(), win_cmd_rs::error::CmdError> {
     let raw_script = b"@echo off\r\nsetlocal\r\nset VAR = 42\r\nif %VAR%==42 echo %VAR%\r\n";
@@ -584,6 +658,16 @@ fn main() -> Result<(), win_cmd_rs::error::CmdError> {
     assert!(applied_count >= 2);
     assert!(fixed_text.contains(r#"set "VAR=42""#));
 
+    // Audit and auto-fix an MS-DOS 6.22 batch script (`CMD5004`, `CMD5006`)
+    let dos_cfg = LinterConfig {
+        dialect: ShellDialect::MsDos622,
+        ..LinterConfig::default()
+    };
+    let (dos_fixed, dos_edits) =
+        rewrite_script("@echo off\r\ngoto :EOF\r\n", ExecutionContext::BatchFile, &dos_cfg);
+    assert_eq!(dos_edits, 1);
+    assert!(dos_fixed.ends_with(":EOF\r\n"));
+
     Ok(())
 }
 ```
@@ -594,24 +678,60 @@ fn main() -> Result<(), win_cmd_rs::error::CmdError> {
 
 ```text
 win-cmd-rs/
-├── Cargo.toml                  # Package manifest & strict rustc/clippy/rustdoc lint rules
+├── .editorconfig               # Consistent workspace formatting rules
+├── .gitattributes              # Line-ending normalization attributes
+├── .gitignore                  # Ignored build & coverage artifacts
+├── .pre-commit-config.yaml     # Automated doc, anti-pattern, no_std, lint & 100% branch coverage gates
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # Linux/macOS/Windows CI, 100% coverage, FreeDOS QEMU & release builds
+├── Cargo.toml                  # Root `#![no_std]`/`std` manifest & strict rustc/clippy/rustdoc lints
+├── Cargo.lock                  # Reproducible dependency lockfile
 ├── LICENSE-APACHE              # Apache License, Version 2.0
 ├── LICENSE-MIT                 # MIT License
-├── .pre-commit-config.yaml     # Automated doc, anti-pattern, lint & 100% branch coverage gates
 ├── README.md                   # Project overview & quick reference
-├── USAGE.md                    # Comprehensive CLI, scripting, CI/CD & Rust API guide
+├── USAGE.md                    # Comprehensive CLI, MS-DOS dialect, CI/CD & Rust API guide
 ├── ARCHITECTURE.md             # Deep architectural guide with Mermaid diagrams
+├── targets/
+│   └── i586-pc-msdosdjgpp.json # Custom 32-bit x86 soft-float COFF target spec for MS-DOS DJGPP
+├── crates/
+│   └── wincmd-dos/             # Isolated 32-bit Protected-Mode MS-DOS (`DJGPP` + `CWSDPMI`) crate
+│       ├── Cargo.toml          # Target crate manifest & identical strict lint table
+│       ├── Cargo.lock          # Target crate lockfile
+│       ├── src/
+│       │   ├── lib.rs          # Stream-generic DOS CLI runners & unit test suite
+│       │   ├── alloc_djgpp.rs  # Alignment-safe `#[global_allocator]` over DJGPP `malloc`/`free`
+│       │   ├── panic_dos.rs    # Zero-heap-allocation stack `#[panic_handler]` to DOS `STDERR`
+│       │   ├── ffi.rs          # Thin `unsafe` DJGPP `libc` & DPMI `INT 10h/11h/16h/21h/31h` bindings
+│       │   ├── djgpp_kernel.rs # Safe `DosKernelApi` implementation (`DjgppDosKernel`)
+│       │   ├── stub_verify.rs  # Assembled 16-bit MZ CPU guard bytes & behavioral verifier
+│       │   └── bin/
+│       │       ├── wincmd.rs   # `WINCMD.EXE` entrypoint
+│       │       └── wincheck.rs # `WINCHECK.EXE` entrypoint
+│       ├── stub/
+│       │   ├── cpu_guard_stub.asm # 16-bit real-mode 8086/80286 CPU guard MZ stub (`NASM`)
+│       │   ├── chkstk_dos.s    # 32-bit x86 COFF stack-probe shim
+│       │   ├── djgpp-rust.ld   # DJGPP COFF linker script
+│       │   └── djgpp-linker.sh # `i586-pc-msdosdjgpp-gcc` + `stubify` + MZ CPU guard patcher
+│       └── tests/
+│           └── dos_binaries.rs # Subprocess integration tests for `wincmd-dos` binaries
 ├── src/
-│   ├── lib.rs                  # Library root exporting all public modules
+│   ├── lib.rs                  # `#![cfg_attr(not(feature = "std"), no_std)]` library root
 │   ├── span.rs                 # BOM-aware ByteOffset, LineNumber, ColumnNumber, Span & SourceMap
-│   ├── types.rs                # Strongly typed domain primitives (ExitCode, DriveLetter, EnvVarName, etc.)
-│   ├── error.rs                # Unified derive_more CmdError enum with exact cmd.exe messages
+│   ├── types.rs                # Domain primitives (ExitCode, DriveLetter, IoErrorKind, ShellDialect, etc.)
+│   ├── error.rs                # Unified `no_std` derive_more CmdError enum (`cmd.exe` & DOS messages)
 │   ├── bin/
-│   │   ├── wincmd.rs           # `wincmd` CLI binary entrypoint
-│   │   └── wincheck.rs         # `wincheck` CLI binary entrypoint
+│   │   ├── wincmd.rs           # Host `wincmd` CLI binary entrypoint
+│   │   └── wincheck.rs         # Host `wincheck` CLI binary entrypoint
+│   ├── dos/
+│   │   ├── mod.rs              # Safe `#![no_std]` MS-DOS subsystem root & unit tests
+│   │   ├── types.rs            # PackedDosTimestamp, FatAttributeByte, DosFileName8Dot3 & PspCommandTail
+│   │   ├── kernel.rs           # Safe `DosKernelApi` hardware trait & `SharedDosKernel`
+│   │   ├── sim.rs              # Deterministic in-memory `SimulatedDosKernel` (8.3/LFN, faults, `.COM` exec)
+│   │   └── console.rs          # `DosConsoleIo` BIOS scan-code `DOSKEY` line editor (`F1`/`F3`/`F7`/`F8`/`F9`)
 │   ├── reader/
 │   │   ├── mod.rs              # Phase 0 script reader module root
-│   │   ├── encoding.rs         # Incremental single-line decoding (CP437/CP850/CP1252/UTF-8/UTF-16)
+│   │   ├── encoding.rs         # Incremental decoding (CP437/850/852/865/866/1252/UTF-8/UTF-16)
 │   │   ├── char_map.rs         # SpannedChar, ProvenanceMode & LogicalLineBuffer
 │   │   └── stream.rs           # Raw-byte BatchFrameReader cursor, `^` continuations & label scanner
 │   ├── parser/
@@ -632,19 +752,21 @@ win-cmd-rs/
 │   │   ├── phase4.rs           # Phase 4: Delayed `!VAR!` expansion & `!`-triggered caret pass
 │   │   └── ast.rs              # Full Span-preserving AST nodes & sub-word WordPart metadata
 │   ├── vfs/
-│   │   ├── mod.rs              # VFS module root & cross-backend conformance tests
+│   │   ├── mod.rs              # VFS module root & cross-backend (`InMemory`/`HostOs`/`DosFat`) conformance tests
 │   │   ├── traits.rs           # VirtualFileSystem trait, VfsMetadata, FileTimestamp & FileAttributeFlags
 │   │   ├── memory.rs           # Deterministic InMemoryVfs (UNC aliases, hardlinks, symlinks, 8.3 names)
 │   │   ├── host.rs             # Sandboxed HostOsVfs bridge, UNC mounts & Wine/POSIX drive translation
+│   │   ├── dos.rs              # MS-DOS FAT12/16/32 & DOS 7 LFN `DosFatVfs<K: DosKernelApi>`
 │   │   ├── path.rs             # Case-insensitive WindowsPath, UNC validation & NT 8.3 hash generator
-│   │   ├── devices.rs          # Reserved DOS device handler (NUL, CON, PRN, AUX, COM1..9, LPT1..9)
+│   │   ├── devices.rs          # Reserved DOS device handler (NUL, CON, PRN, AUX, CLOCK$, COM1..9, LPT1..9)
 │   │   └── glob.rs             # Polynomial-time Win32 FsRtlIsNameInExpression wildcard engine
 │   ├── runtime/
 │   │   ├── mod.rs              # Runtime module root & subshell CWD snapshot helpers
-│   │   ├── interpreter.rs      # Stateful Interpreter session, ExecutionLimits, ConsoleState & completion
+│   │   ├── interpreter.rs      # Stateful Interpreter, MemoryProfile, ExecutionLimits & completion
 │   │   ├── exec.rs             # AST statement, pipeline, handle 0..=9 redirection & batch-frame engine
+│   │   ├── dos_exec.rs         # Single-tasking `DosProcessSpawner` (`INT 21h AH=4Bh`) & `%TEMP%` spooler
 │   │   ├── argv.rs             # CommandLineToArgvW parser & `%PATH%`/`%PATHEXT%`/HKCR target resolver
-│   │   ├── io.rs               # Streaming CmdIo trait, BufferedIoStreams, RedirectedIo & spawner
+│   │   ├── io.rs               # Portable `no_std` byte streams (`ByteStreamRead`/`Write`), `CmdIo` & spawner
 │   │   ├── env.rs              # EnvironmentStack, per-read `%RANDOM%` PRNG & POSIX PATH translation
 │   │   ├── arithmetic.rs       # Overflow-safe `SET /A` 32-bit signed arithmetic evaluator
 │   │   └── registry.rs         # Canonical Windows Registry (`HKLM`, `HKCU`) & live Command Processor settings
@@ -654,29 +776,31 @@ win-cmd-rs/
 │   │   ├── flow_cmds.rs        # CALL, GOTO, EXIT, SHIFT, PAUSE, CMD, START
 │   │   ├── fs_cmds.rs          # DIR, CD, MD, RD, PUSHD, POPD, COPY, DEL, REN, MOVE, TYPE, MKLINK
 │   │   ├── console_cmds.rs     # ECHO, CLS, COLOR, TITLE, VER, VOL, DATE, TIME, VERIFY, CHCP, MODE, DOSKEY
+│   │   ├── dos_cmds.rs         # MS-DOS `TRUENAME`, `CTTY`, `LH`/`LOADHIGH` & `MEM` (`/C`, `/D`, `/F`, `/M`, `/P`)
 │   │   ├── shims_search.rs     # WHERE, FIND, FINDSTR (`/R` regex), SORT, MORE, FC, COMP, TREE
-│   │   └── shims_admin.rs      # XCOPY, ROBOCOPY, ATTRIB, CHOICE, TIMEOUT, REG, HOSTNAME, WHOAMI
+│   │   └── shims_admin.rs      # XCOPY, ROBOCOPY, ATTRIB, CHOICE (NT & DOS 6.x), TIMEOUT, REG, HOSTNAME, WHOAMI
 │   ├── linter/
-│   │   ├── mod.rs              # `wincheck` analyzer root & `lint_script` / `rewrite_script` entrypoints
-│   │   ├── rules.rs            # Rule catalog (`CMD0001`–`CMD4010`), RuleMetadata & FixApplicability
+│   │   ├── mod.rs              # `wincheck` VFS-aware analyzer & `lint_script` / `rewrite_script` entrypoints
+│   │   ├── rules.rs            # 60-rule catalog (`CMD0001`–`CMD5010`), RuleMetadata & FixApplicability
 │   │   ├── directives.rs       # Inline `REM wincheck` disable/enable/source-path directive parser
 │   │   ├── formatters.rs       # TTY, GCC, JSON, SARIF & Myers/LCS unified diff formatters
-│   │   ├── rewriter.rs         # Composable lossless CstRewriter respecting filters & suppressions
+│   │   ├── rewriter.rs         # Composable 5-pass lossless CstRewriter respecting dialects & suppressions
 │   │   └── passes/             # Modular AST static analysis & CST rewrite passes
 │   │       ├── mod.rs
 │   │       ├── delayed_exp.rs
 │   │       ├── dialect.rs
+│   │       ├── dos_compat.rs   # MS-DOS `COMMAND.COM` portability rules (`CMD5001`–`CMD5010`) & auto-fixes
 │   │       ├── quoting.rs
 │   │       └── structural.rs
 │   └── cli/
-│       ├── mod.rs              # CLI module root & end-to-end unit tests
-│       ├── wincmd_cli.rs       # `wincmd` flag parser, live `/C` executable probe & process driver
-│       ├── wincheck_cli.rs     # `wincheck` flag parser, BOM-preserving `--fix`/`--in-place` & driver
-│       └── repl.rs             # Unified streaming `BufRead` REPL, `/F:ON` completion & ANSI colors
+│       ├── mod.rs              # `#![no_std]` + `std` CLI module root & end-to-end unit tests
+│       ├── wincmd_cli.rs       # `wincmd` flag parser (`/P`, `/E:nnnnn`, `--dialect`) & stream driver
+│       ├── wincheck_cli.rs     # `wincheck` flag parser (`--dialect`, VFS `--in-place`) & stream driver
+│       └── repl.rs             # Unified streaming `ByteStreamBufRead` REPL, `/F:ON` completion & ANSI colors
 └── tests/
     ├── cli_binaries.rs         # Subprocess integration tests for `wincmd` and `wincheck` binaries
-    ├── doc_and_quality_gates.rs# 100% doc-completeness & anti-pattern verification gates
-    └── property_invariants.rs  # Differential AST, VFS case-folding & semantic-rewriter property tests
+    ├── doc_and_quality_gates.rs# 100% doc-completeness, 60-rule catalog & anti-pattern gates across workspace
+    └── property_invariants.rs  # AST/CST, FAT timestamp, 8.3 name, PSP tail, OEM codepage & rewriter properties
 ```
 
 ---
@@ -689,24 +813,31 @@ This repository enforces the strictest possible Rust engineering and verificatio
    - Every module, struct, enum, variant, field, and function (both public and private) is documented with rustdoc, enforced via `#![deny(missing_docs)]`, `#![deny(clippy::missing_docs_in_private_items)]`, `#![deny(clippy::missing_errors_doc)]`, and `#![deny(clippy::missing_panics_doc)]`.
 2. **100% Test Coverage**:
    - Verified across functions, lines, and branches via `cargo llvm-cov`.
-3. **Zero `unsafe`, Zero `unwrap`, Zero `panic!`, Zero Indexing**:
-   - `#![forbid(unsafe_code)]`
+3. **Zero Core `unsafe`, Zero `unwrap`, Zero `panic!`, Zero Indexing**:
+   - `#![forbid(unsafe_code)]` across the entire `win-cmd-rs` library and `DjgppDosKernel` (with raw DJGPP `libc` / DPMI FFI isolated exclusively to `crates/wincmd-dos/src/ffi.rs` under mandatory `# Safety` invariants).
    - `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::panic_in_result_fn, clippy::indexing_slicing, clippy::string_slice, clippy::arithmetic_side_effects)]`
 4. **Single Unified Error Enum**:
-   - All errors across the reader, parser, VFS, arithmetic evaluator, runtime, CLI, and linter use `win_cmd_rs::error::CmdError` powered by `derive_more`, with `.cmd_exe_message()` and `.exit_code()` producing authentic `cmd.exe` diagnostics.
+   - All errors across the reader, parser, VFS, DOS hardware layer, arithmetic evaluator, runtime, CLI, and linter use `win_cmd_rs::error::CmdError` powered by `derive_more`, with `.cmd_exe_message()` and `.exit_code()` producing authentic `cmd.exe` and `COMMAND.COM` diagnostics.
 
 ### Running the Verification Suite
 
 ```bash
-# Run all unit, integration, and doc tests
-cargo test --all-targets
-cargo test --doc
+# Verify pure `#![no_std]` + `alloc` core without `std`
+cargo check --lib --no-default-features
+cargo clippy --lib --no-default-features -- -D warnings
+
+# Run all unit, integration, property, and doc tests
+cargo test --workspace --all-targets --all-features
+cargo test --workspace --doc --all-features
 
 # Run Clippy with all pedantic/nursery/restriction lints denied
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Build documentation including private items with zero warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --document-private-items
+
+# Verify 100.00% function, line, and branch coverage
+cargo +nightly llvm-cov --branch --workspace --all-targets --all-features --summary-only
 ```
 
 ---

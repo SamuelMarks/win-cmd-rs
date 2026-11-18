@@ -1603,16 +1603,18 @@ impl VirtualFileSystem for HostOsVfs {
         self.inner.unmount_drive(drive);
     }
 
-    /// Translates a resolved [`WindowsPath`] to a real host [`PathBuf`] if backed by a mounted drive or UNC share.
+    /// Translates a resolved [`WindowsPath`] to a real host [`crate::types::NativeBackingPath`] if backed by a mounted drive or UNC share.
     ///
     /// # Arguments
     /// * `win_path` - Resolved [`WindowsPath`].
     ///
     /// # Returns
-    /// `Some(PathBuf)` if `win_path`'s drive or UNC share is mounted, or `None` otherwise.
-    fn resolve_host_path(&self, win_path: &WindowsPath) -> Option<PathBuf> {
+    /// `Some(NativeBackingPath)` if `win_path`'s drive or UNC share is mounted, or `None` otherwise.
+    fn resolve_host_path(&self, win_path: &WindowsPath) -> Option<crate::types::NativeBackingPath> {
         let base = self.mount_root_for(win_path, "").ok()?;
-        Some(Self::to_host_path_from_base(base, &win_path.components))
+        Some(crate::types::NativeBackingPath::from_path_buf(
+            Self::to_host_path_from_base(base, &win_path.components),
+        ))
     }
 
     /// Configures the simulated free disk space (in bytes) for `drive` on [`InMemoryVfs`] or [`HostOsVfs`].

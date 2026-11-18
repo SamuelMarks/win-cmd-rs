@@ -1,9 +1,9 @@
 # `win-cmd-rs` Architecture
 
-`win-cmd-rs` is a single-crate Rust workspace (`#![forbid(unsafe_code)]`, sole runtime dependency `derive_more`) providing two tightly integrated engines over a shared, lossless parsing and virtual-filesystem foundation:
+`win-cmd-rs` is a `#![no_std]` + `alloc` core Rust architecture (`#![forbid(unsafe_code)]` across the entire core library, sole runtime dependency `derive_more`) providing two tightly integrated engines over a shared, lossless parsing and virtual-filesystem foundation across Windows, Linux, macOS, and 32-bit Protected-Mode MS-DOS (`DJGPP` + `CWSDPMI`):
 
-1. **`wincmd`** — A bug-for-bug, quirk-for-quirk cross-platform Windows Command Prompt (`cmd.exe`) interpreter.
-2. **`wincheck`** — A `ShellCheck`-style 50-rule static analysis and lossless CST auto-fixing engine for `.bat`, `.cmd`, and interactive `cmd.exe` inputs.
+1. **`wincmd` (`WINCMD.EXE`)** — A bug-for-bug, quirk-for-quirk cross-platform Windows Command Prompt (`cmd.exe`) and MS-DOS (`COMMAND.COM`) interpreter.
+2. **`wincheck` (`WINCHECK.EXE`)** — A `ShellCheck`-style 60-rule static analysis (`CMD0001`–`CMD5010`) and lossless CST auto-fixing engine for `.bat`, `.cmd`, MS-DOS `COMMAND.COM`, and interactive `cmd.exe` inputs.
 
 ---
 
@@ -19,41 +19,44 @@
 8. [Virtual File System, Win32 Paths & Polynomial Globbing (`src/vfs/`)](#8-virtual-file-system-win32-paths--polynomial-globbing-srcvfs)
 9. [`wincheck` Static Analyzer & Composable `CstRewriter` (`src/linter/`)](#9-wincheck-static-analyzer--composable-cstrewriter-srclinter)
 10. [Unified `CmdError` Architecture & Verification Gates (`src/error.rs`, `tests/`)](#10-unified-cmderror-architecture--verification-gates-srcerrorrs-tests)
+11. [`#![no_std]` + `alloc` Core, `DosKernelApi`, `%TEMP%` Spooling & DPMI Memory Layout (`src/dos/`, `crates/wincmd-dos/`)](#11-no_std--alloc-core-doskernelapi-temp-spooling--dpmi-memory-layout-srcdos-crateswincmd-dos)
 
 ---
 
 ## 1. High-Level System & Module Dependency Graph
 
-Every layer in `win-cmd-rs` is strictly acyclic: low-level location, domain, and error primitives (`span`, `types`, `error`) sit at the base; `reader`, `parser`, and `vfs` form the middle layer; `runtime`, `builtins`, and `linter` implement execution and static analysis; and `cli` plus the thin `src/bin/{wincmd,wincheck}.rs` entrypoints bind OS streams and arguments.
+Every layer in `win-cmd-rs` is strictly acyclic: low-level location, domain, and error primitives (`span`, `types`, `error`) sit at the base; `dos`, `reader`, `parser`, and `vfs` form the middle `#![no_std]` + `alloc` layer; `runtime`, `builtins`, and `linter` implement execution and static analysis; and `cli` plus the thin host (`src/bin/`) and DJGPP (`crates/wincmd-dos/`) binary entrypoints bind OS streams, `HostOsVfs`, or `DjgppDosKernel`.
 
 ```mermaid
 flowchart TB
-    subgraph Binaries["Binary Entrypoints & CLI Layer"]
-        BIN_CMD["src/bin/wincmd.rs"]
-        BIN_CHK["src/bin/wincheck.rs"]
-        CLI["src/cli/<br/>wincmd_cli, wincheck_cli, Streaming REPL & Fix Driver"]
+    subgraph Binaries["Host & MS-DOS Binary Entrypoints"]
+        BIN_HOST["src/bin/{wincmd,wincheck}.rs<br/>(Host std OS)"]
+        BIN_DOS["crates/wincmd-dos/<br/>WINCMD.EXE & WINCHECK.EXE (DJGPP + CWSDPMI)"]
+        CLI["src/cli/<br/>Stream-Generic CLI & REPL (#![no_std] + std)"]
     end
 
-    subgraph Engines["Execution & Static Analysis Engines"]
-        RT["src/runtime/<br/>Interpreter, EnvStack, Arithmetic, Registry, CmdIo"]
-        BI["src/builtins/<br/>37 Core Built-In Dispatchers & 17 Utility Shims"]
-        LINT["src/linter/<br/>50 Lint Rules, Directives, Formatters & CstRewriter"]
+    subgraph Engines["Execution & Static Analysis Engines (#![no_std] + alloc)"]
+        RT["src/runtime/<br/>Interpreter, DosProcessSpawner, EnvStack, Arithmetic, Registry"]
+        BI["src/builtins/<br/>Core Built-Ins, MS-DOS Commands (TRUENAME/CTTY/LH/MEM) & Shims"]
+        LINT["src/linter/<br/>60 Lint Rules (CMD0001-CMD5010), Directives, Formatters & CstRewriter"]
     end
 
-    subgraph Frontend["Unified Parsing, Expansion & VFS Layer"]
+    subgraph Frontend["Unified Parsing, Expansion, VFS & DOS Abstraction (#![no_std] + alloc)"]
         PARSE["src/parser/<br/>Lexer, Lossless CST, AST Lowerer & Phases 1-4"]
-        READ["src/reader/<br/>BatchFrameReader, CodePages & LogicalLineBuffer"]
-        VFS["src/vfs/<br/>VirtualFileSystem, InMemoryVfs, HostOsVfs, Globs & Devices"]
+        READ["src/reader/<br/>BatchFrameReader, OEM/UTF CodePages & LogicalLineBuffer"]
+        VFS["src/vfs/<br/>VirtualFileSystem, InMemoryVfs, DosFatVfs & std HostOsVfs"]
+        DOS["src/dos/<br/>DosKernelApi, SimulatedDosKernel, DosConsoleIo & FAT/PSP Types"]
     end
 
-    subgraph Core["Foundational Primitives"]
+    subgraph Core["Foundational Primitives (#![no_std] + alloc)"]
         SPAN["src/span.rs<br/>ByteOffset, Span, SourceFile & SourceMap"]
-        TYPES["src/types.rs<br/>ExitCode, DriveLetter, EnvVarName, CodePage, Mode Enums"]
-        ERR["src/error.rs<br/>Unified CmdError (derive_more)"]
+        TYPES["src/types.rs<br/>ExitCode, DriveLetter, IoErrorKind, ShellDialect, MemoryProfile"]
+        ERR["src/error.rs<br/>Unified CmdError (derive_more, core::error::Error)"]
     end
 
-    BIN_CMD --> CLI
-    BIN_CHK --> CLI
+    BIN_HOST --> CLI
+    BIN_DOS --> CLI
+    BIN_DOS --> DOS
     CLI --> RT
     CLI --> LINT
     CLI --> VFS
@@ -62,12 +65,17 @@ flowchart TB
     RT --> PARSE
     RT --> READ
     RT --> VFS
+    RT --> DOS
 
     LINT --> PARSE
     LINT --> READ
+    LINT --> VFS
 
+    VFS --> DOS
     PARSE --> READ
     PARSE --> VFS
+    DOS --> TYPES
+    DOS --> ERR
     READ --> SPAN
     READ --> TYPES
     READ --> ERR
@@ -157,7 +165,7 @@ sequenceDiagram
 Every diagnostic in `wincheck` and every syntax error in `wincmd` maps expanded characters back to exact 1-based `(LineNumber, ColumnNumber)` coordinates in the original raw file—even after BOM stripping, `^\r\n` line continuations, and multi-pass variable expansions.
 
 - **`SourceMap` & `SourceFile` (`src/span.rs`)**: Stores raw bytes, decoded text, precomputed newline byte offsets (`O(log L)` binary search for `line_col`), and BOM length (`UTF-8` 3-byte, `UTF-16LE/BE` 2-byte).
-- **`CodePage` (`src/reader/encoding.rs`)**: Supports `Utf8` (`65001`), `OemUnitedStates` (`437`), `OemMultilingualLatin1` (`850`), `WindowsLatin1` (`1252`), `Utf16Le` (`1200`), `Utf16Be` (`1201`), and `Ascii` (`20127`), plus `0x1A` (`SUB` / `Ctrl+Z`) logical EOF truncation.
+- **`CodePage` (`src/reader/encoding.rs`)**: Supports `Utf8` (`65001`), `OemUnitedStates` (`437`), `OemMultilingualLatin1` (`850`), `OemLatin2` (`852`), `OemNordic` (`865`), `OemCyrillic` (`866`), `WindowsLatin1` (`1252`), `Utf16Le` (`1200`), `Utf16Be` (`1201`), and `Ascii` (`20127`), plus `0x1A` (`SUB` / `Ctrl+Z`) logical EOF truncation.
 - **`ProvenanceMode` (`src/reader/char_map.rs`)**:
   - `ProvenanceMode::Full`: Tracks per-character `ExpansionOrigin` (`LiteralSource`, `CaretContinuation`, `PositionalParam`, `ImmediateEnvVar`, `ForVariable`, `DelayedEnvVar`).
   - `ProvenanceMode::Lightweight`: Elides heap `String` clones inside `ExpansionOrigin` on hot interpreter loops when sub-word provenance is not needed.
@@ -414,19 +422,19 @@ flowchart TD
     REDIR -- "Redirection I/O Error" --> FAIL_REDIR["Emit stderr &amp; set ERRORLEVEL=1<br/>(Command body NOT executed)"]
     REDIR -- "Success" --> DRV{"Drive Switch?<br/>(e.g. 'D:')"}
     DRV -- "Yes" --> SET_DRV["vfs.set_current_drive(D:)"]
-    DRV -- "No" --> INT{"Tier 1: Core Internal Built-In?<br/>(try_dispatch_internal: 37 dispatchers)"}
-    INT -- "Match" --> RUN_INT["env_cmds / flow_cmds / fs_cmds / console_cmds"]
-    INT -- "None" --> SHIM{"Tier 2: Cross-Platform Utility Shim?<br/>(try_dispatch_shim: 17 shims)"}
-    SHIM -- "Match" --> RUN_SHIM["shims_search / shims_admin / CMD subshell"]
+    DRV -- "No" --> INT{"Tier 1: Core Internal Built-In?<br/>(try_dispatch_internal: 41 command names)"}
+    INT -- "Match" --> RUN_INT["env_cmds / flow_cmds / fs_cmds / console_cmds / dos_cmds"]
+    INT -- "None" --> SHIM{"Tier 2: Cross-Platform Utility Shim?<br/>(try_dispatch_shim: 18 shims)"}
+    SHIM -- "Match" --> RUN_SHIM["shims_search / shims_admin / dos_cmds (MEM) / CMD"]
     SHIM -- "None" --> RESOLVE["Tier 3: Resolve via CWD + %PATH% + %PATHEXT%"]
     RESOLVE -- ".bat / .cmd" --> RUN_BAT["Push BatchCallFrame<br/>(Transfer control if no CALL; return if CALL)"]
     RESOLVE -- "ASSOC + FTYPE match" --> RUN_ASSOC["Expand FTYPE template (%1, %*) &amp; execute"]
-    RESOLVE -- ".exe / .com / host binary" --> SPAWN["Tier 4: ProcessSpawner::spawn_external<br/>std::thread::scope (stdin writer + stdout/stderr readers)"]
+    RESOLVE -- ".exe / .com / host binary" --> SPAWN["Tier 4: ProcessSpawner::spawn_external<br/>HostProcessSpawner (thread::scope) or DosProcessSpawner (%TEMP% spool)"]
     RESOLVE -- "Not Found" --> ERR_9009["CmdError::UnknownCommand<br/>(ERRORLEVEL = 9009)"]
 ```
 
 - **Zero-Copy VFS Sharing Across Pipelines (`cmd1 | cmd2`)**: Instead of deep-cloning `InMemoryVfs` for both sides of a pipe, `execute_pipeline` snapshots only per-drive CWDs (`VfsCwdSnapshot`), runs the left and right subshells with isolated `EnvironmentStack` and `ConsoleState` instances against the shared `VirtualFileSystem`, and restores the parent's CWD snapshot afterward.
-- **Deadlock-Free Child Process Spawning (`HostProcessSpawner`)**: Uses `std::thread::scope` to concurrently stream `stdin` on a writer thread (closing child `stdin` immediately upon EOF) while draining `stdout` and `stderr` on two reader threads prior to `child.wait()`, preventing OS pipe buffer deadlocks on >64 KiB payloads.
+- **Deadlock-Free Host & Single-Tasking DOS Child Spawning**: On host OSes (`std`), `HostProcessSpawner` uses `std::thread::scope` to concurrently stream `stdin` on a writer thread while draining `stdout` and `stderr` on two reader threads prior to `child.wait()`, preventing OS pipe buffer deadlocks on >64 KiB payloads. On MS-DOS, `DosProcessSpawner` spools redirected handles through collision-free 8.3 `%TEMP%` files around `INT 21h AH=4Bh`.
 
 ---
 
@@ -444,9 +452,11 @@ flowchart TD
 
     BACKEND -- "InMemoryVfs" --> MEM["Inode Graph &amp; VfsRoot (Drive | Unc)<br/>• Arc-shared hardlinks (InodeId)<br/>• 32-hop ReparsePoint symlinks/junctions<br/>• NT 8.3 names (PROGRA~1..4, PRxxxx~1 hash &gt;=5)"]
     BACKEND -- "HostOsVfs" --> HOST["Host Directory Mount Table (C:, D:, Z:)<br/>• Case-insensitive POSIX directory segment walker<br/>• FileAttributeFlags sidecar (R, H, S, A, L)<br/>• SandboxContainment::Contained symlink guard"]
+    BACKEND -- "DosFatVfs<K: DosKernelApi>" --> DOSFAT["MS-DOS FAT12/16/32 &amp; DOS 7 LFN<br/>• Strict 8.3 truncation or INT 21h AX=71xxh LFN<br/>• 2-second PackedDosTimestamp &amp; FatAttributeByte<br/>• Cross-drive copy+delete MOVE fallback"]
 
     MEM --> GLOB["Win32 Glob Engine (vfs/glob.rs)<br/>FsRtlIsNameInExpression (DOS_STAR, DOS_QM, DOS_DOT)<br/>O(|P| * |N|) Iterative DP Matcher"]
     HOST --> GLOB
+    DOSFAT --> GLOB
 ```
 
 ### Polynomial-Time Win32 Wildcard Engine (`src/vfs/glob.rs`)
@@ -457,7 +467,7 @@ Win32 wildcard rules (`FsRtlIsNameInExpression`) differ sharply from POSIX globs
 
 ## 9. `wincheck` Static Analyzer & Composable `CstRewriter` (`src/linter/`)
 
-`wincheck` combines file-level encoding/directive inspection, CST syntax-recovery diagnostics, AST semantic passes, and a 4-stage composable CST tree rewriter (`CstRewriter`). Crucially, **both `wincheck --diff` and `wincheck --fix` invoke the exact same `CstRewriter` pipeline**, guaranteeing 100% agreement between previewed diffs and rewritten scripts.
+`wincheck` combines file-level encoding/directive inspection, CST syntax-recovery diagnostics, AST semantic passes (including the `CMD5001`–`CMD5010` MS-DOS `COMMAND.COM` portability analyzer), and a 5-stage composable CST tree rewriter (`CstRewriter`). Crucially, **both `wincheck --diff` and `wincheck --fix` invoke the exact same `CstRewriter` pipeline**, guaranteeing 100% agreement between previewed diffs and rewritten scripts.
 
 ```mermaid
 flowchart TD
@@ -465,9 +475,9 @@ flowchart TD
     SRC --> CST["cst_parser::parse_script_cst<br/>(RecoveryMode::Recovering)"]
     CST --> PEG_DIAG["Convert PegDiagnostics<br/>(CMD1002, CMD1003, CMD1006, CMD1013, CMD1014, CMD2014)"]
     CST --> LOWER["lower_cst_to_ast_with_mode<br/>(PopulateSubwordParts)"]
-    LOWER --> AST_PASS["passes/mod.rs<br/>50-Rule Semantic Visitors:<br/>• Block %VAR% &amp; dynamic vars (CMD2001, CMD2009)<br/>• Labels, CALL, EXIT, ROBOCOPY, pipes (CMD3xxx)<br/>• Quoting, SET, RD /S /Q root guard (CMD2xxx, CMD4xxx)"]
+    LOWER --> AST_PASS["passes/mod.rs &amp; passes/dos_compat.rs<br/>60-Rule Semantic Visitors (CMD0001-CMD5010):<br/>• Block %VAR% &amp; dynamic vars (CMD2001, CMD2009)<br/>• Labels, CALL, EXIT, ROBOCOPY, pipes (CMD3xxx)<br/>• Quoting, SET, RD /S /Q root guard (CMD2xxx, CMD4xxx)<br/>• MS-DOS COMMAND.COM portability (CMD5001-CMD5010)"]
 
-    DIR --> MERGE["Filter by SuppressionTable, Severity &amp; Include/Exclude<br/>Sort deterministically by Span &amp; RuleId"]
+    DIR --> MERGE["Filter by SuppressionTable, Dialect, Severity &amp; Include/Exclude<br/>Sort deterministically by Span &amp; RuleId"]
     PEG_DIAG --> MERGE
     AST_PASS --> MERGE
     MERGE --> FMT["formatters.rs<br/>TTY | GCC | JSON | SARIF v2.1.0"]
@@ -477,34 +487,131 @@ flowchart TD
         P_DELAY --> P_STRUCT["Pass 2: StructuralSyntaxFixPass<br/>IF ==, FOR IN/DO, (...) ELSE (...), SET #quot;k=v#quot;, CD /D, CALL, ECHO("]
         P_STRUCT --> P_DIAL["Pass 3: ExecutionModePercentPass<br/>Batch (%%I, 100%%) &lt;-&gt; REPL (%I, 100%)"]
         P_DIAL --> P_QUOTE["Pass 4: QuoteUnquotedVariablesPass<br/>Quote paths/IF/redirs &amp; #quot;%1#quot; -> #quot;%~1#quot;"]
-        P_QUOTE --> OUT_TXT["Recompute Spans &amp; Emit Lossless Source<br/>(Myers/LCS Unified Diff or stdout)"]
+        P_QUOTE --> P_DOS["Pass 5: MsDosPortabilityPass (MsDos622)<br/>Split &amp; chains onto lines + append explicit :EOF"]
+        P_DOS --> OUT_TXT["Recompute Spans &amp; Emit Lossless Source<br/>(Myers/LCS Unified Diff or VFS --in-place)"]
     end
 
     CST -. "When --diff or --fix" .-> R0
 ```
 
 Why multi-pass CST re-parsing between rewrite stages matters:
-- If Pass 2 repairs an unparenthesized `IF %x% = 1 echo %x% else echo no` into `IF %x% == 1 (echo(%x%) else (echo no)` and wraps `SET y = 2 ` into `SET "y=2"`, Pass 4 immediately sees the newly structured CST nodes without byte-offset collisions or corrupted spans, and `rewrite_script` is **idempotent** (`rewrite(rewrite(s)) == rewrite(s)`).
+- If Pass 2 repairs an unparenthesized `IF %x% = 1 echo %x% else echo no` into `IF %x% == 1 (echo(%x%) else (echo no)` and wraps `SET y = 2 ` into `SET "y=2"`, Pass 4 immediately sees the newly structured CST nodes without byte-offset collisions or corrupted spans, while under `ShellDialect::MsDos622` NT-only rewrites are gated off and Pass 5 (`MsDosPortabilityPass`) decomposes `&` chains and `GOTO :EOF` cleanly. Every `rewrite_script` configuration is **idempotent** (`rewrite(rewrite(s)) == rewrite(s)`).
 
 ---
 
 ## 10. Unified `CmdError` Architecture & Verification Gates (`src/error.rs`, `tests/`)
 
-Every fallible operation across all 61 source files (59 library modules and 2 binary entrypoints) returns `Result<T, CmdError>`—a single strongly typed enum powered by `derive_more::{Display, Error, From, IsVariant}` with zero `anyhow`, `thiserror`, or `Box<dyn Error>` erasure.
+Every fallible operation across both the `#![no_std]` core (`src/`) and the DJGPP MS-DOS adapter (`crates/wincmd-dos/`) returns `Result<T, CmdError>`—a single strongly typed enum powered by `derive_more::{Display, Error, From, IsVariant}` implementing `core::error::Error` with zero `anyhow`, `thiserror`, or `Box<dyn Error>` erasure.
 
 ```mermaid
 flowchart LR
-    SUB["Reader / Parser / VFS / Arithmetic / Runtime / Builtins / Linter / CLI"] --> ERR["CmdError<br/>derive(Display, Error, From, IsVariant)"]
-    ERR --> MSG[".cmd_exe_message()<br/>Authentic Windows stderr text"]
+    SUB["Reader / Parser / VFS / DOS / Arithmetic / Runtime / Builtins / Linter / CLI"] --> ERR["CmdError<br/>derive(Display, Error, From, IsVariant)"]
+    ERR --> MSG[".cmd_exe_message()<br/>Authentic cmd.exe &amp; COMMAND.COM stderr text"]
     ERR --> CODE[".exit_code()<br/>ExitCode (1, 2, 9009, ...)"]
     ERR --> SP[".span()<br/>Optional Source Span"]
 
     subgraph Gates["Automated Quality & Invariant Gates (tests/)"]
-        G1["doc_and_quality_gates.rs<br/>100% File/Type/Fn/#Arguments/#Returns/#Errors<br/>Zero unwrap/expect/panic/allow/unsafe"]
-        G2["property_invariants.rs<br/>CST Round-Trip Losslessness, Case-Insensitive VFS,<br/>&lt;1ms Adversarial Globbing &amp; Safe Rewriter Equivalence"]
-        G3["cli_binaries.rs<br/>End-to-End wincmd &amp; wincheck Subprocess Pipe/File Tests"]
+        G1["doc_and_quality_gates.rs<br/>100% File/Type/Fn/#Arguments/#Returns/#Errors/#Safety<br/>60-Rule Catalog &amp; Zero unwrap/expect/panic/allow"]
+        G2["property_invariants.rs<br/>CST Round-Trip, FAT Timestamps, 8.3 Names, PSP Tails,<br/>256-Byte OEM Codepage Bijections &amp; Rewriter Idempotence"]
+        G3["cli_binaries.rs &amp; FreeDOS QEMU CI<br/>Host Subprocess Tests + Headless FreeDOS Boot Verification"]
         G4["cargo +nightly llvm-cov --branch<br/>100.00% Functions, Lines &amp; Short-Circuit Branches"]
     end
 
     SUB -. "Verified by" .-> Gates
+```
+
+---
+
+## 11. `#![no_std]` + `alloc` Core, `DosKernelApi`, `%TEMP%` Spooling & DPMI Memory Layout (`src/dos/`, `crates/wincmd-dos/`)
+
+### 11.1 100% Safe `#![no_std]` Hardware Boundary (`DosKernelApi`)
+
+To run natively on MS-DOS without sacrificing `#![forbid(unsafe_code)]` or 100.00% host branch coverage, all MS-DOS domain logic lives in `src/dos/`, `src/vfs/dos.rs`, and `src/runtime/dos_exec.rs` against the safe `DosKernelApi` trait. Host tests execute against the deterministic in-memory `SimulatedDosKernel`, while `crates/wincmd-dos` binds `DjgppDosKernel` to DJGPP `libc` and DPMI `INT 10h`/`11h`/`16h`/`21h`/`31h`:
+
+```mermaid
+flowchart TB
+    subgraph SafeCore["100% Safe #![no_std] + alloc Core (src/ — #![forbid(unsafe_code)])"]
+        INTERP_DOS["Interpreter + Linter + CLI"]
+        DOS_VFS["DosFatVfs&lt;K: DosKernelApi&gt;<br/>8.3 / DOS 7 LFN, FatAttributeByte, PackedDosTimestamp"]
+        DOS_EXEC["DosProcessSpawner&lt;K: DosKernelApi&gt;<br/>126-byte PspCommandTail, CMDLINE=, %TEMP% Spooling"]
+        DOS_CON["DosConsoleIo&lt;K: DosKernelApi&gt;<br/>BIOS Scan-Code Line Editor (F1/F3/F7/F8/F9, Tab) &amp; INT 10h CLS"]
+        KTRAIT["pub trait DosKernelApi<br/>(Zero unsafe methods)"]
+    end
+
+    subgraph HostTest["Host Verification (Linux / macOS / Windows)"]
+        SIM["SimulatedDosKernel (src/dos/sim.rs)<br/>• In-memory FAT16/32 &amp; strict 8.3 truncation<br/>• 2-second FAT timestamp rounding<br/>• Scripted FaultRule queue &amp; .COM/.EXE handlers<br/>• 100.00% fn / line / branch llvm-cov"]
+    end
+
+    subgraph TargetDos["MS-DOS Target Adapter (crates/wincmd-dos/)"]
+        DJ_K["DjgppDosKernel (#![forbid(unsafe_code)])<br/>Maps DosExtendedError -> CmdError::from_dos_error"]
+        DJ_FFI["ffi.rs + alloc_djgpp.rs + panic_dos.rs<br/>• DjgppAllocator (malloc/free + &gt;8B alignment header)<br/>• Zero-heap stack #[panic_handler] to fd 2<br/>• INT 21h/16h/11h/10h/31h &amp; spawnvpe"]
+    end
+
+    INTERP_DOS --> DOS_VFS & DOS_EXEC & DOS_CON
+    DOS_VFS & DOS_EXEC & DOS_CON --> KTRAIT
+    KTRAIT <|.. SIM
+    KTRAIT <|.. DJ_K
+    DJ_K --> DJ_FFI
+```
+
+### 11.2 Single-Tasking `%TEMP%` Pipeline Spooling (`src/runtime/dos_exec.rs`)
+
+Because real-mode MS-DOS is single-tasking and has no concurrent anonymous kernel pipes, `Interpreter::execute_pipeline` (`PipeExecutionMode::InMemoryBuffered`) and `DosProcessSpawner` execute multi-stage pipelines (`prog1.com | builtin | prog2.exe`) sequentially via collision-free 8.3 temporary spool files (`_WCI0000.TMP`, `_WCO0000.TMP`, `_WCE0000.TMP`) in `%TEMP%` -> `%TMP%` -> active drive root, polling `DosKernelApi::poll_ctrl_break()` between stages and unconditionally cleaning up spool files:
+
+```mermaid
+sequenceDiagram
+    participant Sh as Interpreter (execute_pipeline)
+    participant Sp as DosProcessSpawner
+    participant K as DosKernelApi (DjgppDosKernel)
+    participant P1 as Child 1 (PROG1.COM)
+    participant P2 as Child 2 (PROG2.EXE)
+
+    Sh->>Sp: spawn_external(PROG1.COM, stdin="")
+    Sp->>K: memory_stats() + pack PSP tail (&lt;=126B + CMDLINE=)
+    Sp->>K: exec_child(stdout -> C:\TEMP\_WCO0000.TMP)
+    K->>P1: INT 21h AH=4Bh EXEC (dup2 fd 1 -> _WCO0000.TMP)
+    P1-->>K: INT 21h AH=4Ch exit + AH=4Dh return code
+    Sp->>K: read_file_bytes(_WCO0000.TMP) & delete_file(_WCO0000.TMP)
+    Sp-->>Sh: Stage 1 stdout bytes
+
+    Sh->>K: poll_ctrl_break() (abort cleanly if Ctrl+C/Break)
+
+    Sh->>Sp: spawn_external(PROG2.EXE, stdin=Stage 1 bytes)
+    Sp->>K: write_file_bytes(C:\TEMP\_WCI0001.TMP, Stage 1 bytes)
+    Sp->>K: exec_child(stdin -> _WCI0001.TMP, stdout -> _WCO0001.TMP)
+    K->>P2: INT 21h AH=4Bh EXEC (dup2 fd 0/1)
+    P2-->>K: ExitCode
+    Sp->>K: read_file_bytes(_WCO0001.TMP) & delete _WCI0001/_WCO0001/_WCE0001
+    Sp-->>Sh: Final pipeline output & ExitCode
+```
+
+### 11.3 32-Bit Protected-Mode DJGPP + `CWSDPMI` Memory Layout & 16-Bit CPU Guard
+
+Compiling `WINCMD.EXE` and `WINCHECK.EXE` as 32-bit protected-mode COFF images stubbed with `CWSDPMI` solves the classic 640 KiB MS-DOS conventional memory crunch while preserving clean behavior on 16-bit 8086/286 hardware:
+
+```mermaid
+flowchart LR
+    subgraph Boot["MZ Header & 16-Bit Real-Mode Entry (crates/wincmd-dos/stub/)"]
+        MZ["cpu_guard_stub.asm<br/>Check FLAGS bits 12..15"]
+        REJECT["8086 / 80186 / 80286:<br/>INT 21h AH=09h 'requires 80386+'<br/>Exit AX=4C01h (Never hangs!)"]
+        STUB["80386+: Chain to DJGPP DPMI Stub<br/>Load CWSDPMI.EXE (DPMI 0.9+)"]
+        MZ -- "Pre-386" --> REJECT
+        MZ -- "386+" --> STUB
+    end
+
+    subgraph Conv["Conventional RAM (0 KiB – 640 KiB)"]
+        DOS_K["MS-DOS Kernel, Drivers &amp; COMMAND.COM (~45-65 KiB)"]
+        DJ_STUB["DJGPP Real-Mode Transfer Buffer &amp; DPMI Stub (~24-40 KiB)"]
+        FREE_CONV["~535–570 KiB FREE Conventional Arena!<br/>Available for INT 21h AH=4Bh Child .COM / .EXE Programs"]
+    end
+
+    subgraph Ext["Extended XMS / DPMI 32-Bit Flat Memory (&gt; 1 MiB, 4–16+ MiB)"]
+        CODE["WINCMD.EXE / WINCHECK.EXE<br/>32-Bit Protected-Mode Code &amp; Rodata (~550–825 KiB)"]
+        HEAP["DjgppAllocator Flat 32-Bit Rust Heap<br/>AST, Lossless CST, SourceMap, VFS &amp; Pipe Buffers<br/>Bounded by MemoryProfile (DosCompact4MiB / DosStandard8MiB)"]
+    end
+
+    STUB --> DJ_STUB
+    STUB --> CODE
+    CODE --> HEAP
+    DJ_STUB -. "INT 21h AH=4Bh EXEC" .-> FREE_CONV
 ```

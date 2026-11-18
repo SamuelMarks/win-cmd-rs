@@ -4,7 +4,11 @@
 //! Operates against [`Interpreter`]'s [`crate::runtime::ConsoleState`] and [`crate::runtime::SessionConfig`],
 //! streaming interactive prompts and output over [`CmdIo`].
 
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 use crate::error::CmdError;
 use crate::parser::ast::SpannedWord;
@@ -60,10 +64,11 @@ pub(super) fn cmd_echo(
     Ok(FlowControl::Continue)
 }
 
-/// Built-in `VER` command, displaying the configured Windows version banner.
+/// Built-in `VER` command (`VER [/R]`), displaying the configured Windows or MS-DOS version banner.
 ///
 /// # Arguments
 /// * `interp` - Mutable [`Interpreter`] session.
+/// * `args` - Parsed argument words (optional `/R` revision flag on MS-DOS).
 /// * `io` - Mutable [`CmdIo`] stream.
 ///
 /// # Returns
@@ -73,9 +78,15 @@ pub(super) fn cmd_echo(
 /// Returns [`CmdError::IoFailure`] if writing to `io` fails.
 pub(super) fn cmd_ver(
     interp: &mut Interpreter,
+    args: &[SpannedWord],
     io: &mut dyn CmdIo,
 ) -> Result<FlowControl, CmdError> {
     io.write_stdout_str(&format!("{CRLF}{}{CRLF}", interp.config.version_banner))?;
+    if args.iter().any(|w| w.unquoted().eq_ignore_ascii_case("/R")) {
+        io.write_stdout_str(&format!(
+            "Revision A{CRLF}DOS is in HMA (32-bit DPMI){CRLF}"
+        ))?;
+    }
     interp.record_success();
     Ok(FlowControl::Continue)
 }
@@ -119,7 +130,7 @@ pub(super) fn cmd_vol(
     Ok(FlowControl::Continue)
 }
 
-/// Built-in `CLS` command, emitting the ANSI terminal clear sequence.
+/// Built-in `CLS` command, clearing via BIOS VGA attributes, ANSI CSI escapes, or plain teletype newline.
 ///
 /// # Arguments
 /// * `interp` - Mutable [`Interpreter`] session.
@@ -129,12 +140,28 @@ pub(super) fn cmd_vol(
 /// `Ok(FlowControl::Continue)` on completion.
 ///
 /// # Errors
-/// Returns [`CmdError::IoFailure`] if writing to `io` fails.
+/// Returns [`CmdError::IoFailure`] if writing to `io` or clearing the BIOS screen fails.
 pub(super) fn cmd_cls(
     interp: &mut Interpreter,
     io: &mut dyn CmdIo,
 ) -> Result<FlowControl, CmdError> {
-    io.write_stdout_str(&format!("{ESC_CHAR}[2J{ESC_CHAR}[H"))?;
+    match interp.console.render_backend {
+        crate::types::ConsoleRenderBackend::AnsiSysEscape => {
+            io.write_stdout_str(&format!("{ESC_CHAR}[2J{ESC_CHAR}[H"))?;
+        }
+        crate::types::ConsoleRenderBackend::BiosVgaAttribute => {
+            let attr = interp
+                .console
+                .console_color
+                .map_or(0x07, ConsoleColor::to_vga_attribute_byte);
+            if let Some(kernel) = &mut interp.proc_env.dos_kernel {
+                kernel.clear_console_screen(attr)?;
+            }
+        }
+        crate::types::ConsoleRenderBackend::DumbTeletype => {
+            io.write_stdout_str(CRLF)?;
+        }
+    }
     interp.mark_cmd_succeeded();
     Ok(FlowControl::Continue)
 }
@@ -149,7 +176,7 @@ pub(super) fn cmd_cls(
 /// `Ok(FlowControl::Continue)` on valid or empty color attribute.
 ///
 /// # Errors
-/// Returns [`CmdError`] (`InvalidColorAttribute`) if `attr` is invalid hex or fg == bg.
+/// Returns [`CmdError`] (`InvalidColorAttribute` or `IoFailure`) if `attr` is invalid or BIOS clearing fails.
 pub(super) fn cmd_color(
     interp: &mut Interpreter,
     args: &[SpannedWord],
@@ -159,6 +186,15 @@ pub(super) fn cmd_color(
         interp.console.console_color = Some(color);
     } else {
         interp.console.console_color = None;
+    }
+    if interp.console.render_backend == crate::types::ConsoleRenderBackend::BiosVgaAttribute
+        && let Some(kernel) = &mut interp.proc_env.dos_kernel
+    {
+        let attr = interp
+            .console
+            .console_color
+            .map_or(0x07, ConsoleColor::to_vga_attribute_byte);
+        kernel.clear_console_screen(attr)?;
     }
     interp.record_success();
     Ok(FlowControl::Continue)
@@ -203,9 +239,7 @@ pub(super) fn cmd_date(
     {
         io.write_stdout_str(&format!("{}{CRLF}", interp.proc_env.env.virtual_date))?;
     } else if let Some(new_d) = args.first() {
-        new_d
-            .unquoted()
-            .clone_into(&mut interp.proc_env.env.virtual_date);
+        apply_new_virtual_date(interp, new_d.unquoted())?;
     } else {
         let fmt_hint = match interp.config.locale.date_format {
             crate::types::DateFormatStyle::DayMonthDateYearUs => "(mm-dd-yy)",
@@ -218,13 +252,49 @@ pub(super) fn cmd_date(
         ))?;
         let line = io.read_stdin_line()?.unwrap_or_default();
         if !line.trim().is_empty() {
-            line.trim()
-                .clone_into(&mut interp.proc_env.env.virtual_date);
+            apply_new_virtual_date(interp, line.trim())?;
         }
         io.write_stdout_str(CRLF)?;
     }
     interp.record_success();
     Ok(FlowControl::Continue)
+}
+
+/// Updates `virtual_date` and synchronizes [`crate::dos::DosKernelApi::set_current_date`] if `raw` parses as `YYYY-MM-DD` or `MM-DD-YYYY`.
+///
+/// # Arguments
+/// * `interp` - Mutable [`Interpreter`].
+/// * `raw` - Date string entered by user.
+///
+/// # Returns
+/// `Ok(())` on success.
+///
+/// # Errors
+/// Propagates [`CmdError`] if an attached DOS kernel rejects the date.
+fn apply_new_virtual_date(interp: &mut Interpreter, raw: &str) -> Result<(), CmdError> {
+    if let Some(kernel) = &mut interp.proc_env.dos_kernel {
+        let mut parts = raw.split(['-', '/']);
+        if let (Some(a), Some(b), Some(c)) = (parts.next(), parts.next(), parts.next())
+            && parts.next().is_none()
+        {
+            let parsed_ymd = if a.len() == 4 {
+                a.parse::<u16>()
+                    .ok()
+                    .zip(b.parse::<u8>().ok())
+                    .zip(c.parse::<u8>().ok())
+            } else {
+                c.parse::<u16>()
+                    .ok()
+                    .zip(a.parse::<u8>().ok())
+                    .zip(b.parse::<u8>().ok())
+            };
+            if let Some(((y, m), d)) = parsed_ymd {
+                kernel.set_current_date(y, m, d)?;
+            }
+        }
+    }
+    raw.clone_into(&mut interp.proc_env.env.virtual_date);
+    Ok(())
 }
 
 /// Built-in `TIME` command (`TIME [/T | time]`), supporting interactive `stdin` prompting.
@@ -250,9 +320,7 @@ pub(super) fn cmd_time(
     {
         io.write_stdout_str(&format!("{}{CRLF}", interp.proc_env.env.virtual_time))?;
     } else if let Some(new_t) = args.first() {
-        new_t
-            .unquoted()
-            .clone_into(&mut interp.proc_env.env.virtual_time);
+        apply_new_virtual_time(interp, new_t.unquoted())?;
     } else {
         io.write_stdout_str(&format!(
             "The current time is: {}{CRLF}Enter the new time: ",
@@ -260,13 +328,45 @@ pub(super) fn cmd_time(
         ))?;
         let line = io.read_stdin_line()?.unwrap_or_default();
         if !line.trim().is_empty() {
-            line.trim()
-                .clone_into(&mut interp.proc_env.env.virtual_time);
+            apply_new_virtual_time(interp, line.trim())?;
         }
         io.write_stdout_str(CRLF)?;
     }
     interp.record_success();
     Ok(FlowControl::Continue)
+}
+
+/// Updates `virtual_time` and synchronizes [`crate::dos::DosKernelApi::set_current_time`] if `raw` parses as `HH:MM[:SS[.CC]]`.
+///
+/// # Arguments
+/// * `interp` - Mutable [`Interpreter`].
+/// * `raw` - Time string entered by user.
+///
+/// # Returns
+/// `Ok(())` on success.
+///
+/// # Errors
+/// Propagates [`CmdError`] if an attached DOS kernel rejects the time.
+fn apply_new_virtual_time(interp: &mut Interpreter, raw: &str) -> Result<(), CmdError> {
+    if let Some(kernel) = &mut interp.proc_env.dos_kernel {
+        let (hms, cc_str) = raw.split_once('.').unwrap_or((raw, "0"));
+        let mut parts = hms.split(':');
+        if let (Some(h_s), Some(m_s)) = (parts.next(), parts.next()) {
+            let s_s = parts.next().unwrap_or("0");
+            if parts.next().is_none()
+                && let (Ok(h), Ok(m), Ok(s), Ok(cc)) = (
+                    h_s.parse::<u8>(),
+                    m_s.parse::<u8>(),
+                    s_s.parse::<u8>(),
+                    cc_str.parse::<u8>(),
+                )
+            {
+                kernel.set_current_time(h, m, s, cc)?;
+            }
+        }
+    }
+    raw.clone_into(&mut interp.proc_env.env.virtual_time);
+    Ok(())
 }
 
 /// Built-in `VERIFY` command (`VERIFY [ON | OFF]`).
@@ -298,8 +398,18 @@ pub(super) fn cmd_verify(
             };
             io.write_stdout_str(&format!("VERIFY is {s}.{CRLF}"))?;
         }
-        Some("ON") => interp.config.verify_state = VerifyCopyMode::Verified,
-        Some("OFF") => interp.config.verify_state = VerifyCopyMode::Unverified,
+        Some("ON") => {
+            interp.config.verify_state = VerifyCopyMode::Verified;
+            if let Some(kernel) = &mut interp.proc_env.dos_kernel {
+                kernel.set_verify_flag(VerifyCopyMode::Verified);
+            }
+        }
+        Some("OFF") => {
+            interp.config.verify_state = VerifyCopyMode::Unverified;
+            if let Some(kernel) = &mut interp.proc_env.dos_kernel {
+                kernel.set_verify_flag(VerifyCopyMode::Unverified);
+            }
+        }
         Some(_) => {
             io.write_stderr_str(&format!("Must specify ON or OFF.{CRLF}"))?;
             interp.record_failure(ExitCode::FAILURE);
@@ -338,7 +448,13 @@ pub(super) fn cmd_chcp(
                     span: first.span,
                     param: raw_tok.to_owned(),
                 })?;
-        interp.console.codepage = CodePage::from_id(id)?;
+        let cp = CodePage::from_id(id)?;
+        if let Some(kernel) = &mut interp.proc_env.dos_kernel {
+            kernel.set_active_codepage(cp)?;
+        }
+        interp.console.codepage = cp;
+    } else if let Some(kernel) = &interp.proc_env.dos_kernel {
+        interp.console.codepage = kernel.active_codepage()?;
     }
     io.write_stdout_str(&format!(
         "Active code page: {}{CRLF}",

@@ -3,7 +3,11 @@
 //! Operates against [`Interpreter`]'s encapsulated [`crate::runtime::ProcessEnvironment`]
 //! (`env`, `vfs`, and unified `registry_store`) and streams output/prompts over [`CmdIo`].
 
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 use crate::error::CmdError;
 use crate::parser::ast::SpannedWord;
@@ -58,8 +62,8 @@ pub(super) fn cmd_set(
         let expr_raw = trimmed_start.get(2..).unwrap_or("").trim();
         let cwd = interp.current_cwd_string();
         let exit_code = interp.last_exit_code();
-        let pending_updates: std::cell::RefCell<Vec<(String, i32)>> =
-            std::cell::RefCell::new(Vec::new());
+        let pending_updates: core::cell::RefCell<Vec<(String, i32)>> =
+            core::cell::RefCell::new(Vec::new());
         let val = {
             let env_ref = &interp.proc_env.env;
             evaluate_set_a(

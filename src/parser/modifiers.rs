@@ -13,6 +13,10 @@
 //! - `z` (file size in bytes)
 //! - `$ENVVAR:` (search directories in `%ENVVAR%` for the file)
 
+use alloc::borrow::ToOwned;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use crate::reader::char_map::SpannedChar;
 use crate::types::EnvVarName;
 use crate::vfs::VirtualFileSystem;

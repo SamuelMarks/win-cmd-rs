@@ -16,6 +16,10 @@
 //! `CmdError::InvalidNumber` on malformed octal literals like `08` or `09`, and implicitly
 //! dereferencing bare variable names (`0` if undefined or non-numeric, supporting hex/octal values).
 
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::error::CmdError;
 use crate::span::Span;
 

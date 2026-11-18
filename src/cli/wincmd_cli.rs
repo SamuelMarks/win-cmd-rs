@@ -1,18 +1,30 @@
 //! `wincmd` (`cmd.exe`) CLI argument parser, `/C` quote heuristic, and process driver.
 
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+#[cfg(feature = "std")]
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
+#[cfg(feature = "std")]
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
 
 use crate::error::{CliErrorReason, CliTool, CliUsageFailure, CmdError};
-use crate::runtime::{Interpreter, IoStreams};
-use crate::types::{
-    AutoRunMode, CRLF, ConsoleColor, DelayedExpansionMode, EchoState, ExitCode, ExtensionsMode,
-    FileCompletionMode, HostBindingMode, OutputUnicodeMode, QuoteStripMode, VfsBackendMode,
+use crate::runtime::{
+    ByteStreamBufRead, ByteStreamIo, ByteStreamWrite, Interpreter, IoStreams,
+    write_byte_stream_gracefully,
 };
+use crate::types::{
+    AutoRunMode, BS_STR, CRLF, ConsoleColor, DelayedExpansionMode, EchoState, ExitCode,
+    ExtensionsMode, FileCompletionMode, HostBindingMode, NativeBackingPath, OutputUnicodeMode,
+    PermanentShellMode, QuoteStripMode, ShellDialect, VfsBackendMode,
+};
+#[cfg(feature = "std")]
 use crate::vfs::HostOsVfs;
 
-use super::repl::{run_interactive_repl, run_interactive_repl_streaming, write_stream_gracefully};
+use super::repl::{run_interactive_repl, run_interactive_repl_byte_streams};
 
 /// Execution mode parsed from `wincmd` (`cmd.exe`) command-line arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,11 +70,21 @@ pub struct WinCmdCliConfig {
     /// `/T:fg` initial console color.
     pub initial_color: Option<ConsoleColor>,
     /// Optional `--host-root <dir>` mounting `HostOsVfs` onto `C:`.
-    pub host_root: Option<PathBuf>,
+    pub host_root: Option<NativeBackingPath>,
     /// VFS backend selection (`--in-memory` vs `--host-native`).
     pub vfs_backend_mode: VfsBackendMode,
     /// Host working directory synchronization mode (`Isolated` vs `Synchronized`).
     pub host_binding_mode: HostBindingMode,
+    /// Optional `--dialect <cmd|dos622|freedos>` compatibility dialect override.
+    pub dialect: Option<ShellDialect>,
+    /// Primary permanent shell policy (`COMMAND.COM /P`).
+    pub permanent_shell: PermanentShellMode,
+    /// Optional MS-DOS `/E:nnnnn` environment paragraph size (`160..=32768` bytes).
+    pub dos_env_bytes: Option<u16>,
+    /// Optional `COMMAND.COM` command directory (`COMMAND C:\DOS /P`).
+    pub command_dir: Option<String>,
+    /// Explicit `/E:ON` or `/E:OFF` override supplied on the CLI (preserved over dialect defaults).
+    pub explicit_extensions: Option<ExtensionsMode>,
     /// Original unstripped `/C` or `/K` command string for live VFS/`%PATH%`/`%PATHEXT%` executable probing.
     pub raw_command_string: Option<String>,
 }
@@ -89,6 +111,11 @@ impl Default for WinCmdCliConfig {
             host_root: None,
             vfs_backend_mode: VfsBackendMode::InMemoryHermetic,
             host_binding_mode: HostBindingMode::Isolated,
+            dialect: None,
+            permanent_shell: PermanentShellMode::Transient,
+            dos_env_bytes: None,
+            command_dir: None,
+            explicit_extensions: None,
             raw_command_string: None,
         }
     }
@@ -325,15 +352,17 @@ pub fn parse_wincmd_args_with_default_backend(
                 };
                 return Ok(cfg);
             }
-            _ if upper.starts_with("/T:") => {
-                cfg.initial_color = Some(ConsoleColor::parse_hex(arg.get(3..).unwrap_or(""))?);
+            _ if upper.starts_with("/T:")
+                || upper.starts_with("/E:")
+                || upper.starts_with("--DIALECT=") =>
+            {
+                apply_inline_wincmd_flag(arg, &upper, &mut cfg)?;
             }
-            "--HOST-ROOT" => {
-                let root_str = args
+            "--DIALECT" | "--HOST-ROOT" => {
+                let val = args
                     .get(i.saturating_add(1))
                     .ok_or_else(|| wincmd_cli_err(arg.clone(), CliErrorReason::MissingValue))?;
-                cfg.host_root = Some(PathBuf::from(root_str));
-                cfg.vfs_backend_mode = VfsBackendMode::HostNative;
+                apply_two_arg_wincmd_flag(&upper, arg, val, &mut cfg)?;
                 i = i.saturating_add(2);
                 continue;
             }
@@ -350,6 +379,14 @@ pub fn parse_wincmd_args_with_default_backend(
             _ if is_unrecognized_cli_flag(arg, cfg.vfs_backend_mode) => {
                 return Err(wincmd_cli_err(arg.clone(), CliErrorReason::UnknownFlag));
             }
+            _ if args
+                .get(i.saturating_add(1)..)
+                .unwrap_or(&[])
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case("/P")) =>
+            {
+                cfg.command_dir = Some(arg.clone());
+            }
             _ => {
                 cfg.action = WinCmdAction::RunScriptFile {
                     path: normalize_cli_script_path(arg, cfg.vfs_backend_mode),
@@ -362,6 +399,83 @@ pub fn parse_wincmd_args_with_default_backend(
     }
 
     Ok(cfg)
+}
+
+/// Applies two-token `--dialect <val>` and `--host-root <dir>` `wincmd` options.
+///
+/// # Arguments
+/// * `upper` - Uppercased flag name (`"--DIALECT"` or `"--HOST-ROOT"`).
+/// * `flag` - Original flag string.
+/// * `val` - Following operand value.
+/// * `cfg` - Mutable [`WinCmdCliConfig`].
+///
+/// # Returns
+/// `Ok(())` on success.
+///
+/// # Errors
+/// Returns [`CmdError`] if `--dialect` receives an unknown dialect name.
+fn apply_two_arg_wincmd_flag(
+    upper: &str,
+    flag: &str,
+    val: &str,
+    cfg: &mut WinCmdCliConfig,
+) -> Result<(), CmdError> {
+    if upper == "--DIALECT" {
+        cfg.dialect = Some(ShellDialect::parse_cli_value(val).ok_or_else(|| {
+            wincmd_cli_err(
+                flag.to_owned(),
+                CliErrorReason::InvalidModeValue(val.to_owned()),
+            )
+        })?);
+    } else {
+        cfg.host_root = Some(NativeBackingPath::from_string(val));
+        cfg.vfs_backend_mode = VfsBackendMode::HostNative;
+    }
+    Ok(())
+}
+
+/// Applies inline `KEY:VALUE` / `--key=value` `wincmd` flags (`/T:`, `/E:<bytes>`, `--dialect=`).
+///
+/// # Arguments
+/// * `arg` - Original argument string.
+/// * `upper` - Uppercased argument string.
+/// * `cfg` - Mutable [`WinCmdCliConfig`].
+///
+/// # Returns
+/// `Ok(())` on valid value.
+///
+/// # Errors
+/// Returns [`CmdError`] on invalid hex color, environment size, or dialect name.
+fn apply_inline_wincmd_flag(
+    arg: &str,
+    upper: &str,
+    cfg: &mut WinCmdCliConfig,
+) -> Result<(), CmdError> {
+    if upper.starts_with("/T:") {
+        cfg.initial_color = Some(ConsoleColor::parse_hex(arg.get(3..).unwrap_or(""))?);
+    } else if upper.starts_with("/E:") {
+        let raw_e = arg.get(3..).unwrap_or("");
+        let bytes = raw_e
+            .parse::<u16>()
+            .ok()
+            .filter(|&n| (160..=32768).contains(&n))
+            .ok_or_else(|| {
+                wincmd_cli_err(
+                    arg.to_owned(),
+                    CliErrorReason::InvalidModeValue(raw_e.to_owned()),
+                )
+            })?;
+        cfg.dos_env_bytes = Some(bytes);
+    } else {
+        let val = arg.get("--dialect=".len()..).unwrap_or("");
+        cfg.dialect = Some(ShellDialect::parse_cli_value(val).ok_or_else(|| {
+            wincmd_cli_err(
+                "--dialect".to_owned(),
+                CliErrorReason::InvalidModeValue(val.to_owned()),
+            )
+        })?);
+    }
+    Ok(())
 }
 
 /// Applies zero-operand `wincmd` mode switches (`/Q`, `/S`, `/D`, `/A`, `/U`, `/F:*`, `/E:*`, `/V:*`, backend flags).
@@ -381,8 +495,16 @@ fn apply_simple_wincmd_flag(upper: &str, cfg: &mut WinCmdCliConfig) -> bool {
         "/U" => cfg.unicode_output_mode = OutputUnicodeMode::Utf16Le,
         "/F:ON" => cfg.file_completion = FileCompletionMode::Enabled,
         "/F:OFF" => cfg.file_completion = FileCompletionMode::Disabled,
-        "/E:ON" => cfg.extensions = ExtensionsMode::Enabled,
-        "/E:OFF" => cfg.extensions = ExtensionsMode::Disabled,
+        "/E:ON" => {
+            cfg.extensions = ExtensionsMode::Enabled;
+            cfg.explicit_extensions = Some(ExtensionsMode::Enabled);
+        }
+        "/E:OFF" => {
+            cfg.extensions = ExtensionsMode::Disabled;
+            cfg.explicit_extensions = Some(ExtensionsMode::Disabled);
+        }
+        "/P" => cfg.permanent_shell = PermanentShellMode::Permanent,
+        "/MSG" => {}
         "/V:ON" => cfg.delayed_expansion = DelayedExpansionMode::Enabled,
         "/V:OFF" => cfg.delayed_expansion = DelayedExpansionMode::Disabled,
         "--IN-MEMORY" | "--HERMETIC" => {
@@ -431,9 +553,12 @@ fn is_unrecognized_cli_flag(arg: &str, backend: VfsBackendMode) -> bool {
 fn is_posix_script_path(arg: &str) -> bool {
     let tail = arg.get(1..).unwrap_or("");
     tail.contains('/')
-        || std::path::Path::new(tail)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
+        || tail
+            .rsplit_once('.')
+            .filter(|(stem, _)| !stem.is_empty())
+            .is_some_and(|(_, ext)| {
+                ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd")
+            })
 }
 
 /// Maps POSIX absolute script paths (`/tmp/foo.bat`) onto `Z:` when running in `HostNative` mode.
@@ -456,28 +581,64 @@ fn normalize_cli_script_path(raw_path: &str, backend: VfsBackendMode) -> String 
     }
 }
 
-/// Applies `cfg` flags and VFS backend settings onto `interp`.
+/// Applies non-VFS session flags from `cfg` onto `interp`.
 ///
 /// # Arguments
 /// * `cfg` - Parsed [`WinCmdCliConfig`].
 /// * `interp` - Mutable [`Interpreter`] to configure.
-fn configure_interpreter_from_cli(cfg: &WinCmdCliConfig, interp: &mut Interpreter) {
-    if let Some(root) = &cfg.host_root {
-        interp.proc_env.vfs = Box::new(HostOsVfs::new(root.clone()));
-    } else if cfg.vfs_backend_mode == VfsBackendMode::HostNative {
-        interp.proc_env.vfs = Box::new(HostOsVfs::from_host_env());
-    }
+fn apply_cli_session_flags(cfg: &WinCmdCliConfig, interp: &mut Interpreter) {
     if let Some(echo_ov) = cfg.initial_echo_override {
         interp.console.echo_state = echo_ov;
     }
     interp.config.unicode_output_mode = cfg.unicode_output_mode;
     interp.config.file_completion = cfg.file_completion;
     interp.config.host_binding_mode = cfg.host_binding_mode;
+    interp.config.permanent_shell = cfg.permanent_shell;
+    interp.config.dos_env_bytes = cfg.dos_env_bytes;
     interp.proc_env.env.extensions = cfg.extensions;
+    if let Some(dialect) = cfg.dialect {
+        interp.apply_shell_dialect(dialect);
+        if let Some(exp_ext) = cfg.explicit_extensions {
+            interp.proc_env.env.extensions = exp_ext;
+        }
+    }
+    if let Some(cmd_dir) = &cfg.command_dir {
+        let trimmed = cmd_dir.trim_end_matches([crate::types::BS_CHAR, '/']);
+        interp
+            .proc_env
+            .env
+            .set("COMSPEC", &format!("{trimmed}{BS_STR}COMMAND.COM"));
+    }
     interp.proc_env.env.delayed_expansion = cfg.delayed_expansion;
     if cfg.initial_color.is_some() {
         interp.console.console_color = cfg.initial_color;
     }
+}
+
+/// Mounts `HostOsVfs` when `--host-root` or `--host-native` is selected under `std` builds,
+/// and applies all session flags from `cfg` onto `interp`.
+///
+/// # Arguments
+/// * `cfg` - Parsed [`WinCmdCliConfig`].
+/// * `interp` - Mutable [`Interpreter`] to configure.
+#[cfg(feature = "std")]
+fn configure_interpreter_from_cli(cfg: &WinCmdCliConfig, interp: &mut Interpreter) {
+    if let Some(root) = &cfg.host_root {
+        interp.proc_env.vfs = Box::new(HostOsVfs::new(root.to_path_buf()));
+    } else if cfg.vfs_backend_mode == VfsBackendMode::HostNative {
+        interp.proc_env.vfs = Box::new(HostOsVfs::from_host_env());
+    }
+    apply_cli_session_flags(cfg, interp);
+}
+
+/// Applies session flags from `cfg` onto `interp` in `#![no_std]` builds (preserving the caller's VFS).
+///
+/// # Arguments
+/// * `cfg` - Parsed [`WinCmdCliConfig`].
+/// * `interp` - Mutable [`Interpreter`] to configure.
+#[cfg(not(feature = "std"))]
+fn configure_interpreter_from_cli(cfg: &WinCmdCliConfig, interp: &mut Interpreter) {
+    apply_cli_session_flags(cfg, interp);
 }
 
 /// Builds the `wincmd /?` / `--help` usage banner.
@@ -518,6 +679,17 @@ pub fn run_wincmd_with_config(
         WinCmdAction::ShowHelp | WinCmdAction::ShowVersion
     ) {
         interp.run_autorun_if_enabled(cfg.autorun_mode, io);
+        if cfg.permanent_shell == PermanentShellMode::Permanent
+            && interp.proc_env.vfs.exists("C:/AUTOEXEC.BAT")
+        {
+            let _auto = interp.execute_batch_file(
+                "C:\\AUTOEXEC.BAT",
+                "C:\\AUTOEXEC.BAT",
+                Vec::new(),
+                String::new(),
+                io,
+            );
+        }
     }
 
     match &cfg.action {
@@ -549,6 +721,41 @@ pub fn run_wincmd_with_config(
     }
 }
 
+/// Executes the `wincmd` CLI process over portable `#![no_std]` [`ByteStreamBufRead`] and [`ByteStreamWrite`] streams
+/// against a caller-supplied [`Interpreter`] (e.g., MS-DOS `DosFatVfs` + `DosProcessSpawner`).
+///
+/// # Arguments
+/// * `args` - Command-line arguments excluding `argv[0]`.
+/// * `default_backend` - Default [`VfsBackendMode`] when neither `--in-memory` nor `--host-native` is passed.
+/// * `interp` - Mutable [`Interpreter`] session pre-configured with VFS and spawner.
+/// * `stdin` - Live buffered input stream.
+/// * `stdout` - Live standard output stream.
+/// * `stderr` - Live standard error stream.
+///
+/// # Returns
+/// Process exit status byte (`0..=255`).
+pub fn execute_wincmd_over_streams(
+    args: &[String],
+    default_backend: VfsBackendMode,
+    interp: &mut Interpreter,
+    stdin: &mut dyn ByteStreamBufRead,
+    stdout: &mut dyn ByteStreamWrite,
+    stderr: &mut dyn ByteStreamWrite,
+) -> u8 {
+    let cfg = match parse_wincmd_args_with_default_backend(args, default_backend) {
+        Ok(c) => c,
+        Err(err) => {
+            let msg = format!("{}{CRLF}", err.cmd_exe_message());
+            if write_byte_stream_gracefully(stderr, msg.as_bytes()).is_err() {
+                return 1;
+            }
+            return exit_code_to_u8(ExitCode::FAILURE);
+        }
+    };
+    execute_wincmd_with_interpreter_streams(&cfg, interp, stdin, stdout, stderr)
+        .map_or(1, exit_code_to_u8)
+}
+
 /// Executes the standalone `wincmd` CLI process over live `stdin`, `stdout`, and `stderr` streams.
 ///
 /// Defaults to [`VfsBackendMode::HostNative`] so host batch files and directories are accessible
@@ -562,6 +769,7 @@ pub fn run_wincmd_with_config(
 ///
 /// # Returns
 /// Process exit status byte (`0..=255`).
+#[cfg(feature = "std")]
 pub fn execute_wincmd_process(
     args: &[String],
     stdin: &mut dyn BufRead,
@@ -584,6 +792,7 @@ pub fn execute_wincmd_process(
 ///
 /// # Errors
 /// Returns [`CmdError`] on CLI argument errors or non-`BrokenPipe` stream write/read failures.
+#[cfg(feature = "std")]
 fn execute_wincmd_process_inner(
     args: &[String],
     stdin: &mut dyn BufRead,
@@ -594,7 +803,7 @@ fn execute_wincmd_process_inner(
         Ok(c) => c,
         Err(err) => {
             let msg = format!("{}{CRLF}", err.cmd_exe_message());
-            write_stream_gracefully(stderr, msg.as_bytes())?;
+            super::repl::write_stream_gracefully(stderr, msg.as_bytes())?;
             return Ok(ExitCode::FAILURE);
         }
     };
@@ -608,7 +817,7 @@ fn execute_wincmd_process_inner(
     execute_wincmd_with_interpreter(&cfg, &mut interp, stdin, stdout, stderr)
 }
 
-/// Runs a parsed [`WinCmdCliConfig`] against an existing [`Interpreter`] over live streams.
+/// Runs a parsed [`WinCmdCliConfig`] against an existing [`Interpreter`] over live `std::io` streams.
 ///
 /// # Arguments
 /// * `cfg` - Parsed [`WinCmdCliConfig`].
@@ -622,6 +831,7 @@ fn execute_wincmd_process_inner(
 ///
 /// # Errors
 /// Returns [`CmdError`] on non-`BrokenPipe` stream read/write failures.
+#[cfg(feature = "std")]
 pub(super) fn execute_wincmd_with_interpreter(
     cfg: &WinCmdCliConfig,
     interp: &mut Interpreter,
@@ -629,13 +839,40 @@ pub(super) fn execute_wincmd_with_interpreter(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<ExitCode, CmdError> {
+    let mut sin = crate::runtime::StdBufReadAdapter(stdin);
+    let mut sout = crate::runtime::StdWriteAdapter::new(stdout, "write");
+    let mut serr = crate::runtime::StdWriteAdapter::new(stderr, "write");
+    execute_wincmd_with_interpreter_streams(cfg, interp, &mut sin, &mut sout, &mut serr)
+}
+
+/// Runs a parsed [`WinCmdCliConfig`] against an existing [`Interpreter`] over portable [`ByteStreamBufRead`] / [`ByteStreamWrite`] streams.
+///
+/// # Arguments
+/// * `cfg` - Parsed [`WinCmdCliConfig`].
+/// * `interp` - Mutable [`Interpreter`] session.
+/// * `stdin` - Buffered input reader.
+/// * `stdout` - Standard output writer.
+/// * `stderr` - Standard error writer.
+///
+/// # Returns
+/// `Ok(ExitCode)` when execution and stream flushing succeed.
+///
+/// # Errors
+/// Returns [`CmdError`] on non-`BrokenPipe` stream read/write failures.
+pub fn execute_wincmd_with_interpreter_streams(
+    cfg: &WinCmdCliConfig,
+    interp: &mut Interpreter,
+    stdin: &mut dyn ByteStreamBufRead,
+    stdout: &mut dyn ByteStreamWrite,
+    stderr: &mut dyn ByteStreamWrite,
+) -> Result<ExitCode, CmdError> {
     configure_interpreter_from_cli(cfg, interp);
 
     if !matches!(
         cfg.action,
         WinCmdAction::ShowHelp | WinCmdAction::ShowVersion
     ) {
-        let mut ar_io = crate::runtime::StdIoStreams::new(
+        let mut ar_io = ByteStreamIo::new(
             stdin,
             stdout,
             stderr,
@@ -643,17 +880,28 @@ pub(super) fn execute_wincmd_with_interpreter(
             interp.config.unicode_output_mode,
         );
         interp.run_autorun_if_enabled(cfg.autorun_mode, &mut ar_io);
+        if cfg.permanent_shell == PermanentShellMode::Permanent
+            && interp.proc_env.vfs.exists("C:/AUTOEXEC.BAT")
+        {
+            let _auto = interp.execute_batch_file(
+                "C:\\AUTOEXEC.BAT",
+                "C:\\AUTOEXEC.BAT",
+                Vec::new(),
+                String::new(),
+                &mut ar_io,
+            );
+        }
         ar_io.check_error()?;
     }
 
     match &cfg.action {
         WinCmdAction::InteractiveRepl => {
-            run_interactive_repl_streaming(interp, stdin, stdout, stderr)
+            run_interactive_repl_byte_streams(interp, stdin, stdout, stderr)
         }
         WinCmdAction::RunCommandAndStay(cmd) => {
             let effective = resolve_cmd_c_against_interpreter(cfg, cmd, interp);
             {
-                let mut cmd_io = crate::runtime::StdIoStreams::new(
+                let mut cmd_io = ByteStreamIo::new(
                     stdin,
                     stdout,
                     stderr,
@@ -666,21 +914,21 @@ pub(super) fn execute_wincmd_with_interpreter(
             if let Some(code) = interp.exec.exited() {
                 return Ok(code);
             }
-            run_interactive_repl_streaming(interp, stdin, stdout, stderr)
+            run_interactive_repl_byte_streams(interp, stdin, stdout, stderr)
         }
         WinCmdAction::ShowHelp => {
             let help_msg = format_wincmd_help_banner();
-            write_stream_gracefully(stdout, help_msg.as_bytes())?;
+            write_byte_stream_gracefully(stdout, help_msg.as_bytes())?;
             Ok(ExitCode::SUCCESS)
         }
         WinCmdAction::ShowVersion => {
             let ver_msg = format!("{}{CRLF}", interp.config.version_banner);
-            write_stream_gracefully(stdout, ver_msg.as_bytes())?;
+            write_byte_stream_gracefully(stdout, ver_msg.as_bytes())?;
             Ok(ExitCode::SUCCESS)
         }
         WinCmdAction::RunCommandAndExit(cmd) => {
             let effective = resolve_cmd_c_against_interpreter(cfg, cmd, interp);
-            let mut cmd_io = crate::runtime::StdIoStreams::new(
+            let mut cmd_io = ByteStreamIo::new(
                 stdin,
                 stdout,
                 stderr,
@@ -693,7 +941,7 @@ pub(super) fn execute_wincmd_with_interpreter(
         }
         WinCmdAction::RunScriptFile { path, args: sargs } => {
             let raw_tail = join_argv_preserving_quotes(sargs);
-            let mut script_io = crate::runtime::StdIoStreams::new(
+            let mut script_io = ByteStreamIo::new(
                 stdin,
                 stdout,
                 stderr,
@@ -707,7 +955,7 @@ pub(super) fn execute_wincmd_with_interpreter(
                 Ok(c) => Ok(c),
                 Err(err) => {
                     let msg = format!("{}{CRLF}", err.cmd_exe_message());
-                    write_stream_gracefully(stderr, msg.as_bytes())?;
+                    write_byte_stream_gracefully(stderr, msg.as_bytes())?;
                     Ok(err.exit_code())
                 }
             }

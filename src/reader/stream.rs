@@ -7,6 +7,8 @@
 //! caret continuation, trailing-whitespace-after-caret detection (`CMD1004`), `,`/`;`/`=` label
 //! delimiter rules, and the `8191`-character logical line limit.
 
+use alloc::string::String;
+
 use crate::error::CmdError;
 use crate::reader::char_map::{ExpansionOrigin, LogicalLineBuffer, SpannedChar};
 use crate::reader::encoding::decode_physical_line_at;

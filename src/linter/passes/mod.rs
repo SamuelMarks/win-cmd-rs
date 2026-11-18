@@ -6,11 +6,16 @@
 
 pub mod delayed_exp;
 pub mod dialect;
+pub mod dos_compat;
 pub mod quoting;
 pub mod structural;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 use crate::linter::directives::WELL_KNOWN_ENV_VARS;
 use crate::linter::rules::{Diagnostic, RuleId, Severity, SuggestedFix};

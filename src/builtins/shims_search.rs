@@ -5,7 +5,12 @@
 //! supporting `.`, `*`, `^`, `$`, `[a-z]` / `[^a-z]` character classes, and word boundaries,
 //! propagates `decode_script_bytes` errors via `?`, and accurately reports missing files in `FC` and `COMP`.
 
-use std::fmt::Write as _;
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 use crate::error::CmdError;
 use crate::parser::ast::SpannedWord;

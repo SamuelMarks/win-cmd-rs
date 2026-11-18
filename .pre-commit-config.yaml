@@ -33,24 +33,27 @@ repos:
           - |
             import pathlib, re, subprocess, sys
 
-            # Fast static anti-pattern check across Cargo.toml, src/**, and tests/**
+            # Fast static anti-pattern check across Cargo.toml, src/**, tests/**, and crates/wincmd-dos/**
             root = pathlib.Path(".")
             violations = []
-            cargo_toml = (root / "Cargo.toml").read_text(encoding="utf-8")
-            for idx, line in enumerate(cargo_toml.splitlines(), 1):
-                t = line.strip()
-                if not t.startswith("#") and '= "allow"' in t:
-                    violations.append(f"Cargo.toml:{idx}: blanket allow `{t}`")
-                for banned_dep in ("anyhow", "thiserror", "eyre", "snafu"):
-                    if t.startswith(banned_dep):
-                        violations.append(f"Cargo.toml:{idx}: banned crate `{banned_dep}`")
+            for manifest_rel in ("Cargo.toml", "crates/wincmd-dos/Cargo.toml"):
+                cargo_toml = (root / manifest_rel).read_text(encoding="utf-8")
+                for idx, line in enumerate(cargo_toml.splitlines(), 1):
+                    t = line.strip()
+                    if not t.startswith("#") and '= "allow"' in t:
+                        violations.append(f"{manifest_rel}:{idx}: blanket allow `{t}`")
+                    for banned_dep in ("anyhow", "thiserror", "eyre", "snafu"):
+                        if t.startswith(banned_dep):
+                            violations.append(f"{manifest_rel}:{idx}: banned crate `{banned_dep}`")
 
             banned = (
                 "#[allow(",
                 "#![allow(",
+                "#[expect(",
+                "#![expect(",
                 "std::convert::identity",
                 "convert::identity",
-                "let _ = main()",
+                "let _ =",
                 ".unwrap(",
                 ".expect(",
                 "panic!(",
@@ -64,20 +67,21 @@ repos:
                 "Box<dyn std::error::Error",
                 "Box<dyn core::error::Error",
             )
-            for p in sorted((root / "src").rglob("*.rs")) + sorted((root / "tests").rglob("*.rs")):
-                in_test = p.parts[0] == "tests"
+            scan_files = (
+                sorted((root / "src").rglob("*.rs"))
+                + sorted((root / "tests").rglob("*.rs"))
+                + sorted((root / "crates/wincmd-dos/src").rglob("*.rs"))
+                + sorted((root / "crates/wincmd-dos/tests").rglob("*.rs"))
+            )
+            for p in scan_files:
                 for idx, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
                     t = line.strip()
-                    if t == "#[cfg(test)]":
-                        in_test = True
                     if t.startswith("//"):
                         continue
                     scrubbed = re.sub(r'r(#*)"[\s\S]*?"\1|"(?:\\.|[^"\\])*"', '""', t)
                     for needle in banned:
                         if needle in scrubbed:
                             violations.append(f"{p}:{idx}: banned `{needle}`")
-                    if in_test and scrubbed.startswith("let _ ="):
-                        violations.append(f"{p}:{idx}: assertion-free `let _ =` in test")
 
             if violations:
                 for v in violations:
@@ -95,14 +99,14 @@ repos:
       - id: cargo-fmt
         name: cargo fmt
         language: system
-        entry: bash -c 'exec cargo fmt --all -- --check'
+        entry: bash -c 'cargo fmt --all -- --check && cargo fmt --manifest-path crates/wincmd-dos/Cargo.toml --all -- --check'
         files: \.rs$
         pass_filenames: false
 
       - id: cargo-clippy-and-rustdoc
-        name: cargo clippy & private-item rustdoc
+        name: cargo clippy, no_std check & private-item rustdoc
         language: system
-        entry: bash -c 'cargo clippy --workspace --all-targets -- -D warnings && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --bins --lib --document-private-items --no-deps'
+        entry: bash -c 'cargo check --lib --no-default-features && cargo clippy --lib --no-default-features -- -D warnings && cargo clippy --workspace --all-targets --all-features -- -D warnings && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --bins --lib --document-private-items --no-deps'
         files: (\.rs$|Cargo\.toml$|Cargo\.lock$)
         pass_filenames: false
 
@@ -191,6 +195,18 @@ repos:
           - |
             import json, pathlib, re, subprocess, sys
 
+            subprocess.run(
+                [
+                    "cargo",
+                    "+nightly",
+                    "llvm-cov",
+                    "clean",
+                    "--manifest-path",
+                    "crates/wincmd-dos/Cargo.toml",
+                ],
+                capture_output=True,
+                text=True,
+            )
             res = subprocess.run(
                 [
                     "cargo",
@@ -199,6 +215,7 @@ repos:
                     "--branch",
                     "--workspace",
                     "--all-targets",
+                    "--all-features",
                     "--json",
                     "--summary-only",
                 ],

@@ -1,11 +1,19 @@
 //! Interactive Read-Eval-Print Loop (REPL) drivers and stream writing helpers.
 
-use std::io::{BufRead, Cursor, Write};
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use std::io::{BufRead, Write};
 
 use crate::error::CmdError;
 use crate::parser::peg::compute_lossless_paren_balance;
 use crate::reader::char_map::LogicalLineBuffer;
-use crate::runtime::{Interpreter, IoStreams};
+use crate::runtime::{
+    ByteStreamBufRead, ByteStreamIo, ByteStreamWrite, InMemoryByteReader, Interpreter, IoStreams,
+    write_byte_stream_gracefully,
+};
 use crate::span::{ByteOffset, SourceId};
 use crate::types::{
     CR_CHAR, CRLF, CompletionScope, ConsoleColor, ESC_CHAR, EchoState, ExitCode, LF_CHAR,
@@ -40,7 +48,7 @@ pub fn repl_open_paren_depth(pending_buf: &str) -> i32 {
 /// # Returns
 /// `Some(prefix_without_last_caret)` when odd trailing carets exist, or `None`.
 #[must_use]
-fn strip_odd_trailing_caret(line: &str) -> Option<&str> {
+pub fn strip_odd_trailing_caret(line: &str) -> Option<&str> {
     let caret_count = line.chars().rev().take_while(|&c| c == '^').count();
     if caret_count.is_multiple_of(2) {
         None
@@ -105,21 +113,25 @@ fn expand_repl_line_completions(interp: &Interpreter, line: &str) -> String {
 fn sync_console_ansi_color(
     interp: &Interpreter,
     last_color: &mut Option<ConsoleColor>,
-    stdout: &mut dyn Write,
+    stdout: &mut dyn ByteStreamWrite,
 ) -> Result<(), CmdError> {
+    if interp.console.render_backend != crate::types::ConsoleRenderBackend::AnsiSysEscape {
+        *last_color = interp.console.console_color;
+        return Ok(());
+    }
     if interp.console.console_color != *last_color {
         match interp.console.console_color {
-            Some(color) => write_stream_gracefully(stdout, color.to_ansi_sgr().as_bytes())?,
-            None => write_stream_gracefully(stdout, format!("{ESC_CHAR}[0m").as_bytes())?,
+            Some(color) => write_byte_stream_gracefully(stdout, color.to_ansi_sgr().as_bytes())?,
+            None => write_byte_stream_gracefully(stdout, format!("{ESC_CHAR}[0m").as_bytes())?,
         }
         *last_color = interp.console.console_color;
     }
     Ok(())
 }
 
-/// Runs the interactive Read-Eval-Print Loop (REPL) over `io` using a streaming [`Cursor`].
+/// Runs the interactive Read-Eval-Print Loop (REPL) over `io` using a `#![no_std]` [`InMemoryByteReader`].
 ///
-/// Adapts `io.stdin` to [`run_interactive_repl_streaming`] so interactive commands (`SET /P`,
+/// Adapts `io.stdin` to [`run_interactive_repl_byte_streams`] so interactive commands (`SET /P`,
 /// `PAUSE`, `CHOICE`, `MORE`, `FIND`, `SORT`) read subsequent `stdin` lines live without pre-draining.
 ///
 /// # Arguments
@@ -129,24 +141,22 @@ fn sync_console_ansi_color(
 /// # Returns
 /// Final [`ExitCode`] of the session.
 pub fn run_interactive_repl(interp: &mut Interpreter, io: &mut IoStreams) -> ExitCode {
-    let raw_stdin = std::mem::take(&mut io.stdin).into_bytes();
-    let mut cursor = Cursor::new(raw_stdin);
+    let raw_stdin = core::mem::take(&mut io.stdin).into_bytes();
+    let mut reader = InMemoryByteReader::new(raw_stdin);
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
-    let code = run_interactive_repl_streaming(interp, &mut cursor, &mut out_buf, &mut err_buf)
+    let code = run_interactive_repl_byte_streams(interp, &mut reader, &mut out_buf, &mut err_buf)
         .unwrap_or(ExitCode::FAILURE);
     io.stdout.push_str(&String::from_utf8_lossy(&out_buf));
     io.stderr.push_str(&String::from_utf8_lossy(&err_buf));
-    let pos = usize::try_from(cursor.position()).unwrap_or(0);
-    let inner = cursor.into_inner();
-    if let Some(rem) = inner.get(pos..).filter(|s| !s.is_empty()) {
-        io.stdin = String::from_utf8_lossy(rem).into_owned();
+    let rem = reader.into_remaining();
+    if !rem.is_empty() {
+        io.stdin = String::from_utf8_lossy(&rem).into_owned();
     }
     code
 }
 
-/// Runs the unified streaming interactive REPL reading lines on demand from `stdin` (`BufRead`)
-/// and flushing prompts, ANSI color updates, and command output to `stdout` and `stderr`.
+/// Runs the `#![no_std]`-compatible streaming interactive REPL over [`ByteStreamBufRead`] and [`ByteStreamWrite`].
 ///
 /// Supports:
 /// - Live `stdin` handoff to `SET /P`, `PAUSE`, `CHOICE`, `MORE`, `FIND`, and `SORT`
@@ -166,11 +176,11 @@ pub fn run_interactive_repl(interp: &mut Interpreter, io: &mut IoStreams) -> Exi
 ///
 /// # Errors
 /// Returns [`CmdError`] on non-`BrokenPipe` stream I/O errors.
-pub fn run_interactive_repl_streaming(
+pub fn run_interactive_repl_byte_streams(
     interp: &mut Interpreter,
-    stdin: &mut dyn BufRead,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+    stdin: &mut dyn ByteStreamBufRead,
+    stdout: &mut dyn ByteStreamWrite,
+    stderr: &mut dyn ByteStreamWrite,
 ) -> Result<ExitCode, CmdError> {
     let mut last_color: Option<ConsoleColor> = None;
     sync_console_ansi_color(interp, &mut last_color, stdout)?;
@@ -179,30 +189,28 @@ pub fn run_interactive_repl_streaming(
         "{}{CRLF}(c) Microsoft Corporation. All rights reserved.{CRLF}{CRLF}",
         interp.config.version_banner
     );
-    write_stream_gracefully(stdout, banner.as_bytes())?;
+    write_byte_stream_gracefully(stdout, banner.as_bytes())?;
 
     let mut pending_buf = String::new();
-    let mut raw_line = String::new();
+    let mut raw_bytes = Vec::new();
 
     loop {
         sync_console_ansi_color(interp, &mut last_color, stdout)?;
         if pending_buf.is_empty() {
             if interp.console.echo_state == EchoState::On {
                 let prompt = interp.format_prompt();
-                write_stream_gracefully(stdout, prompt.as_bytes())?;
+                write_byte_stream_gracefully(stdout, prompt.as_bytes())?;
             }
         } else {
-            write_stream_gracefully(stdout, b"More? ")?;
+            write_byte_stream_gracefully(stdout, b"More? ")?;
         }
 
-        raw_line.clear();
-        let bytes_read = stdin
-            .read_line(&mut raw_line)
-            .map_err(|err| CmdError::from_io_error(&err, "<stdin>", "read"))?;
+        raw_bytes.clear();
+        let bytes_read = stdin.read_line_bytes(&mut raw_bytes)?;
         if bytes_read == 0 {
             if !pending_buf.is_empty() {
-                let trailing_cmd = std::mem::take(&mut pending_buf);
-                let mut eof_io = crate::runtime::StdIoStreams::new(
+                let trailing_cmd = core::mem::take(&mut pending_buf);
+                let mut eof_io = ByteStreamIo::new(
                     stdin,
                     stdout,
                     stderr,
@@ -215,10 +223,11 @@ pub fn run_interactive_repl_streaming(
             break;
         }
 
+        let raw_line = String::from_utf8_lossy(&raw_bytes);
         if raw_line.contains(CTRL_C_CHAR) {
             interp.trigger_ctrl_c();
             pending_buf.clear();
-            let mut ctrl_io = crate::runtime::StdIoStreams::new(
+            let mut ctrl_io = ByteStreamIo::new(
                 stdin,
                 stdout,
                 stderr,
@@ -227,7 +236,7 @@ pub fn run_interactive_repl_streaming(
             );
             let _ctrl_flow = interp.handle_ctrl_c_interrupt(&mut ctrl_io);
             ctrl_io.check_error()?;
-            write_stream_gracefully(stdout, format!("^C{CRLF}").as_bytes())?;
+            write_byte_stream_gracefully(stdout, format!("^C{CRLF}").as_bytes())?;
             continue;
         }
 
@@ -248,8 +257,8 @@ pub fn run_interactive_repl_streaming(
             continue;
         }
 
-        let full_cmd = std::mem::take(&mut pending_buf);
-        let mut live_io = crate::runtime::StdIoStreams::new(
+        let full_cmd = core::mem::take(&mut pending_buf);
+        let mut live_io = ByteStreamIo::new(
             stdin,
             stdout,
             stderr,
@@ -268,6 +277,33 @@ pub fn run_interactive_repl_streaming(
     Ok(interp.last_exit_code())
 }
 
+/// Runs the unified streaming interactive REPL reading lines on demand from `stdin` (`BufRead`)
+/// and flushing prompts, ANSI color updates, and command output to `stdout` and `stderr`.
+///
+/// # Arguments
+/// * `interp` - Mutable [`Interpreter`] session.
+/// * `stdin` - Streaming buffered input reader.
+/// * `stdout` - Standard output writer.
+/// * `stderr` - Standard error writer.
+///
+/// # Returns
+/// `Ok(ExitCode)` when `EXIT` or EOF is reached.
+///
+/// # Errors
+/// Returns [`CmdError`] on non-`BrokenPipe` stream I/O errors.
+#[cfg(feature = "std")]
+pub fn run_interactive_repl_streaming(
+    interp: &mut Interpreter,
+    stdin: &mut dyn BufRead,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<ExitCode, CmdError> {
+    let mut sin = crate::runtime::StdBufReadAdapter(stdin);
+    let mut sout = crate::runtime::StdWriteAdapter::new(stdout, "write");
+    let mut serr = crate::runtime::StdWriteAdapter::new(stderr, "write");
+    run_interactive_repl_byte_streams(interp, &mut sin, &mut sout, &mut serr)
+}
+
 /// Writes `bytes` to `writer` and flushes, treating `BrokenPipe` as a clean early termination.
 ///
 /// # Arguments
@@ -279,6 +315,7 @@ pub fn run_interactive_repl_streaming(
 ///
 /// # Errors
 /// Returns [`CmdError`] mapped from any non-`BrokenPipe` [`std::io::Error`].
+#[cfg(feature = "std")]
 pub fn write_stream_gracefully(writer: &mut dyn Write, bytes: &[u8]) -> Result<(), CmdError> {
     crate::runtime::io::write_and_flush_gracefully(writer, bytes, "write")
 }

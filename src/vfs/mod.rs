@@ -1,18 +1,21 @@
 //! Cross-Platform Virtual File System (VFS) trait, file attributes, timestamps, and backends.
 //!
 //! All file, directory, attribute, drive, share, link, and device operations in `win-cmd-rs`
-//! go through the [`VirtualFileSystem`] trait. Two complete implementations are provided:
+//! go through the [`VirtualFileSystem`] trait. Three complete implementations are provided:
 //! - [`InMemoryVfs`]: 100% deterministic in-memory multi-drive and UNC-share filesystem with
 //!   inode-backed shared hardlinks, bounded 32-hop symbolic link and junction resolution,
 //!   8.3 short names, case-insensitive lookup, Windows attribute bitmasks, and DOS devices.
 //! - [`HostOsVfs`]: Bridges Windows drive mounts onto host POSIX/Windows directories with
 //!   case-insensitive resolution, full [`crate::error::CmdError`] I/O error mapping, and optional sandbox
 //!   symlink containment.
+//! - [`DosFatVfs`]: Safe `#![no_std]` MS-DOS FAT12/16/32 and DOS 7 LFN backend over [`crate::dos::DosKernelApi`].
 
 pub mod devices;
+pub mod dos;
 pub mod glob;
 pub mod path;
 
+#[cfg(feature = "std")]
 /// Host OS filesystem bridge (`HostOsVfs`) and Wine/POSIX mount translation.
 mod host;
 /// Deterministic in-memory multi-drive and UNC-share VFS backend (`InMemoryVfs`).
@@ -20,6 +23,8 @@ mod memory;
 /// Core `VirtualFileSystem` trait, metadata, timestamps, and attribute types.
 mod traits;
 
+pub use self::dos::DosFatVfs;
+#[cfg(feature = "std")]
 pub use self::host::{HostOsVfs, SandboxContainment};
 pub use self::memory::InMemoryVfs;
 pub use self::traits::{
@@ -1528,5 +1533,331 @@ mod tests {
         }
         assert!(host.mount_unc_drive(r"\\srv\shr", &[]).is_err());
         assert!(std::fs::remove_dir_all(&tmp_base).is_ok());
+    }
+
+    /// Runs shared behavioral invariants across `InMemoryVfs`, `HostOsVfs`, and `DosFatVfs` (8.3 & LFN).
+    ///
+    /// # Arguments
+    /// * `vfs` - Mutable [`VirtualFileSystem`] backend under test.
+    fn run_cross_backend_vfs_conformance(vfs: &mut dyn VirtualFileSystem) {
+        assert_eq!(vfs.current_drive(), DriveLetter::C);
+        assert!(vfs.volume_info(DriveLetter::C).is_ok());
+        vfs.set_drive_free_space(DriveLetter::C, 4_194_304);
+        assert_eq!(vfs.free_disk_space(DriveLetter::C), Ok(4_194_304));
+        assert_eq!(vfs.sync_host_cwd(HostBindingMode::default()), Ok(()));
+        assert_eq!(vfs.sync_host_cwd(HostBindingMode::Synchronized), Ok(()));
+        assert_eq!(vfs.clone_box().current_drive(), DriveLetter::C);
+
+        assert!(vfs.exists("NUL"));
+        assert!(!vfs.exists("C:/NO_SUCH/NUL"));
+        assert_eq!(vfs.write_bytes("NUL", b"discard"), Ok(()));
+        assert_eq!(vfs.append_bytes("NUL", b"discard"), Ok(()));
+        assert_eq!(vfs.read_bytes("NUL"), Ok(Vec::new()));
+
+        assert_eq!(vfs.create_dir("C:/WORK/SUB", CreateParents), Ok(()));
+        assert_eq!(vfs.create_dir("C:/WORK/LEAF", ImmediateParentOnly), Ok(()));
+        assert!(vfs.create_dir("C:/", ImmediateParentOnly).is_err());
+        assert!(vfs.create_dir("C:/WORK/LEAF", CreateParents).is_err());
+        assert!(vfs.exists("C:/WORK/NUL"));
+
+        assert_eq!(vfs.write_bytes("C:/WORK/NOTE.TXT", b"ab"), Ok(()));
+        assert_eq!(vfs.append_bytes("C:/WORK/NOTE.TXT", b"cd"), Ok(()));
+        assert_eq!(vfs.read_bytes("C:/WORK/NOTE.TXT"), Ok(b"abcd".to_vec()));
+        assert!(!vfs.exists("C:/WORK/NOTE.TXT/NUL"));
+        assert!(vfs.exists("C:/WORK/*.TXT"));
+        assert!(vfs.exists("C:/WORK/????????.TXT"));
+
+        let ts = FileTimestamp::from_civil_utc(1996, 5, 20, 10, 30).unwrap_or_default();
+        assert_eq!(vfs.touch_file("C:/WORK/NOTE.TXT", ts), Ok(()));
+        assert_eq!(
+            vfs.stat("C:/WORK/NOTE.TXT").map(|m| m.modified_timestamp),
+            Ok(ts)
+        );
+
+        let mut ro = FileAttributeFlags::default_file();
+        ro.insert(FileAttributeFlags::READ_ONLY);
+        assert_eq!(vfs.set_attributes("C:/WORK/NOTE.TXT", ro), Ok(()));
+        assert!(
+            vfs.delete_file("C:/WORK/NOTE.TXT", RespectReadOnly)
+                .is_err()
+        );
+        assert!(vfs.remove_dir("C:/WORK", RecursiveSubtree).is_err());
+        assert_eq!(
+            vfs.delete_file("C:/WORK/NOTE.TXT", ForceDeleteReadOnly),
+            Ok(())
+        );
+
+        let work_path = vfs.resolve_path("C:/WORK");
+        assert_eq!(vfs.set_drive_cwd(&work_path), Ok(()));
+        assert!(vfs.remove_dir("C:/WORK", RecursiveSubtree).is_err());
+        assert!(vfs.move_entry("C:/WORK", "C:/WORK2").is_err());
+        let root_path = WindowsPath::root(DriveLetter::C);
+        assert_eq!(vfs.set_drive_cwd(&root_path), Ok(()));
+
+        assert!(vfs.move_entry("C:/WORK", "C:/WORK/SUB/CYCLE").is_err());
+        assert_eq!(vfs.move_entry("C:/WORK", "C:/RENWORK"), Ok(()));
+        assert!(vfs.remove_dir("C:/RENWORK", EmptyOnly).is_err());
+        assert_eq!(vfs.remove_dir("C:/RENWORK", RecursiveSubtree), Ok(()));
+    }
+
+    /// Executes `run_cross_backend_vfs_conformance` on `InMemoryVfs`, `HostOsVfs`, and `DosFatVfs` (8.3 + LFN).
+    #[test]
+    fn test_cross_backend_conformance_in_memory_host_and_dos_fat() {
+        let mut mem = InMemoryVfs::new();
+        run_cross_backend_vfs_conformance(&mut mem);
+
+        let tmp = std::env::temp_dir().join(format!("wincmd_xbackend_{}", std::process::id()));
+        assert!(std::fs::create_dir_all(&tmp).is_ok());
+        let mut host = HostOsVfs::new(tmp.clone());
+        run_cross_backend_vfs_conformance(&mut host);
+        assert!(std::fs::remove_dir_all(&tmp).is_ok());
+
+        let mut dos_83 = DosFatVfs::new(crate::dos::SimulatedDosKernel::new());
+        run_cross_backend_vfs_conformance(&mut dos_83);
+
+        let mut lfn_kernel = crate::dos::SimulatedDosKernel::new();
+        lfn_kernel.mount_drive(
+            DriveLetter::C,
+            crate::dos::SimulatedDriveConfig {
+                lfn_mode: crate::dos::LfnSupportMode::EnabledInt21Ax71,
+                ..crate::dos::SimulatedDriveConfig::default()
+            },
+        );
+        let mut dos_lfn = DosFatVfs::new(lfn_kernel);
+        run_cross_backend_vfs_conformance(&mut dos_lfn);
+    }
+
+    /// Verifies `DosFatVfs` 8.3 vs LFN metadata, `copy_file` verify flag, cross-drive moves, and unsupported links.
+    #[test]
+    fn test_dos_fat_vfs_cross_drive_moves_copy_verify_and_unsupported_links() {
+        use crate::dos::{DosKernelApi, LfnSupportMode, SimulatedDosKernel, SimulatedDriveConfig};
+        use crate::types::VerifyCopyMode;
+
+        let mut kernel = SimulatedDosKernel::new();
+        kernel.mount_drive(
+            DriveLetter::D,
+            SimulatedDriveConfig {
+                lfn_mode: LfnSupportMode::EnabledInt21Ax71,
+                ..SimulatedDriveConfig::default()
+            },
+        );
+        let mut vfs = DosFatVfs::new(kernel);
+        assert_eq!(vfs.kernel().current_drive(), DriveLetter::C);
+        assert_eq!(vfs.free_disk_space(DriveLetter::C), Ok(16_777_216));
+
+        assert!(matches!(
+            vfs.create_symlink("C:/LNK", "C:/TGT", MklinkKind::FileSymlink),
+            Err(CmdError::UnsupportedOperation { .. })
+        ));
+        assert!(matches!(
+            vfs.create_hardlink("C:/HLNK", "C:/TGT"),
+            Err(CmdError::UnsupportedOperation { .. })
+        ));
+
+        assert_eq!(vfs.write_bytes("C:/verylongfile.html", b"dos83"), Ok(()));
+        let st_83 = vfs.stat("C:/VERYLONG.HTM");
+        assert_eq!(st_83.as_ref().map(|m| m.name.as_str()), Ok("VERYLONG.HTM"));
+        assert_eq!(
+            vfs.copy_file(
+                "C:/VERYLONG.HTM",
+                "D:/Long Report.html",
+                VerifyCopyMode::Verified
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            vfs.copy_file("C:/VERYLONG.HTM", "NUL", VerifyCopyMode::Unverified),
+            Ok(())
+        );
+        assert!(
+            vfs.copy_file("C:/MISSING.TXT", "NUL", VerifyCopyMode::Unverified)
+                .is_err()
+        );
+        assert_eq!(vfs.kernel().verify_flag(), VerifyCopyMode::Unverified);
+        let st_lfn = vfs.stat("D:/Long Report.html");
+        assert_eq!(
+            st_lfn.as_ref().map(|m| m.short_name.as_str()),
+            Ok("LONGRE~1.HTM")
+        );
+
+        let mut ro = FileAttributeFlags::default_file();
+        ro.insert(FileAttributeFlags::READ_ONLY);
+        assert_eq!(vfs.set_attributes("C:/VERYLONG.HTM", ro), Ok(()));
+        assert!(vfs.move_entry("C:/VERYLONG.HTM", "D:/MOVED.HTM").is_err());
+        assert_eq!(
+            vfs.set_attributes("C:/VERYLONG.HTM", FileAttributeFlags::default_file()),
+            Ok(())
+        );
+        assert_eq!(vfs.move_entry("C:/VERYLONG.HTM", "C:/VERYLONG.HTM"), Ok(()));
+        assert_eq!(
+            vfs.move_entry("C:/VERYLONG.HTM", "D:/Long Report.html"),
+            Ok(())
+        );
+        assert_eq!(vfs.read_bytes("D:/Long Report.html"), Ok(b"dos83".to_vec()));
+        assert!(!vfs.exists("C:/VERYLONG.HTM"));
+
+        assert_eq!(vfs.create_dir("C:/TREE/SUB", CreateParents), Ok(()));
+        assert_eq!(vfs.write_bytes("C:/TREE/SUB/A.TXT", b"tree"), Ok(()));
+        assert_eq!(vfs.set_attributes("C:/TREE/SUB/A.TXT", ro), Ok(()));
+        assert!(vfs.move_entry("C:/TREE", "D:/TREE_MOVED").is_err());
+        assert_eq!(
+            vfs.set_attributes("C:/TREE/SUB/A.TXT", FileAttributeFlags::default_file()),
+            Ok(())
+        );
+        assert_eq!(vfs.move_entry("C:/TREE", "D:/TREE_MOVED"), Ok(()));
+        assert_eq!(
+            vfs.read_bytes("D:/TREE_MOVED/SUB/A.TXT"),
+            Ok(b"tree".to_vec())
+        );
+        let owned = vfs.into_kernel();
+        assert_eq!(owned.current_drive(), DriveLetter::C);
+    }
+
+    /// Verifies `DosFatVfs` UNC redirectors, `PUSHD` aliases, and error branches.
+    #[test]
+    fn test_dos_fat_vfs_unc_redirectors_pushd_and_error_edges() {
+        use crate::dos::{DosKernelApi, SimulatedDosKernel, SimulatedDriveConfig};
+
+        let mut kernel = SimulatedDosKernel::new();
+        kernel.mount_drive(DriveLetter::D, SimulatedDriveConfig::default());
+        assert_eq!(
+            kernel.create_dir("D:/SHARED/DOCS"),
+            Err(CmdError::PathNotFound {
+                path: "D:/SHARED/DOCS".to_owned()
+            })
+        );
+        assert_eq!(kernel.create_dir("D:/SHARED"), Ok(()));
+        assert_eq!(kernel.create_dir("D:/SHARED/DOCS"), Ok(()));
+        let mut vfs = DosFatVfs::new(kernel);
+
+        assert!(matches!(
+            vfs.stat("//bad"),
+            Err(CmdError::InvalidUncPath { .. })
+        ));
+        assert!(matches!(
+            vfs.stat("//srv/shr/DOCS"),
+            Err(CmdError::NetworkPathNotFound { .. })
+        ));
+        assert!(
+            vfs.resolve_host_path(&vfs.resolve_path("Z:/NOPE"))
+                .is_none()
+        );
+
+        vfs.map_unc_redirector("srv", "shr", DriveLetter::D);
+        assert!(vfs.stat("//srv/shr/SHARED/DOCS").is_ok());
+        assert!(vfs.resolve_host_path(&vfs.resolve_path("C:/")).is_some());
+
+        assert!(vfs.mount_unc_drive("C:/not_unc", &[]).is_err());
+        assert!(
+            vfs.mount_unc_drive("//srv/shr", &["NOPE".to_owned()])
+                .is_err()
+        );
+        assert_eq!(vfs.write_bytes("D:/FILE.BIN", b"1"), Ok(()));
+        assert!(
+            vfs.mount_unc_drive("//srv/shr", &["FILE.BIN".to_owned()])
+                .is_err()
+        );
+
+        let z = vfs.mount_unc_drive("//srv/shr", &["SHARED".to_owned()]);
+        assert_eq!(z, Ok(DriveLetter::Z));
+        let y_letter = DriveLetter::try_from_char('Y').unwrap_or(DriveLetter::Z);
+        let y = vfs.mount_unc_drive("//srv/shr", &[]);
+        assert_eq!(y, Ok(y_letter));
+        assert!(vfs.mount_unc_drive("//bad", &[]).is_err());
+        assert_eq!(vfs.set_current_drive(DriveLetter::Z), Ok(()));
+        assert_eq!(vfs.current_drive(), DriveLetter::Z);
+        assert_eq!(
+            vfs.drive_cwd(DriveLetter::Z).map(|p| p.components),
+            Ok(vec!["SHARED".to_owned()])
+        );
+        assert_eq!(
+            vfs.volume_info(DriveLetter::Z).map(|v| v.label),
+            Ok("//srv/shr".to_owned())
+        );
+        assert_eq!(vfs.free_disk_space(DriveLetter::Z), Ok(16_777_216));
+
+        let z_docs = vfs.resolve_path("Z:/SHARED/DOCS");
+        assert_eq!(vfs.set_drive_cwd(&z_docs), Ok(()));
+        assert_eq!(
+            vfs.resolve_path("REL.TXT").components,
+            vec!["SHARED".to_owned(), "DOCS".to_owned(), "REL.TXT".to_owned()]
+        );
+        let unc_shared = vfs.resolve_path("//srv/shr/SHARED");
+        assert_eq!(vfs.set_drive_cwd(&unc_shared), Ok(()));
+        let d_root = vfs.resolve_path("D:/");
+        assert_eq!(vfs.set_drive_cwd(&d_root), Ok(()));
+        assert_eq!(vfs.create_dir("C:/C_EMPTY", ImmediateParentOnly), Ok(()));
+        assert_eq!(vfs.remove_dir("C:/C_EMPTY", EmptyOnly), Ok(()));
+        assert_eq!(vfs.create_dir("D:/D_EMPTY", ImmediateParentOnly), Ok(()));
+        assert_eq!(vfs.remove_dir("D:/D_EMPTY", EmptyOnly), Ok(()));
+        assert!(vfs.remove_dir("D:/SHARED", RecursiveSubtree).is_err());
+
+        vfs.kernel_mut().unmount_drive(DriveLetter::D);
+        assert!(vfs.stat("Z:/").is_err());
+        assert!(vfs.stat("//srv/shr").is_err());
+        assert_eq!(vfs.set_current_drive(DriveLetter::C), Ok(()));
+        vfs.unmount_drive(DriveLetter::Z);
+        vfs.unmount_drive(y_letter);
+        assert!(vfs.drive_cwd(DriveLetter::Z).is_err());
+
+        for d in DriveLetter::ALL_DESCENDING {
+            vfs.kernel_mut()
+                .mount_drive(d, SimulatedDriveConfig::default());
+        }
+        assert!(vfs.mount_unc_drive("//srv/shr", &[]).is_err());
+    }
+
+    /// Verifies `DosFatVfs` root stat, `MD`/`RD`/`MOVE`/`DEL`/`CD` error branches, and `READ_ONLY` guards.
+    #[test]
+    fn test_dos_fat_vfs_dir_move_delete_and_cwd_edges() {
+        let mut vfs = DosFatVfs::new(crate::dos::SimulatedDosKernel::new());
+        assert!(vfs.stat("C:/").is_ok_and(|m| m.attributes.is_directory()));
+        assert!(vfs.stat("C:/NO_PARENT/SUB/NUL").is_err());
+
+        assert_eq!(vfs.write_bytes("C:/F.TXT", b"f"), Ok(()));
+        assert_eq!(vfs.write_bytes("C:/RO.TXT", b"r"), Ok(()));
+        let mut ro_file = FileAttributeFlags::default_file();
+        ro_file.insert(FileAttributeFlags::READ_ONLY);
+        assert_eq!(vfs.set_attributes("C:/RO.TXT", ro_file), Ok(()));
+
+        assert!(vfs.set_drive_cwd(&vfs.resolve_path("C:/F.TXT")).is_err());
+        assert!(vfs.set_drive_cwd(&vfs.resolve_path("C:/NO_DIR")).is_err());
+        assert!(
+            vfs.set_drive_cwd(&vfs.resolve_path("C:/NO_PARENT/SUB"))
+                .is_err()
+        );
+
+        assert_eq!(vfs.create_dir("C:/DIR1", ImmediateParentOnly), Ok(()));
+        assert_eq!(vfs.create_dir("C:/DIR1/CHILD", CreateParents), Ok(()));
+        assert!(vfs.create_dir("C:/F.TXT/CHILD", CreateParents).is_err());
+        assert_eq!(vfs.create_dir("C:/DIR2", ImmediateParentOnly), Ok(()));
+
+        assert!(vfs.delete_file("C:/DIR2", ForceDeleteReadOnly).is_err());
+        assert_eq!(vfs.write_bytes("C:/WRITABLE.TXT", b"w"), Ok(()));
+        assert_eq!(
+            vfs.delete_file("C:/WRITABLE.TXT", ForceDeleteReadOnly),
+            Ok(())
+        );
+
+        assert!(vfs.remove_dir("C:/", EmptyOnly).is_err());
+        assert!(vfs.remove_dir("C:/NO_DIR", EmptyOnly).is_err());
+        assert!(vfs.remove_dir("C:/NO_PARENT/SUB", EmptyOnly).is_err());
+        assert!(vfs.remove_dir("C:/F.TXT", EmptyOnly).is_err());
+        let mut ro_dir = FileAttributeFlags::default_dir();
+        ro_dir.insert(FileAttributeFlags::READ_ONLY);
+        assert_eq!(vfs.set_attributes("C:/DIR2", ro_dir), Ok(()));
+        assert!(vfs.remove_dir("C:/DIR2", EmptyOnly).is_err());
+        assert_eq!(
+            vfs.set_attributes("C:/DIR2", FileAttributeFlags::default_dir()),
+            Ok(())
+        );
+
+        assert!(vfs.move_entry("C:/", "C:/X").is_err());
+        assert!(vfs.move_entry("C:/F.TXT", "C:/").is_err());
+        assert!(vfs.move_entry("C:/F.TXT", "C:/NO_PARENT/X.TXT").is_err());
+        assert!(vfs.move_entry("C:/F.TXT", "C:/F.TXT/X.TXT").is_err());
+        assert!(vfs.move_entry("C:/DIR1", "C:/DIR2").is_err());
+        assert!(vfs.move_entry("C:/F.TXT", "C:/DIR2").is_err());
+        assert!(vfs.move_entry("C:/F.TXT", "C:/RO.TXT").is_err());
     }
 }

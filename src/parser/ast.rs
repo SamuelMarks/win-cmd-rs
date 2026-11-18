@@ -4,6 +4,11 @@
 //! redirections, `IF` conditions, `FOR` loop variants, and `:label`/`REM` nodes
 //! for both runtime execution and `wincheck` static analysis.
 
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use derive_more::{Display, IsVariant};
 
 use crate::span::{ByteOffset, SourceId, Span};

@@ -4,7 +4,11 @@
 //! multi-pass expansion engine, parser, runtime interpreter, and static linter to
 //! maintain exact byte-level provenance for every token and diagnostic.
 
-use std::num::NonZeroUsize;
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::num::NonZeroUsize;
 
 use derive_more::{Constructor, Deref, Display, From, Into};
 

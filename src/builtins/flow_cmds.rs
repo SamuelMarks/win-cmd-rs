@@ -4,6 +4,11 @@
 //! `SHIFT /n`, interactive `PAUSE`, nested `CMD` subshells (honoring live Registry settings),
 //! and lossless `START` tail slicing (preserving multi-space and quoted arguments verbatim).
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::error::CmdError;
 use crate::parser::ast::SpannedWord;
 use crate::parser::phase1::{Phase1Context, expand_phase1};
@@ -238,6 +243,11 @@ pub(super) fn cmd_exit(
     let code = explicit_code.unwrap_or_else(|| interp.last_exit_code());
     if batch_only && exec_ctx == ExecutionContext::BatchFile {
         FlowControl::ExitBatchFrame(code)
+    } else if !batch_only
+        && interp.exec.call_stack().is_empty()
+        && interp.config.permanent_shell == crate::types::PermanentShellMode::Permanent
+    {
+        FlowControl::Continue
     } else {
         FlowControl::ExitShell(code)
     }

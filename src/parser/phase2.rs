@@ -6,6 +6,8 @@
 //! `ECHO(` block balancer, and CST-to-AST lowerer (using [`WordPartsMode::Lightweight`] at
 //! runtime to avoid sub-word [`crate::parser::ast::WordPart`] heap allocations).
 
+use alloc::vec::Vec;
+
 use crate::error::CmdError;
 use crate::parser::ast::{LabelNode, SpannedWord, Statement};
 use crate::parser::cst::SyntaxKind;

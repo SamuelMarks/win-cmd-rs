@@ -5,10 +5,18 @@
 //! built-in commands, CLI, and static linter returns a single strongly typed [`CmdError`]
 //! enum derived via `derive_more`.
 
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use derive_more::{Display, Error, From, IsVariant};
 
 use crate::span::{ByteOffset, Span};
-use crate::types::{CodePage, DriveLetter, ExitCode, FileDescriptor, LabelName};
+use crate::types::{
+    CodePage, DosErrorCode, DosExtendedError, DriveLetter, ExitCode, FileDescriptor, IoErrorKind,
+    LabelName,
+};
 
 /// Grammar constructs expected by the PEG parser at a farthest-failure location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, IsVariant)]
@@ -640,10 +648,35 @@ operable program or batch file."
     ChildProcessFailure {
         /// Executable path or command name.
         program: String,
-        /// Underlying OS [`std::io::ErrorKind`].
-        kind: std::io::ErrorKind,
-        /// OS error description.
+        /// Portable [`IoErrorKind`] describing the failure reason.
+        kind: IoErrorKind,
+        /// OS or DOS error description.
         message: String,
+    },
+
+    /// Conventional or DPMI memory was insufficient to complete an operation or load a child program.
+    #[display("Program too big to fit in memory")]
+    InsufficientMemory,
+
+    /// Serialized MS-DOS environment segment exceeded configured `/E:nnnnn` or 32 KiB capacity.
+    #[display("Out of environment space")]
+    OutOfEnvironmentSpace,
+
+    /// External MS-DOS command tail exceeded the 126-byte Program Segment Prefix (`PSP:0x80`) limit.
+    #[display("Command line too long ({length} bytes exceeds {limit}-byte limit)")]
+    CommandLineTooLong {
+        /// Actual encoded byte length of the command tail.
+        length: usize,
+        /// Maximum permitted byte length (`126` on real-mode MS-DOS PSP).
+        limit: usize,
+    },
+
+    /// Requested filesystem or OS feature is unsupported on the active backend (e.g., symlinks on MS-DOS FAT).
+    #[display("The request is not supported: {operation}")]
+    UnsupportedOperation {
+        /// Short description of the unsupported operation.
+        #[error(not(source))]
+        operation: String,
     },
 
     /// Host or stream I/O failure.
@@ -710,6 +743,161 @@ operable program or batch file."
 }
 
 impl CmdError {
+    /// Checks whether `operation` denotes a directory-level filesystem operation.
+    ///
+    /// # Arguments
+    /// * `operation` - Short operation tag (`"mkdir"`, `"chdir"`, `"rmdir"`, etc.).
+    ///
+    /// # Returns
+    /// `true` when `NotFound` should map to [`CmdError::PathNotFound`] rather than [`CmdError::FileNotFound`].
+    #[must_use]
+    pub const fn is_directory_operation(operation: &str) -> bool {
+        matches!(
+            operation.as_bytes(),
+            b"mkdir"
+                | b"chdir"
+                | b"rmdir"
+                | b"create_dir"
+                | b"remove_dir"
+                | b"read_dir"
+                | b"set_current_dir"
+        )
+    }
+
+    /// Maps a portable [`IoErrorKind`] and message into the closest domain-specific [`CmdError`] variant.
+    ///
+    /// Works identically across both `std` and `#![no_std]` MS-DOS builds.
+    ///
+    /// # Arguments
+    /// * `kind` - Portable [`IoErrorKind`] classification.
+    /// * `detail` - Error description text.
+    /// * `path` - Target path associated with the operation (if applicable).
+    /// * `operation` - Short name of the operation (`"read"`, `"write"`, `"mkdir"`, etc.).
+    ///
+    /// # Returns
+    /// The mapped [`CmdError`] preserving `cmd.exe` / `COMMAND.COM` error semantics.
+    #[must_use]
+    pub fn from_io_kind(kind: IoErrorKind, detail: &str, path: &str, operation: &str) -> Self {
+        match kind {
+            IoErrorKind::NotFound => {
+                if Self::is_directory_operation(operation) {
+                    Self::PathNotFound {
+                        path: path.to_owned(),
+                    }
+                } else {
+                    Self::FileNotFound {
+                        path: path.to_owned(),
+                    }
+                }
+            }
+            IoErrorKind::PermissionDenied
+            | IoErrorKind::IsADirectory
+            | IoErrorKind::ReadOnlyFilesystem => Self::AccessDenied {
+                path: path.to_owned(),
+            },
+            IoErrorKind::AlreadyExists => Self::FileAlreadyExists {
+                path: path.to_owned(),
+            },
+            IoErrorKind::DirectoryNotEmpty => Self::DirectoryNotEmpty {
+                path: path.to_owned(),
+            },
+            IoErrorKind::WouldBlock => Self::SharingViolation {
+                path: path.to_owned(),
+            },
+            IoErrorKind::BrokenPipe => Self::BrokenPipe,
+            IoErrorKind::OutOfMemory => Self::InsufficientMemory,
+            IoErrorKind::Unsupported => Self::UnsupportedOperation {
+                operation: operation.to_owned(),
+            },
+            IoErrorKind::DosExtended(dos_err) => Self::from_dos_error(dos_err, path, operation),
+            IoErrorKind::NotADirectory
+            | IoErrorKind::InvalidInput
+            | IoErrorKind::InvalidData
+            | IoErrorKind::TimedOut
+            | IoErrorKind::WriteZero
+            | IoErrorKind::Interrupted
+            | IoErrorKind::StorageFull
+            | IoErrorKind::CrossesDevices
+            | IoErrorKind::Other => Self::IoFailure {
+                operation: operation.to_owned(),
+                message: detail.to_owned(),
+            },
+        }
+    }
+
+    /// Maps an MS-DOS `INT 21h AH=59h` [`DosExtendedError`] into a domain-specific [`CmdError`].
+    ///
+    /// # Arguments
+    /// * `err` - Structured [`DosExtendedError`] returned by the DOS kernel.
+    /// * `path` - Target DOS path associated with the failing call.
+    /// * `operation` - Short name of the operation (`"open"`, `"mkdir"`, `"exec"`, etc.).
+    ///
+    /// # Returns
+    /// Mapped [`CmdError`] with authentic `COMMAND.COM` / `cmd.exe` semantics.
+    #[must_use]
+    pub fn from_dos_error(err: DosExtendedError, path: &str, operation: &str) -> Self {
+        match err.code {
+            DosErrorCode::FileNotFound | DosErrorCode::NoMoreFiles => {
+                if Self::is_directory_operation(operation) {
+                    Self::PathNotFound {
+                        path: path.to_owned(),
+                    }
+                } else {
+                    Self::FileNotFound {
+                        path: path.to_owned(),
+                    }
+                }
+            }
+            DosErrorCode::PathNotFound => Self::PathNotFound {
+                path: path.to_owned(),
+            },
+            DosErrorCode::InvalidDrive => path
+                .chars()
+                .next()
+                .and_then(|ch| DriveLetter::try_from_char(ch).ok())
+                .map_or_else(
+                    || Self::InvalidDriveLetter {
+                        ch: path.chars().next().unwrap_or('?'),
+                    },
+                    |drive| Self::DriveNotFound { drive },
+                ),
+            DosErrorCode::AccessDenied
+            | DosErrorCode::WriteProtectedDisk
+            | DosErrorCode::AttemptToRemoveCurrentDirectory
+            | DosErrorCode::CannotMakeDirectoryEntry => Self::AccessDenied {
+                path: path.to_owned(),
+            },
+            DosErrorCode::SharingViolation | DosErrorCode::LockViolation => {
+                Self::SharingViolation {
+                    path: path.to_owned(),
+                }
+            }
+            DosErrorCode::FileExists => Self::FileAlreadyExists {
+                path: path.to_owned(),
+            },
+            DosErrorCode::NotEnoughMemory
+            | DosErrorCode::ArenaTrashed
+            | DosErrorCode::InvalidBlock => Self::InsufficientMemory,
+            DosErrorCode::BadEnvironment => Self::OutOfEnvironmentSpace,
+            DosErrorCode::InvalidFunction => Self::UnsupportedOperation {
+                operation: operation.to_owned(),
+            },
+            DosErrorCode::TooManyOpenFiles
+            | DosErrorCode::InvalidHandle
+            | DosErrorCode::BadFormat
+            | DosErrorCode::InvalidAccess
+            | DosErrorCode::InvalidData
+            | DosErrorCode::NotSameDevice
+            | DosErrorCode::UnknownUnit
+            | DosErrorCode::DriveNotReady
+            | DosErrorCode::GeneralFailure
+            | DosErrorCode::UnknownCode(_) => Self::IoFailure {
+                operation: operation.to_owned(),
+                message: err.to_string(),
+            },
+        }
+    }
+
     /// Maps a host [`std::io::Error`] into the closest domain-specific [`CmdError`] variant.
     ///
     /// Distinguishes directory operations (`"mkdir"`, `"chdir"`, `"rmdir"`, `"create_dir"`,
@@ -723,55 +911,15 @@ impl CmdError {
     ///
     /// # Returns
     /// The mapped [`CmdError`] preserving `cmd.exe` error semantics.
+    #[cfg(feature = "std")]
     #[must_use]
     pub fn from_io_error(err: &std::io::Error, path: &str, operation: &str) -> Self {
-        let kind = err.kind();
-        if kind == std::io::ErrorKind::NotFound {
-            if matches!(
-                operation,
-                "mkdir"
-                    | "chdir"
-                    | "rmdir"
-                    | "create_dir"
-                    | "remove_dir"
-                    | "read_dir"
-                    | "set_current_dir"
-            ) {
-                Self::PathNotFound {
-                    path: path.to_owned(),
-                }
-            } else {
-                Self::FileNotFound {
-                    path: path.to_owned(),
-                }
-            }
-        } else if matches!(
-            kind,
-            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory
-        ) {
-            Self::AccessDenied {
-                path: path.to_owned(),
-            }
-        } else if kind == std::io::ErrorKind::AlreadyExists {
-            Self::FileAlreadyExists {
-                path: path.to_owned(),
-            }
-        } else if kind == std::io::ErrorKind::DirectoryNotEmpty {
-            Self::DirectoryNotEmpty {
-                path: path.to_owned(),
-            }
-        } else if kind == std::io::ErrorKind::WouldBlock {
-            Self::SharingViolation {
-                path: path.to_owned(),
-            }
-        } else if kind == std::io::ErrorKind::BrokenPipe {
-            Self::BrokenPipe
-        } else {
-            Self::IoFailure {
-                operation: operation.to_owned(),
-                message: err.to_string(),
-            }
-        }
+        Self::from_io_kind(
+            IoErrorKind::from(err.kind()),
+            &err.to_string(),
+            path,
+            operation,
+        )
     }
 
     /// Returns the exact Windows `cmd.exe`-compatible error message string for this error.
@@ -824,6 +972,10 @@ impl CmdError {
             | Self::LineTooLong { .. }
             | Self::BrokenPipe
             | Self::ChildProcessFailure { .. }
+            | Self::InsufficientMemory
+            | Self::OutOfEnvironmentSpace
+            | Self::CommandLineTooLong { .. }
+            | Self::UnsupportedOperation { .. }
             | Self::IoFailure { .. }
             | Self::LinterRuleNotFound { .. }
             | Self::LinterDirectiveError { .. }
@@ -889,6 +1041,10 @@ impl CmdError {
             | Self::LineTooLong { .. }
             | Self::BrokenPipe
             | Self::ChildProcessFailure { .. }
+            | Self::InsufficientMemory
+            | Self::OutOfEnvironmentSpace
+            | Self::CommandLineTooLong { .. }
+            | Self::UnsupportedOperation { .. }
             | Self::IoFailure { .. }
             | Self::LinterDirectiveError { .. }
             | Self::ExecutionLimitExceeded(_)
@@ -947,6 +1103,10 @@ impl CmdError {
             | Self::EncodingByteOffsetMismatch { .. }
             | Self::BrokenPipe
             | Self::ChildProcessFailure { .. }
+            | Self::InsufficientMemory
+            | Self::OutOfEnvironmentSpace
+            | Self::CommandLineTooLong { .. }
+            | Self::UnsupportedOperation { .. }
             | Self::IoFailure { .. }
             | Self::LinterRuleNotFound { .. }
             | Self::CliUsage(_) => None,
@@ -1525,10 +1685,35 @@ operable program or batch file.",
             (
                 CmdError::ChildProcessFailure {
                     program: "ext.exe".to_owned(),
-                    kind: std::io::ErrorKind::NotFound,
+                    kind: IoErrorKind::NotFound,
                     message: "missing".to_owned(),
                 },
                 "Failed to execute 'ext.exe' (NotFound): missing",
+                ExitCode::FAILURE,
+            ),
+            (
+                CmdError::InsufficientMemory,
+                "Program too big to fit in memory",
+                ExitCode::FAILURE,
+            ),
+            (
+                CmdError::OutOfEnvironmentSpace,
+                "Out of environment space",
+                ExitCode::FAILURE,
+            ),
+            (
+                CmdError::CommandLineTooLong {
+                    length: 140,
+                    limit: 126,
+                },
+                "Command line too long (140 bytes exceeds 126-byte limit)",
+                ExitCode::FAILURE,
+            ),
+            (
+                CmdError::UnsupportedOperation {
+                    operation: "symlink".to_owned(),
+                },
+                "The request is not supported: symlink",
                 ExitCode::FAILURE,
             ),
             (
@@ -1647,5 +1832,158 @@ operable program or batch file.",
             let io_err = std::io::Error::new(kind, "custom io err");
             assert_eq!(CmdError::from_io_error(&io_err, "p", op), expected);
         }
+    }
+
+    /// Verifies `CmdError::from_io_kind` and `CmdError::from_dos_error` across all MS-DOS error codes.
+    #[test]
+    fn test_cmd_error_from_dos_error_mapping() {
+        let cases = [
+            (
+                CmdError::from_io_kind(IoErrorKind::OutOfMemory, "oom", "p", "exec"),
+                CmdError::InsufficientMemory,
+            ),
+            (
+                CmdError::from_io_kind(IoErrorKind::Unsupported, "unsup", "p", "symlink"),
+                CmdError::UnsupportedOperation {
+                    operation: "symlink".to_owned(),
+                },
+            ),
+            (
+                CmdError::from_io_kind(
+                    IoErrorKind::DosExtended(DosExtendedError::from_code(
+                        DosErrorCode::FileNotFound,
+                    )),
+                    "",
+                    "a.txt",
+                    "open",
+                ),
+                CmdError::FileNotFound {
+                    path: "a.txt".to_owned(),
+                },
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::FileNotFound),
+                    "sub",
+                    "mkdir",
+                ),
+                CmdError::PathNotFound {
+                    path: "sub".to_owned(),
+                },
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::PathNotFound),
+                    "dir",
+                    "open",
+                ),
+                CmdError::PathNotFound {
+                    path: "dir".to_owned(),
+                },
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::InvalidDrive),
+                    "Z:\\file",
+                    "open",
+                ),
+                CmdError::DriveNotFound {
+                    drive: DriveLetter::Z,
+                },
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::InvalidDrive),
+                    "1:\\file",
+                    "open",
+                ),
+                CmdError::InvalidDriveLetter { ch: '1' },
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::InvalidDrive),
+                    "",
+                    "open",
+                ),
+                CmdError::InvalidDriveLetter { ch: '?' },
+            ),
+        ];
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected);
+        }
+    }
+
+    /// Verifies remaining `CmdError::from_dos_error` permission, memory, environment, and fallback branches.
+    #[test]
+    fn test_cmd_error_from_dos_error_resource_and_fallback_mapping() {
+        let cases = [
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::WriteProtectedDisk),
+                    "A:\\f",
+                    "write",
+                ),
+                CmdError::AccessDenied {
+                    path: "A:\\f".to_owned(),
+                },
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::SharingViolation),
+                    "C:\\f",
+                    "open",
+                ),
+                CmdError::SharingViolation {
+                    path: "C:\\f".to_owned(),
+                },
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::FileExists),
+                    "C:\\f",
+                    "create",
+                ),
+                CmdError::FileAlreadyExists {
+                    path: "C:\\f".to_owned(),
+                },
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::NotEnoughMemory),
+                    "",
+                    "exec",
+                ),
+                CmdError::InsufficientMemory,
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::BadEnvironment),
+                    "",
+                    "exec",
+                ),
+                CmdError::OutOfEnvironmentSpace,
+            ),
+            (
+                CmdError::from_dos_error(
+                    DosExtendedError::from_code(DosErrorCode::InvalidFunction),
+                    "",
+                    "mklink",
+                ),
+                CmdError::UnsupportedOperation {
+                    operation: "mklink".to_owned(),
+                },
+            ),
+        ];
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected);
+        }
+        assert!(matches!(
+            CmdError::from_dos_error(
+                DosExtendedError::from_code(DosErrorCode::DriveNotReady),
+                "A:\\",
+                "read"
+            ),
+            CmdError::IoFailure { .. }
+        ));
     }
 }

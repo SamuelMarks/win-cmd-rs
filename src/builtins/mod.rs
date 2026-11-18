@@ -5,15 +5,21 @@
 //! - `flow_cmds`: `CALL`, `GOTO`, `EXIT`, `SHIFT`, `PAUSE`, `CMD` subshell, `START`.
 //! - `fs_cmds`: `DIR`, `CD`/`CHDIR`, `MD`/`MKDIR`, `RD`/`RMDIR`, `PUSHD`, `POPD`, `COPY`, `DEL`/`ERASE`, `REN`/`RENAME`, `MOVE`, `TYPE`, `MKLINK`.
 //! - `console_cmds`: `ECHO`, `CLS`, `COLOR`, `TITLE`, `VER`, `VOL`, `DATE`, `TIME`, `VERIFY`, `CHCP`, `MODE`, `DOSKEY`.
+//! - `dos_cmds`: MS-DOS `TRUENAME`, `CTTY`, `LH`/`LOADHIGH`, and `MEM` (`/C`, `/D`, `/F`, `/M`, `/P`).
 //! - `shims_search`: `WHERE`, `FIND`, `FINDSTR`, `SORT`, `MORE`, `FC`, `COMP`, `TREE`.
 //! - `shims_admin`: `XCOPY`, `ROBOCOPY`, `ATTRIB`, `CHOICE`, `TIMEOUT`, `REG`, `HOSTNAME`, `WHOAMI`.
 
 mod console_cmds;
+mod dos_cmds;
 mod env_cmds;
 mod flow_cmds;
 mod fs_cmds;
 mod shims_admin;
 mod shims_search;
+
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::error::CmdError;
 use crate::parser::ast::SpannedWord;
@@ -30,6 +36,7 @@ use self::console_cmds::{
     cmd_chcp, cmd_cls, cmd_color, cmd_date, cmd_doskey, cmd_echo, cmd_mode, cmd_time, cmd_title,
     cmd_ver, cmd_verify, cmd_vol,
 };
+use self::dos_cmds::{cmd_ctty, cmd_loadhigh, cmd_truename, shim_mem};
 use self::env_cmds::{
     cmd_assoc, cmd_endlocal, cmd_ftype, cmd_path, cmd_prompt, cmd_set, cmd_setlocal,
 };
@@ -119,7 +126,10 @@ pub fn dispatch_builtin(
 
     if !vfs_override && can_dispatch_shim_for_path(interp, prog_unquoted) {
         let leaf_raw = upper.rsplit([BS_CHAR, '/']).next().unwrap_or(&upper);
-        let leaf_upper = leaf_raw.strip_suffix(".EXE").unwrap_or(leaf_raw);
+        let leaf_upper = leaf_raw
+            .strip_suffix(".EXE")
+            .or_else(|| leaf_raw.strip_suffix(".COM"))
+            .unwrap_or(leaf_raw);
         if let Some(flow) = try_dispatch_shim(interp, leaf_upper, inv, io)? {
             return Ok(flow);
         }
@@ -207,7 +217,7 @@ fn try_dispatch_internal(
         "GOTO" => cmd_goto(inv.args, inv.cmd_span)?,
         "SHIFT" => cmd_shift(interp, inv.args),
         "EXIT" => cmd_exit(interp, inv.args, inv.exec_ctx),
-        "VER" => cmd_ver(interp, io)?,
+        "VER" => cmd_ver(interp, inv.args, io)?,
         "VOL" => cmd_vol(interp, inv.args, io)?,
         "CLS" => cmd_cls(interp, io)?,
         "COLOR" => cmd_color(interp, inv.args)?,
@@ -218,6 +228,9 @@ fn try_dispatch_internal(
         "DATE" => cmd_date(interp, inv.args, io)?,
         "TIME" => cmd_time(interp, inv.args, io)?,
         "VERIFY" => cmd_verify(interp, inv.args, io)?,
+        "TRUENAME" => cmd_truename(interp, inv.args, io)?,
+        "CTTY" => cmd_ctty(interp, inv.args, io)?,
+        "LH" | "LOADHIGH" => cmd_loadhigh(interp, inv.raw_tail, io)?,
         "ASSOC" => cmd_assoc(interp, inv.raw_tail, io)?,
         "FTYPE" => cmd_ftype(interp, inv.raw_tail, io)?,
         "START" => cmd_start(
@@ -273,6 +286,7 @@ fn try_dispatch_shim(
         "TREE" => shim_tree(interp, inv.args, io)?,
         "HOSTNAME" => shim_hostname(interp, io)?,
         "WHOAMI" => shim_whoami(interp, io)?,
+        "MEM" => shim_mem(interp, inv.args, io)?,
         _ => return Ok(None),
     };
     Ok(Some(flow))
@@ -3385,5 +3399,229 @@ mod tests {
             .0,
             ExitCode::SUCCESS
         );
+    }
+
+    /// Verifies MS-DOS `TRUENAME`, `CTTY`, `LH`, `MEM`, `VER /R`, `VERIFY`, `CHOICE /S /T:c,n`, `DEL <dir>`, and `/P` `EXIT`.
+    #[test]
+    fn test_msdos_builtins_truename_ctty_lh_mem_choice_and_permanent_exit() {
+        use crate::dos::SimulatedDosKernel;
+        use crate::runtime::BufferedIoStreams;
+        use crate::types::{ConsoleRenderBackend, ShellDialect};
+
+        let (mut dos_interp, _) = Interpreter::with_dos_kernel(SimulatedDosKernel::new());
+        dos_interp.apply_shell_dialect(ShellDialect::MsDos622);
+        assert_eq!(dos_interp.config.dialect, ShellDialect::MsDos622);
+        dos_interp.apply_shell_dialect(ShellDialect::FreeDos);
+        dos_interp.apply_shell_dialect(ShellDialect::WindowsNtCmd);
+        dos_interp.apply_shell_dialect(ShellDialect::MsDos622);
+
+        let mut io = BufferedIoStreams::new();
+        assert_eq!(
+            dos_interp.execute_interactive_line("truename", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(io.stdout, format!("C:\\{CRLF}"));
+        io.stdout.clear();
+        assert_eq!(
+            dos_interp.execute_interactive_line("truename ver_long_name.text", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(io.stdout, format!("C:\\VER_LONG.TEX{CRLF}"));
+
+        assert_eq!(
+            dos_interp.execute_interactive_line("ctty COM1:", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            dos_interp.console.render_backend,
+            ConsoleRenderBackend::DumbTeletype
+        );
+        assert_eq!(
+            dos_interp.execute_interactive_line("ctty CON", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            dos_interp.console.render_backend,
+            ConsoleRenderBackend::BiosVgaAttribute
+        );
+        assert_eq!(
+            dos_interp.execute_interactive_line("ctty PRN", &mut io),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            dos_interp.execute_interactive_line("ctty CON", &mut io),
+            ExitCode::SUCCESS
+        );
+
+        io.stdout.clear();
+        assert_eq!(
+            dos_interp.execute_interactive_line("lh /L:1,4096 /S echo loaded_high", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert!(io.stdout.contains("loaded_high"));
+        assert_eq!(
+            dos_interp.execute_interactive_line("loadhigh /S", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_ne!(
+            dos_interp.execute_interactive_line("lh /X", &mut io),
+            ExitCode::SUCCESS
+        );
+
+        io.stdout.clear();
+        assert_eq!(
+            dos_interp.execute_interactive_line("mem", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            dos_interp.execute_interactive_line("mem.com /c /d /f /p /m:MOUSE /x", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert!(io.stdout.contains("MOUSE is using the following memory:"));
+        assert!(io.stdout.contains("Modules using memory below 1 MB:"));
+        assert!(io.stdout.contains("Conventional Memory Detail:"));
+        assert!(io.stdout.contains("Free Conventional Memory:"));
+    }
+
+    /// Verifies MS-DOS `VER /R`, `VERIFY` kernel sync, and `DATE`/`TIME` kernel synchronization.
+    #[test]
+    fn test_msdos_ver_verify_and_rtc_sync() {
+        use crate::dos::{DosKernelApi, SimulatedDosKernel};
+        use crate::runtime::BufferedIoStreams;
+        use crate::types::{ShellDialect, VerifyCopyMode};
+
+        let (mut dos_interp, shared) = Interpreter::with_dos_kernel(SimulatedDosKernel::new());
+        dos_interp.apply_shell_dialect(ShellDialect::MsDos622);
+        let mut io = BufferedIoStreams::new();
+        assert_eq!(
+            dos_interp.execute_interactive_line("ver /r", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert!(io.stdout.contains("DOS is in HMA"));
+
+        assert_eq!(
+            dos_interp.execute_interactive_line("verify on", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            shared.with(DosKernelApi::verify_flag),
+            VerifyCopyMode::Verified
+        );
+        assert_eq!(
+            dos_interp.execute_interactive_line("verify off", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            shared.with(DosKernelApi::verify_flag),
+            VerifyCopyMode::Unverified
+        );
+        for rtc_cmd in [
+            "date 1995-08-24",
+            "date 08-25-1995",
+            "date freeform",
+            "date 08-25-1995-extra",
+            "date 08-xx-1995",
+            "time 14:30:20.50",
+            "time freeform",
+            "time 1:2:3:4",
+            "time 14:xx",
+        ] {
+            assert_eq!(
+                dos_interp.execute_interactive_line(rtc_cmd, &mut io),
+                ExitCode::SUCCESS
+            );
+        }
+
+        let mut rtc_in = BufferedIoStreams::with_stdin("1995-08-26\r\n09:15\r\n".to_owned());
+        assert_eq!(
+            dos_interp.execute_interactive_line("date", &mut rtc_in),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            dos_interp.execute_interactive_line("time", &mut rtc_in),
+            ExitCode::SUCCESS
+        );
+    }
+
+    /// Verifies MS-DOS `CHOICE /S /T:c,n`, `DEL <dir>`, `/P` `EXIT`, and host fallback DOS commands.
+    #[test]
+    fn test_msdos_choice_del_dir_and_permanent_exit() {
+        use crate::dos::SimulatedDosKernel;
+        use crate::runtime::BufferedIoStreams;
+        use crate::types::{PermanentShellMode, ShellDialect};
+
+        let (mut dos_interp, _shared) = Interpreter::with_dos_kernel(SimulatedDosKernel::new());
+        dos_interp.apply_shell_dialect(ShellDialect::MsDos622);
+        let mut io = BufferedIoStreams::new();
+
+        let mut ch_io = BufferedIoStreams::with_stdin("y\r\nY\r\n\r\n".to_owned());
+        assert_eq!(
+            dos_interp.execute_interactive_line("choice /c:YN /s /t:Y,5 Continue", &mut ch_io),
+            ExitCode::new(255)
+        );
+        assert_eq!(
+            dos_interp.execute_interactive_line("choice /c:YN /s /t:Y,5 Continue", &mut ch_io),
+            ExitCode::new(1)
+        );
+        assert_eq!(
+            dos_interp.execute_interactive_line("choice /c:YN \"/t:N,3\"", &mut ch_io),
+            ExitCode::new(2)
+        );
+        assert!(ch_io.stdout.contains("Continue [Y,N]?"));
+        for bad_ch in [
+            "choice /t:Y",
+            "choice /t:Y,bad",
+            "choice \"/t:Y,bad\"",
+            "choice /t:YY,5",
+            "choice \"/t:YY,5\"",
+            "choice Msg1 Msg2",
+        ] {
+            assert_ne!(
+                dos_interp.execute_interactive_line(bad_ch, &mut io),
+                ExitCode::SUCCESS
+            );
+        }
+
+        assert_eq!(
+            dos_interp.execute_interactive_line("md C:\\WIPE", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            dos_interp.execute_interactive_line("echo hi > C:\\WIPE\\A.TXT", &mut io),
+            ExitCode::SUCCESS
+        );
+        let mut del_io = BufferedIoStreams::with_stdin("Y\r\n".to_owned());
+        assert_eq!(
+            dos_interp.execute_interactive_line("del C:\\WIPE", &mut del_io),
+            ExitCode::SUCCESS
+        );
+        assert!(
+            del_io
+                .stdout
+                .contains("All files in directory will be deleted!")
+        );
+
+        dos_interp.config.permanent_shell = PermanentShellMode::Permanent;
+        assert_eq!(
+            dos_interp.execute_interactive_line("exit 9", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(dos_interp.exec.exited(), None);
+
+        let mut host_interp = Interpreter::new();
+        assert_eq!(
+            host_interp.execute_interactive_line("truename C:/", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            host_interp.execute_interactive_line("ctty CON", &mut io),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            host_interp.execute_interactive_line("mem /m", &mut io),
+            ExitCode::SUCCESS
+        );
+        host_interp.apply_shell_dialect(ShellDialect::MsDos622);
+        assert_eq!(host_interp.config.version_banner, "MS-DOS Version 6.22");
     }
 }

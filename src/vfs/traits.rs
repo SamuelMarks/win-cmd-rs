@@ -1,13 +1,17 @@
 //! Core Virtual File System traits, metadata, timestamps, attributes, and directory entry types.
 
-use std::path::PathBuf;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use derive_more::Display;
 
 use crate::error::CmdError;
 use crate::types::{
     AttributeMutation, CmdLocaleConfig, DateFormatStyle, DirCreationDepth, DirRemovalMode,
-    DriveLetter, HostBindingMode, MklinkKind, ReadOnlyDeletePolicy, TimeClockFormat,
+    DriveLetter, HostBindingMode, MklinkKind, NativeBackingPath, ReadOnlyDeletePolicy,
+    TimeClockFormat,
 };
 use crate::vfs::path::WindowsPath;
 
@@ -532,7 +536,7 @@ pub struct VolumeInfo {
 }
 
 /// Trait abstracting all filesystem, path, attribute, link, share, and drive operations.
-pub trait VirtualFileSystem: std::fmt::Debug {
+pub trait VirtualFileSystem: core::fmt::Debug {
     /// Returns the currently active [`DriveLetter`].
     ///
     /// # Returns
@@ -829,14 +833,14 @@ pub trait VirtualFileSystem: std::fmt::Debug {
     /// * `drive` - The temporary [`DriveLetter`] to unmount.
     fn unmount_drive(&mut self, drive: DriveLetter);
 
-    /// Translates a resolved [`WindowsPath`] to a real host [`PathBuf`] if backed by the host OS.
+    /// Translates a resolved [`WindowsPath`] to a native backing path ([`NativeBackingPath`]) if backed by the host OS or DOS volume.
     ///
     /// # Arguments
     /// * `win_path` - Resolved [`WindowsPath`].
     ///
     /// # Returns
-    /// `Some(PathBuf)` if backed by [`super::HostOsVfs`], or `None` for pure [`super::InMemoryVfs`].
-    fn resolve_host_path(&self, win_path: &WindowsPath) -> Option<PathBuf>;
+    /// `Some(NativeBackingPath)` if backed by a host/DOS volume, or `None` for pure [`super::InMemoryVfs`].
+    fn resolve_host_path(&self, win_path: &WindowsPath) -> Option<NativeBackingPath>;
 
     /// Configures the simulated free disk space (in bytes) for `drive` on [`super::InMemoryVfs`] or [`super::HostOsVfs`].
     ///
