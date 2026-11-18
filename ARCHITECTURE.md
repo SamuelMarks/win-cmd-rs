@@ -381,7 +381,12 @@ classDiagram
         +VerifyCopyMode verify_state
         +OutputUnicodeMode unicode_output_mode
         +PipeExecutionMode pipe_execution_mode
+        +StartWaitMode start_wait_mode
+        +StartWindowMode start_window_mode
+        +StartEnvMode start_env_mode
+        +StartPriorityClass start_priority
         +FileCompletionMode file_completion
+        +String version_banner
         +ExecutionLimits limits
     }
     class ConsoleState {
@@ -389,17 +394,27 @@ classDiagram
         +CodePage codepage
         +u16 console_cols
         +u16 console_lines
+        +String console_title
+        +Option~ConsoleColor~ console_color
         +ConsoleRenderBackend render_backend
+        +DoskeyEditMode doskey_edit_mode
         +BTreeMap doskey_macros
         -VecDeque~String~ command_history
+        -usize history_list_size
     }
     class ExecutionState {
         +SourceMap source_map
         -Option_SourceId_8 ephemeral_ring
+        -usize ephemeral_cursor
         -BTreeMap~String, SourceId~ batch_source_slots
         -Vec~BatchCallFrame~ call_stack
         -Vec~ForVarName_String~ for_vars
+        -BTreeMap~u8, FdSink~ active_output_sinks
+        -BTreeMap~u8, Option_String~ active_input_handles
         -ExitCode last_exit_code
+        -bool last_cmd_succeeded
+        -Option~ExitCode~ exited
+        -InterruptState interrupt_state
         -usize steps_executed
     }
     class ExecutionLimits {
@@ -553,8 +568,8 @@ flowchart TB
     end
 
     subgraph TargetDos["MS-DOS Target Adapter (crates/wincmd-dos/)"]
-        DJ_K["DjgppDosKernel (#![forbid(unsafe_code)])<br/>Maps DosExtendedError -> CmdError::from_dos_error"]
-        DJ_FFI["ffi.rs + alloc_djgpp.rs + panic_dos.rs<br/>• DjgppAllocator (malloc/free + &gt;8B alignment header)<br/>• Zero-heap stack #[panic_handler] to fd 2<br/>• INT 21h/16h/11h/10h/31h &amp; spawnvpe"]
+        DJ_K["DjgppDosKernel + panic_dos + stub_verify (#![forbid(unsafe_code)])<br/>• Maps DosExtendedError -> CmdError::from_dos_error<br/>• Zero-heap stack #[panic_handler] &amp; MZ guard verifier"]
+        DJ_FFI["ffi.rs + alloc_djgpp.rs + bin/{wincmd,wincheck}.rs + stub/*.{asm,s}<br/>• DjgppAllocator (malloc/free + &gt;8B alignment header)<br/>• C main entrypoints &amp; 8086/x86 guard/chkstk stubs<br/>• INT 21h/16h/11h/10h/31h &amp; spawnvpe"]
     end
 
     INTERP_DOS --> DOS_VFS & DOS_EXEC & DOS_CON
@@ -566,7 +581,7 @@ flowchart TB
 
 ### 11.2 Single-Tasking `%TEMP%` Pipeline Spooling (`src/runtime/dos_exec.rs`)
 
-Because real-mode MS-DOS is single-tasking and has no concurrent anonymous kernel pipes, `Interpreter::execute_pipeline` (`PipeExecutionMode::InMemoryBuffered`) and `DosProcessSpawner` execute multi-stage pipelines (`prog1.com | builtin | prog2.exe`) sequentially via collision-free 8.3 temporary spool files (`_WCI0000.TMP`, `_WCO0000.TMP`, `_WCE0000.TMP`) in `%TEMP%` -> `%TMP%` -> active drive root, polling `DosKernelApi::poll_ctrl_break()` between stages and unconditionally cleaning up spool files:
+Because real-mode MS-DOS is single-tasking and has no concurrent anonymous kernel pipes, `Interpreter::execute_pipeline` (`PipeExecutionMode::InMemoryBuffered`) and `DosProcessSpawner` execute multi-stage pipelines (`prog1.com | builtin | prog2.exe`) sequentially via collision-free 8.3 temporary spool files (`_WCI0000.TMP`, `_WCO0000.TMP`, `_WCE0000.TMP`, plus `_WCR0000.RSP` response files under `LongCmdlineTransfer::AtResponseFile`) resolved in priority order `%WINCMD_PIPE_DIR%` -> `%TEMP%` -> `%TMP%` -> active drive root, polling `DosKernelApi::poll_ctrl_break()` between stages and unconditionally cleaning up spool files:
 
 ```mermaid
 sequenceDiagram

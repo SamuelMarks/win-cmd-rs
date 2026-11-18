@@ -100,13 +100,13 @@ WINCMD [drive:\path] [/A | /U] [/Q] [/D] [/P] [/MSG] [/E:ON | /E:OFF | /E:nnnnn]
 | `/V:ON` \| `/V:OFF` | Enables or disables `!VAR!` Delayed Environment Variable Expansion. | `/V:OFF` |
 | `/F:ON` \| `/F:OFF` | Enables or disables interactive file and directory completion mode. | `/F:ON` |
 | `/T:bf` | Sets initial background (`b`) and foreground (`f`) hex color nibbles (e.g., `/T:1F`; error if `b == f`). | None |
-| `--dialect <DIALECT>` | Selects compatibility dialect: `cmd` (Windows NT `cmd.exe`), `dos622` (MS-DOS 6.22), or `freedos`. | `cmd` (host), `dos622`/`freedos` (DOS) |
+| `--dialect <DIALECT>` | Selects compatibility dialect: `cmd` (Windows NT `cmd.exe`), `dos622` (MS-DOS 6.22), or `freedos`. | `cmd` (host), `dos622` (`WINCMD.EXE`) |
 | `--host-native` | Mounts the host OS filesystem via `HostOsVfs::from_host_env()` and imports host env vars. | Binary default |
 | `--host-root <dir>` | Mounts host `<dir>` as `C:\` with strict symlink sandbox containment (`SandboxContainment::Contained`). | — |
 | `--in-memory`, `--hermetic` | Uses an isolated in-memory `InMemoryVfs` (`C:\`, `C:\Windows\System32`, `C:\Temp`) with zero host disk I/O. | — |
 | `--script <file> [args...]` | Explicitly runs `<file>` as a batch script (useful if `<file>` begins with `/` or `-`). | — |
 | `/?`, `-h`, `--help` | Prints CLI usage summary and exits `0`. | — |
-| `-V`, `--version` | Prints `Microsoft Windows [Version 10.0.19045.5011]` and exits `0`. | — |
+| `-V`, `--version` | Prints the active dialect/kernel version banner (`Microsoft Windows [Version 10.0.19045.5011]` by default, or `MS-DOS` / `FreeDOS` under DOS dialects) and exits `0`. | — |
 
 > **POSIX Path Note:** Because `/` introduces `cmd.exe` flags (`/C`, `/Q`, `/V:ON`), `wincmd` distinguishes short switches from POSIX filesystem paths automatically when running in `--host-native` mode: `wincmd /tmp/build.bat arg1` maps `/tmp/build.bat` to `Z:\tmp\build.bat` and executes it cleanly, whereas unrecognized flag tokens like `/Z` return a CLI error. You can also always pass `--script /tmp/build.bat arg1` explicitly.
 
@@ -343,12 +343,12 @@ In addition, `DEL <directory>` prompts `All files in directory will be deleted! 
 ### 4.1 CLI Options & Exit Codes
 
 ```text
-wincheck [OPTIONS] <FILES...>
+wincheck [OPTIONS] <FILES...|->
 ```
 
 | Option | Description |
 | :--- | :--- |
-| `<FILES...>` | One or more `.bat` / `.cmd` file paths, or `-` to read from `stdin`. |
+| `<FILES...>\|-` | One or more `.bat` / `.cmd` file paths, or `-` to read from `stdin`. |
 | `-f, --format <FMT>` | Diagnostic output format: `tty` (default), `gcc`, `json`, or `sarif`. |
 | `-m, --mode <batch\|repl>` | Execution context: `batch` (`.bat`/`.cmd`, default) or `repl` (interactive `cmd /C` / REPL). |
 | `--dialect <cmd\|dos622\|freedos>` | Target shell dialect: `cmd` (default), `dos622` (enables `CMD5001`–`CMD5010` MS-DOS checks), or `freedos`. |
@@ -366,8 +366,8 @@ wincheck [OPTIONS] <FILES...>
 | `-V, --version` | Prints `wincheck` version and exits `0`. |
 
 **Exit Codes:**
-- **`0`**: Zero diagnostics matched at or above `--severity` (or `--fix` resolved all remaining matching diagnostics, or `--diff` produced no changes, or `--explain` / `--list-rules` / `--help` succeeded).
-- **`1`**: One or more diagnostics remain (or `--diff` found applicable changes, or file I/O failed).
+- **`0`**: Zero diagnostics matched at or above `--severity` (or `--fix` / `--in-place` resolved all remaining matching diagnostics, or `--explain` / `--list-rules` / `--help` / `--version` succeeded).
+- **`1`**: One or more diagnostics matched (in normal lint or `--diff` mode, or remaining after `--fix` / `--in-place`), or file/stream I/O failed.
 - **`2`**: Invalid CLI option, unknown `--format` / `--severity` / `--mode` / `--dialect` / `--encoding`, unknown `--explain` rule ID, or missing `<FILES...>`.
 
 ### 4.2 Output Formats (`tty`, `gcc`, `json`, `sarif`)

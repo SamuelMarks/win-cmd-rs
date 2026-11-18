@@ -2,11 +2,11 @@
 
 [![doc coverage](https://img.shields.io/badge/doc%20coverage-100.0%25-brightgreen)](https://docs.rs/win-cmd-rs)
 [![test coverage](https://img.shields.io/badge/test%20coverage-100.0%25-brightgreen)](#)
-[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](#quality--engineering-standards)
+[![core unsafe forbidden](https://img.shields.io/badge/core%20unsafe-forbidden-success.svg)](#quality--engineering-standards)
 [![CI](https://github.com/SamuelMarks/win-cmd-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelMarks/win-cmd-rs/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-A cross-platform, bug-for-bug and quirk-for-quirk compatible **Windows Command Prompt (`cmd.exe`) & MS-DOS (`COMMAND.COM`) interpreter (`wincmd` / `WINCMD.EXE`)** and **`ShellCheck`-style static analysis & linting engine (`wincheck` / `WINCHECK.EXE`)** written in `#![no_std]` + `alloc` safe Rust.
+A cross-platform, bug-for-bug and quirk-for-quirk compatible **Windows Command Prompt (`cmd.exe`) & MS-DOS (`COMMAND.COM`) interpreter (`wincmd` / `WINCMD.EXE`)** and **`ShellCheck`-style static analysis & linting engine (`wincheck` / `WINCHECK.EXE`)**, built on a 100% `#![forbid(unsafe_code)]`, `#![no_std]` + `alloc` Rust core (with target-specific DJGPP/DPMI FFI isolated to `crates/wincmd-dos`).
 
 ---
 
@@ -74,7 +74,7 @@ Windows and MS-DOS Batch (`.bat` / `.cmd`) scripts power countless build systems
     2. **Structural Syntax Fix Pass**: Repairs `IF a = b` -> `IF a == b`, `IF (a == b)` -> `IF a == b`, missing `IN`/`DO` in `FOR` loops, unparenthesized `IF ... ELSE ...` -> `IF ... (...) ELSE (...)`, `::` in blocks -> `REM`, broken carets, `SET` assignments, `CD /D`, `CALL`, `EXIT /B`, and `ECHO(`.
     3. **Execution Mode Percent Dialect Pass**: Converts `FOR` loop variables and percent literals between `.bat` mode (`%%I`, `%%~dpI`, `100%%`) and interactive REPL mode (`%I`, `%~dpI`, `100%`).
     4. **Variable & Path Quoting Pass**: Automatically quotes unquoted variables and parameters in path commands, `IF EXIST`, `IF` comparisons, and redirection targets (`> "%LOG%"`), applying smart quote-stripping modifiers (`%1` -> `"%~1"`, `"%1"` -> `"%~1"`, `%%I` -> `"%%~I"`).
-    5. **MS-DOS Portability Pass**: Under `--dialect dos622`, splits unconditional `&` command chains onto sequential physical lines (`CMD5004`) and rewrites `GOTO :EOF` to an explicit `:EOF` label appended at the end of the `.BAT` file (`CMD5006`).
+    5. **MS-DOS Portability Pass**: Under `--dialect dos622`, splits unconditional `&` command chains onto sequential physical lines (`CMD5004`) and rewrites `GOTO :EOF` to `GOTO EOF` with an explicit `:EOF` label appended at the end of the `.BAT` file (`CMD5006`).
 - **Triple Virtual File System Backends (`InMemoryVfs`, `HostOsVfs` & `DosFatVfs`)**:
   - `InMemoryVfs`: Deterministic, `#![no_std]` sandboxed multi-drive (`C:`, `D:`, ...) and UNC (`\\server\share`) filesystem with Windows file attributes, inode hardlinks & reparse-point symlinks/junctions, NT `PROGRA~1` 8.3 short names, reserved DOS devices (`NUL`, `CON`, `PRN`, `AUX`, `CLOCK$`, `COM1`–`COM9`, `LPT1`–`LPT9`), and simulated I/O fault injection.
   - `HostOsVfs`: Maps Windows drive letters onto host POSIX or Windows directories (mounting `/` on `Z:\` on Linux/macOS by default) with transparent case-insensitive path resolution and optional `--host-root` sandbox containment.
@@ -161,16 +161,16 @@ WINCMD [drive:\path] [/A | /U] [/Q] [/D] [/P] [/MSG] [/E:ON | /E:OFF | /E:nnnnn]
 | `/MSG` | Enables resident extended DOS error messages (`COMMAND.COM /MSG` compatibility). |
 | `[drive:\path]` | Positional `COMMAND.COM` startup directory setting `%COMSPEC%` (e.g., `WINCMD C:\DOS /P`). |
 | `/V:ON` / `/V:OFF` | Enables (`ON`) or disables (`OFF`, default) `!VAR!` Delayed Environment Variable Expansion. |
-| `/F:ON` / `/F:OFF` | Enables or disables file and directory name completion characters. |
+| `/F:ON` / `/F:OFF` | Enables (`ON`, default) or disables (`OFF`) file and directory name completion characters. |
 | `/T:bf` | Sets the initial background (`b`) and foreground (`f`) console hex color nibbles (e.g., `/T:0A`). |
-| `--dialect <DIALECT>` | Selects shell dialect: `cmd` (Windows NT `cmd.exe`, default), `dos622` (MS-DOS 6.22 `COMMAND.COM`), or `freedos`. |
+| `--dialect <DIALECT>` | Selects shell dialect: `cmd` (Windows NT `cmd.exe`, host default), `dos622` (MS-DOS 6.22 `COMMAND.COM`, `WINCMD.EXE` default), or `freedos`. |
 | `--host-native` | Mounts the host OS filesystem and imports the host environment (default for the host `wincmd` binary). |
 | `--host-root <dir>` | Sandboxes `C:\` onto `<dir>` on the host OS, preventing symlink traversal outside `<dir>`. |
 | `--in-memory`, `--hermetic` | Runs in a 100% isolated in-memory `InMemoryVfs` without touching the host disk. |
 | `--script <file> [args...]` | Executes `<file>` as a batch script with optional positional arguments `%1`..`%9`. |
 | `<file.bat> [args...]` | Directly executes a batch file with positional arguments. |
 | `/?`, `-h`, `--help` | Displays help output and exits. |
-| `-V`, `--version` | Displays the Windows version banner and exits. |
+| `-V`, `--version` | Displays the active dialect/kernel version banner and exits. |
 
 #### Examples
 
@@ -332,7 +332,7 @@ Supported directive clauses:
 | :--- | :--- | :--- | :--- | :---: |
 | `CMD1001` | Error | `double-colon-in-block` | `::` label comment used inside a `( ... )` parenthesized block breaks block parsing. | `REM ...` |
 | `CMD1002` | Error | `unbalanced-parentheses` | Unbalanced or unclosed `(` or `)` in command block. | — |
-| `CMD1003` | Error | `unescaped-paren-in-block` | Unescaped `)` inside `ECHO` or command arguments inside a `( ... )` block prematurely closes the block. | `^)` |
+| `CMD1003` | Error | `unescaped-paren-in-block` | Unescaped `)` inside `ECHO` or command arguments inside a `( ... )` block prematurely closes the block. | — |
 | `CMD1004` | Warning | `trailing-whitespace-after-caret` | Trailing space or tab after `^` line continuation escapes the space instead of the newline. | Strip spaces |
 | `CMD1005` | Error | `dangling-else` | `ELSE` keyword is not recognized unless the `IF` then-branch is enclosed in parentheses `(...)`. | `(...) ELSE (...)` |
 | `CMD1006` | Error | `multi-char-for-var` | `FOR` loop variable must be a single character (e.g., `%%I`, not `%%item`). | — |
@@ -340,7 +340,7 @@ Supported directive clauses:
 | `CMD1008` | Warning | `utf8-bom` | UTF-8 Byte Order Mark (`EF BB BF`) at start of file corrupts the first command on line 1 in `cmd.exe`. | — |
 | `CMD1009` | Info | `non-crlf-line-endings` | Script uses Unix `LF` or mixed line endings instead of Windows `CRLF`, risking byte-offset `GOTO` bugs. | — |
 | `CMD1010` | Error | `invalid-set-a-expression` | Invalid `SET /A` arithmetic expression syntax or malformed octal literal (`08`/`09`). | — |
-| `CMD1011` | Warning | `unquoted-set-a-special` | Unquoted bitwise shift/logic operators (`<<`, `>>`, `&`, `\|`, `^`) in `SET /A` are parsed as redirections/pipes. | Quote expr |
+| `CMD1011` | Warning | `unquoted-set-a-special` | Unquoted bitwise shift/logic operators (`<<`, `>>`, `&`, `\|`, `^`) in `SET /A` are parsed as redirections/pipes. | — |
 | `CMD1012` | Warning | `invalid-label-characters` | Label definition `:name` contains spaces or delimiter characters that truncate the label name. | — |
 | `CMD1013` | Error | `probable-syntax-misuse` | Probable syntax misuse (`IF a = b`, `IF (a == b)`, missing `IN`/`DO` in `FOR`, unclosed `"`). | `==`, `IN`, `DO`, `"` |
 | `CMD1014` | Warning | `execution-mode-percent-mismatch` | Mismatch between single `%` (REPL mode) and double `%%` (batch file mode). | `%%` <-> `%` |
@@ -404,7 +404,7 @@ Supported directive clauses:
 | `CMD5003` | Error | `dos-unsupported-if-syntax` | `IF /I`, `IF DEFINED`, `IF CMDEXTVERSION`, `EQU`–`GEQ`, and `ELSE` are unsupported in MS-DOS `COMMAND.COM`. | — |
 | `CMD5004` | Error | `dos-compound-or-chaining` | Parenthesized `( ... )` blocks and `&`, `&&`, `\|\|` command chains are unsupported in MS-DOS `COMMAND.COM`. | Split `&` lines |
 | `CMD5005` | Error | `dos-extended-var-syntax` | Delayed `!VAR!`, `%VAR:~...%` / `%VAR:a=b%`, `%*`, and `%~dpnx1` modifiers are unsupported in MS-DOS `COMMAND.COM`. | — |
-| `CMD5006` | Error | `dos-subroutine-or-eof` | `CALL :label`, implicit `GOTO :EOF`, and `EXIT /B` are unsupported in MS-DOS `COMMAND.COM`. | Append `:EOF` |
+| `CMD5006` | Error | `dos-subroutine-or-eof` | `CALL :label`, implicit `GOTO :EOF`, and `EXIT /B` are unsupported in MS-DOS `COMMAND.COM`. | `GOTO EOF` + `:EOF` |
 | `CMD5007` | Error | `dos-nt-only-builtin` | `SETLOCAL`, `ENDLOCAL`, `PUSHD`, `POPD`, `ASSOC`, `FTYPE`, and `MKLINK` are unavailable in MS-DOS `COMMAND.COM`. | — |
 | `CMD5008` | Error | `dos-numeric-fd-redirect` | Numeric handle redirections (`2>`, `2>&1`, `1>&2`) are unsupported in MS-DOS `COMMAND.COM`. | — |
 | `CMD5009` | Warning | `dos-non-8-3-path` | Filename or path segment violates MS-DOS FAT 8.3 limits or uses `.cmd` instead of `.bat`. | — |
@@ -696,7 +696,7 @@ win-cmd-rs/
 │   └── i586-pc-msdosdjgpp.json # Custom 32-bit x86 soft-float COFF target spec for MS-DOS DJGPP
 ├── crates/
 │   └── wincmd-dos/             # Isolated 32-bit Protected-Mode MS-DOS (`DJGPP` + `CWSDPMI`) crate
-│       ├── Cargo.toml          # Target crate manifest & identical strict lint table
+│       ├── Cargo.toml          # Target crate manifest & strict lints (`missing_safety_doc`, `undocumented_unsafe_blocks`)
 │       ├── Cargo.lock          # Target crate lockfile
 │       ├── src/
 │       │   ├── lib.rs          # Stream-generic DOS CLI runners & unit test suite
@@ -810,11 +810,11 @@ win-cmd-rs/
 This repository enforces the strictest possible Rust engineering and verification standards:
 
 1. **100% Documentation Coverage**:
-   - Every module, struct, enum, variant, field, and function (both public and private) is documented with rustdoc, enforced via `#![deny(missing_docs)]`, `#![deny(clippy::missing_docs_in_private_items)]`, `#![deny(clippy::missing_errors_doc)]`, and `#![deny(clippy::missing_panics_doc)]`.
+   - Every module, struct, enum, variant, field, and function (both public and private) across `src/` and `crates/wincmd-dos/src/` is documented with rustdoc, enforced via `#![deny(missing_docs)]`, `#![deny(clippy::missing_docs_in_private_items)]`, `#![deny(clippy::missing_errors_doc)]`, `#![deny(clippy::missing_panics_doc)]`, and `tests/doc_and_quality_gates.rs`.
 2. **100% Test Coverage**:
-   - Verified across functions, lines, and branches via `cargo llvm-cov`.
+   - Verified at 100.00% across functions, lines, and short-circuit branches in `win-cmd-rs` (`src/`) via `cargo llvm-cov --branch`, with `crates/wincmd-dos` verified by both host-simulated tests (`--features host-sim`) and headless FreeDOS QEMU boot integration tests in CI.
 3. **Zero Core `unsafe`, Zero `unwrap`, Zero `panic!`, Zero Indexing**:
-   - `#![forbid(unsafe_code)]` across the entire `win-cmd-rs` library and `DjgppDosKernel` (with target-specific `unsafe` confined to `crates/wincmd-dos`: DJGPP `libc` / DPMI FFI in `ffi.rs`, `GlobalAlloc` alignment math in `alloc_djgpp.rs`, and C `main` entrypoints in `src/bin/`, all under mandatory `# Safety` invariants).
+   - `#![forbid(unsafe_code)]` across the entire `win-cmd-rs` crate (`src/`) as well as `crates/wincmd-dos/src/{djgpp_kernel,panic_dos,stub_verify}.rs`. Target-specific `unsafe` (and 8086/x86 stub assembly in `crates/wincmd-dos/stub/`) is strictly isolated to `crates/wincmd-dos`: DJGPP `libc` / DPMI FFI in `ffi.rs`, `GlobalAlloc` alignment math in `alloc_djgpp.rs`, C `main` entrypoints in `crates/wincmd-dos/src/bin/`, and allocator mock tests in `crates/wincmd-dos/src/lib.rs`, all enforced by `#![deny(clippy::missing_safety_doc, clippy::undocumented_unsafe_blocks)]`.
    - `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::panic_in_result_fn, clippy::indexing_slicing, clippy::string_slice, clippy::arithmetic_side_effects)]`
 4. **Single Unified Error Enum**:
    - All errors across the reader, parser, VFS, DOS hardware layer, arithmetic evaluator, runtime, CLI, and linter use `win_cmd_rs::error::CmdError` powered by `derive_more`, with `.cmd_exe_message()` and `.exit_code()` producing authentic `cmd.exe` and `COMMAND.COM` diagnostics.
@@ -826,17 +826,20 @@ This repository enforces the strictest possible Rust engineering and verificatio
 cargo check --lib --no-default-features
 cargo clippy --lib --no-default-features -- -D warnings
 
-# Run all unit, integration, property, and doc tests
+# Run all unit, integration, property, and doc tests (`win-cmd-rs` + `wincmd-dos` host-sim)
 cargo test --workspace --all-targets --all-features
 cargo test --workspace --doc --all-features
+cargo test --manifest-path crates/wincmd-dos/Cargo.toml --target-dir target/wincmd-dos-host --all-targets --all-features
 
-# Run Clippy with all pedantic/nursery/restriction lints denied
+# Run Clippy with all pedantic/nursery/restriction lints denied across both workspaces
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --manifest-path crates/wincmd-dos/Cargo.toml --target-dir target/wincmd-dos-host --all-targets --all-features -- -D warnings
 
 # Build documentation including private items with zero warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --document-private-items
+RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path crates/wincmd-dos/Cargo.toml --target-dir target/wincmd-dos-host --all-features --no-deps --document-private-items
 
-# Verify 100.00% function, line, and branch coverage
+# Verify 100.00% function, line, and branch coverage across `src/`
 cargo +nightly llvm-cov --branch --workspace --all-targets --all-features --summary-only
 ```
 

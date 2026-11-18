@@ -586,7 +586,7 @@ fn normalize_cli_script_path(raw_path: &str, backend: VfsBackendMode) -> String 
 /// # Arguments
 /// * `cfg` - Parsed [`WinCmdCliConfig`].
 /// * `interp` - Mutable [`Interpreter`] to configure.
-fn apply_cli_session_flags(cfg: &WinCmdCliConfig, interp: &mut Interpreter) {
+pub fn apply_cli_session_flags(cfg: &WinCmdCliConfig, interp: &mut Interpreter) {
     if let Some(echo_ov) = cfg.initial_echo_override {
         interp.console.echo_state = echo_ov;
     }
@@ -595,12 +595,11 @@ fn apply_cli_session_flags(cfg: &WinCmdCliConfig, interp: &mut Interpreter) {
     interp.config.host_binding_mode = cfg.host_binding_mode;
     interp.config.permanent_shell = cfg.permanent_shell;
     interp.config.dos_env_bytes = cfg.dos_env_bytes;
-    interp.proc_env.env.extensions = cfg.extensions;
     if let Some(dialect) = cfg.dialect {
         interp.apply_shell_dialect(dialect);
-        if let Some(exp_ext) = cfg.explicit_extensions {
-            interp.proc_env.env.extensions = exp_ext;
-        }
+    }
+    if let Some(exp_ext) = cfg.explicit_extensions {
+        interp.proc_env.env.extensions = exp_ext;
     }
     if let Some(cmd_dir) = &cfg.command_dir {
         let trimmed = cmd_dir.trim_end_matches([crate::types::BS_CHAR, '/']);
@@ -648,9 +647,9 @@ fn configure_interpreter_from_cli(cfg: &WinCmdCliConfig, interp: &mut Interprete
 #[must_use]
 fn format_wincmd_help_banner() -> String {
     format!(
-        "Starts a new instance of the cross-platform Windows command interpreter (wincmd).{CRLF}\
-         WINCMD [/A | /U] [/Q] [/D] [/E:ON | /E:OFF] [/F:ON | /F:OFF] [/V:ON | /V:OFF] [/T:bf] [[/S] [/C | /K] string]{CRLF}\
-         Options: --in-memory | --hermetic | --host-native | --host-root <dir> | --script <file> [args...]{CRLF}"
+        "Starts a new instance of the cross-platform Windows & MS-DOS command interpreter (wincmd).{CRLF}\
+         WINCMD [drive:\\path] [/A | /U] [/Q] [/D] [/P] [/MSG] [/E:ON | /E:OFF | /E:nnnnn] [/F:ON | /F:OFF] [/V:ON | /V:OFF] [/T:bf] [[/S] [/C | /K] string]{CRLF}\
+         Options: --dialect <cmd|dos622|freedos> | --in-memory | --hermetic | --host-native | --host-root <dir> | --script <file> [args...]{CRLF}"
     )
 }
 

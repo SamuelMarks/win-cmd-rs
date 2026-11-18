@@ -25,8 +25,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use win_cmd_rs::cli::{
-    WinCmdAction, execute_wincheck_over_vfs_streams, execute_wincmd_over_streams,
-    parse_wincmd_args_with_default_backend,
+    WinCmdAction, apply_cli_session_flags, execute_wincheck_over_vfs_streams,
+    execute_wincmd_over_streams, parse_wincmd_args_with_default_backend,
 };
 use win_cmd_rs::dos::{DosKernelApi, run_dos_bios_repl};
 use win_cmd_rs::error::CmdError;
@@ -155,9 +155,7 @@ fn run_dos_wincmd_session(
         && cfg.action == WinCmdAction::InteractiveRepl
         && stdin_bytes.is_empty()
     {
-        if let Some(d) = cfg.dialect {
-            interp.apply_shell_dialect(d);
-        }
+        apply_cli_session_flags(&cfg, &mut interp);
         return run_dos_bios_repl(&mut interp, shared, stdout, stderr).map_or(1, |c| {
             let [low, _, _, _] = c.0.rem_euclid(256).to_le_bytes();
             low
@@ -1271,5 +1269,40 @@ mod tests {
             ),
             0
         );
+    }
+
+    /// Verifies `execute_dos_wincmd` preserves `MsDos622` `/E:OFF` defaults unless `/E:ON` is passed.
+    #[test]
+    fn test_execute_dos_wincmd_default_e_off_and_explicit_e_on() {
+        let mut out_e_off = Vec::new();
+        let mut err_e_off = Vec::new();
+        assert_eq!(
+            execute_dos_wincmd(
+                &[String::from("/C"), String::from("md C:\\SUB1\\SUB2")],
+                SimulatedDosKernel::new(),
+                Vec::new(),
+                &mut out_e_off,
+                &mut err_e_off,
+            ),
+            1
+        );
+
+        let mut out_e_on = Vec::new();
+        let mut err_e_on = Vec::new();
+        assert_eq!(
+            execute_dos_wincmd(
+                &[
+                    String::from("/E:ON"),
+                    String::from("/C"),
+                    String::from("md C:\\SUB1\\SUB2 & echo E_ON=%CD%"),
+                ],
+                SimulatedDosKernel::new(),
+                Vec::new(),
+                &mut out_e_on,
+                &mut err_e_on,
+            ),
+            0
+        );
+        assert!(String::from_utf8_lossy(&out_e_on).contains("E_ON=C:\\"));
     }
 }

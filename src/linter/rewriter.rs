@@ -2,8 +2,9 @@
 //!
 //! Transforms a parsed [`CstScript`] through modular [`CstRewriteRule`] passes
 //! (`DelayedExpansionBlockPass`, `StructuralSyntaxFixPass`, `ExecutionModePercentPass`,
-//! `QuoteUnquotedVariablesPass`) while respecting [`FixApplicability`] (`Safe` vs `UnsafeOptIn`),
-//! preserving comments and trivia, and recomputing exact byte [`Span`]s.
+//! `QuoteUnquotedVariablesPass`, and `MsDosPortabilityPass`) while respecting [`FixApplicability`]
+//! (`SafeSemanticsPreserving`, `RecommendedRepair`, and `UnsafeOptIn`), preserving comments
+//! and trivia, and recomputing exact byte [`Span`]s.
 
 use alloc::borrow::ToOwned;
 use alloc::collections::BTreeSet;
@@ -344,7 +345,7 @@ impl CstRewriter {
     /// * `exec_context` - Target [`ExecutionContext`] (`BatchFile` vs `InteractiveRepl`).
     ///
     /// # Returns
-    /// A configured [`CstRewriter`] containing all four composable passes.
+    /// A configured [`CstRewriter`] containing all five composable passes.
     #[must_use]
     pub fn default_for_context(exec_context: ExecutionContext) -> Self {
         Self::with_fix_safety(exec_context, FixApplicability::UnsafeOptIn)

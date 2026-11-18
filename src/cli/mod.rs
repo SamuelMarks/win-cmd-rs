@@ -1,9 +1,10 @@
 //! Command-line argument parsing, streaming REPL, and process drivers for `wincmd` and `wincheck`.
 //!
-//! Supports full `cmd.exe` flags (`/C`, `/K`, `/S`, `/Q`, `/D`, `/A`, `/U`, `/T:fg`, `/E:ON`,
-//! `/E:OFF`, `/F:ON`, `/F:OFF`, `/V:ON`, `/V:OFF`, `/?`) including the authentic `/C` and `/K`
-//! quote-stripping heuristic, lexer-aware `More? ` REPL continuation, `HostNative` VFS wiring,
-//! `"-"` stdin linting, unified `CstRewriter` `--diff` / `--fix` handling, and graceful `BrokenPipe` I/O.
+//! Supports full `cmd.exe` and MS-DOS `COMMAND.COM` flags (`/C`, `/K`, `/S`, `/Q`, `/D`, `/P`, `/MSG`,
+//! `/A`, `/U`, `/T:fg`, `/E:ON`, `/E:OFF`, `/E:nnnnn`, `/F:ON`, `/F:OFF`, `/V:ON`, `/V:OFF`,
+//! `--dialect`, `/?`) including the authentic `/C` and `/K` quote-stripping heuristic, lexer-aware
+//! `More? ` REPL continuation, `HostNative` VFS wiring, `"-"` stdin linting, unified `CstRewriter`
+//! `--diff` / `--fix` / `--in-place` handling, and graceful `BrokenPipe` I/O.
 
 /// Interactive Read-Eval-Print Loop (REPL) drivers and graceful stream output helpers.
 mod repl;
@@ -27,7 +28,7 @@ pub use self::wincheck_cli::{execute_wincheck_process, load_file_or_stdin};
 #[cfg(feature = "std")]
 pub use self::wincmd_cli::execute_wincmd_process;
 pub use self::wincmd_cli::{
-    WinCmdAction, WinCmdCliConfig, apply_cmd_c_quote_heuristic,
+    WinCmdAction, WinCmdCliConfig, apply_cli_session_flags, apply_cmd_c_quote_heuristic,
     apply_cmd_c_quote_heuristic_with_probe, execute_wincmd_over_streams,
     execute_wincmd_with_interpreter_streams, join_argv_preserving_quotes, parse_wincmd_args,
     parse_wincmd_args_with_default_backend, run_wincmd_with_config, unquote_cmd_c_command_string,
@@ -1575,5 +1576,50 @@ mod tests {
             1
         );
         assert!(String::from_utf8_lossy(&wc_out).contains("CMD5001"));
+
+        let mut help_out = Vec::new();
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &["--help".to_owned()],
+                &mut wc_vfs,
+                &mut wc_in,
+                &mut help_out,
+                &mut wc_err,
+            ),
+            0
+        );
+        let help_text = String::from_utf8_lossy(&help_out);
+        assert!(help_text.contains("--dialect <cmd|dos622|freedos>"));
+        assert!(help_text.contains("cp866"));
+
+        let mut ver_out = Vec::new();
+        assert_eq!(
+            execute_wincheck_over_vfs_streams(
+                &["--version".to_owned()],
+                &mut wc_vfs,
+                &mut wc_in,
+                &mut ver_out,
+                &mut wc_err,
+            ),
+            0
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&ver_out),
+            format!("wincheck {}{LF_CHAR}", env!("CARGO_PKG_VERSION"))
+        );
+
+        let mut dos_interp = Interpreter::new();
+        dos_interp.apply_shell_dialect(crate::types::ShellDialect::MsDos622);
+        let mut dos_io = IoStreams::new();
+        let help_wincmd_cfg = parse_wincmd_args(&["/?".to_owned()]).unwrap_or_default();
+        assert_eq!(
+            run_wincmd_with_config(&help_wincmd_cfg, &mut dos_interp, &mut dos_io),
+            Ok(ExitCode::SUCCESS)
+        );
+        assert!(dos_io.stdout.contains("--dialect <cmd|dos622|freedos>"));
+        assert_eq!(
+            dos_interp.proc_env.env.extensions,
+            crate::types::ExtensionsMode::Disabled
+        );
     }
 }

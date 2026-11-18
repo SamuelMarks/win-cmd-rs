@@ -580,13 +580,14 @@ fn run_wincheck_action_dyn(
         WinCheckAction::ShowHelp => {
             write!(
                 io.stdout,
-                "wincheck - ShellCheck-style static analyzer and linter for Windows Batch (.bat / .cmd){LF_CHAR}\
+                "wincheck - ShellCheck-style static analyzer and linter for Windows & MS-DOS Batch (.bat / .cmd){LF_CHAR}\
                  Usage: wincheck [OPTIONS] <FILES...|->{LF_CHAR}\
                  Options:{LF_CHAR}\
                    -f, --format <tty|json|sarif|gcc>         Output format (default: tty){LF_CHAR}\
-                   -m, --mode <batch|repl>                   Target dialect mode (default: batch){LF_CHAR}\
+                   -m, --mode <batch|repl>                   Target execution context (default: batch){LF_CHAR}\
+                   --dialect <cmd|dos622|freedos>            Target shell dialect (default: cmd){LF_CHAR}\
                    -S, --severity <error|warning|info|style> Minimum severity{LF_CHAR}\
-                   --encoding <utf8|ascii|cp437|cp850|cp1252|utf16le|utf16be> Input fallback encoding{LF_CHAR}\
+                   --encoding <utf8|ascii|cp437|cp850|cp852|cp865|cp866|cp1252|utf16le|utf16be> Input fallback encoding{LF_CHAR}\
                    -i, --include <CMDxxxx,...>               Include specific rules{LF_CHAR}\
                    -e, --exclude <CMDxxxx,...>               Exclude specific rules{LF_CHAR}\
                    --explain <CMDxxxx>                       Explain a rule with examples{LF_CHAR}\
@@ -602,7 +603,7 @@ fn run_wincheck_action_dyn(
             Ok(ExitCode::SUCCESS)
         }
         WinCheckAction::ShowVersion => {
-            write!(io.stdout, "wincheck 0.1.0{LF_CHAR}").unwrap_or(());
+            write!(io.stdout, "wincheck {}{LF_CHAR}", env!("CARGO_PKG_VERSION")).unwrap_or(());
             Ok(ExitCode::SUCCESS)
         }
         WinCheckAction::ListRules => {
