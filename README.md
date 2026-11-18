@@ -728,7 +728,7 @@ win-cmd-rs/
 │   │   ├── types.rs            # PackedDosTimestamp, FatAttributeByte, DosFileName8Dot3 & PspCommandTail
 │   │   ├── kernel.rs           # Safe `DosKernelApi` hardware trait & `SharedDosKernel`
 │   │   ├── sim.rs              # Deterministic in-memory `SimulatedDosKernel` (8.3/LFN, faults, `.COM` exec)
-│   │   └── console.rs          # `DosConsoleIo` BIOS scan-code `DOSKEY` line editor (`F1`/`F3`/`F7`/`F8`/`F9`)
+│   │   └── console.rs          # `DosConsoleLineEditor` & `run_dos_bios_repl` BIOS scan-code `DOSKEY` editor
 │   ├── reader/
 │   │   ├── mod.rs              # Phase 0 script reader module root
 │   │   ├── encoding.rs         # Incremental decoding (CP437/850/852/865/866/1252/UTF-8/UTF-16)
@@ -814,7 +814,7 @@ This repository enforces the strictest possible Rust engineering and verificatio
 2. **100% Test Coverage**:
    - Verified across functions, lines, and branches via `cargo llvm-cov`.
 3. **Zero Core `unsafe`, Zero `unwrap`, Zero `panic!`, Zero Indexing**:
-   - `#![forbid(unsafe_code)]` across the entire `win-cmd-rs` library and `DjgppDosKernel` (with raw DJGPP `libc` / DPMI FFI isolated exclusively to `crates/wincmd-dos/src/ffi.rs` under mandatory `# Safety` invariants).
+   - `#![forbid(unsafe_code)]` across the entire `win-cmd-rs` library and `DjgppDosKernel` (with target-specific `unsafe` confined to `crates/wincmd-dos`: DJGPP `libc` / DPMI FFI in `ffi.rs`, `GlobalAlloc` alignment math in `alloc_djgpp.rs`, and C `main` entrypoints in `src/bin/`, all under mandatory `# Safety` invariants).
    - `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::panic_in_result_fn, clippy::indexing_slicing, clippy::string_slice, clippy::arithmetic_side_effects)]`
 4. **Single Unified Error Enum**:
    - All errors across the reader, parser, VFS, DOS hardware layer, arithmetic evaluator, runtime, CLI, and linter use `win_cmd_rs::error::CmdError` powered by `derive_more`, with `.cmd_exe_message()` and `.exit_code()` producing authentic `cmd.exe` and `COMMAND.COM` diagnostics.

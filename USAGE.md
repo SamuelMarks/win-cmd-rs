@@ -368,7 +368,7 @@ wincheck [OPTIONS] <FILES...>
 **Exit Codes:**
 - **`0`**: Zero diagnostics matched at or above `--severity` (or `--fix` resolved all remaining matching diagnostics, or `--diff` produced no changes, or `--explain` / `--list-rules` / `--help` succeeded).
 - **`1`**: One or more diagnostics remain (or `--diff` found applicable changes, or file I/O failed).
-- **`2`**: Invalid CLI option, unknown `--format` / `--severity` / `--mode`, unknown `--explain` rule ID, or missing `<FILES...>`.
+- **`2`**: Invalid CLI option, unknown `--format` / `--severity` / `--mode` / `--dialect` / `--encoding`, unknown `--explain` rule ID, or missing `<FILES...>`.
 
 ### 4.2 Output Formats (`tty`, `gcc`, `json`, `sarif`)
 

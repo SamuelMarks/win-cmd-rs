@@ -45,7 +45,7 @@ flowchart TB
         PARSE["src/parser/<br/>Lexer, Lossless CST, AST Lowerer & Phases 1-4"]
         READ["src/reader/<br/>BatchFrameReader, OEM/UTF CodePages & LogicalLineBuffer"]
         VFS["src/vfs/<br/>VirtualFileSystem, InMemoryVfs, DosFatVfs & std HostOsVfs"]
-        DOS["src/dos/<br/>DosKernelApi, SimulatedDosKernel, DosConsoleIo & FAT/PSP Types"]
+        DOS["src/dos/<br/>DosKernelApi, SimulatedDosKernel, DosConsoleLineEditor & FAT/PSP Types"]
     end
 
     subgraph Core["Foundational Primitives (#![no_std] + alloc)"]
@@ -140,21 +140,21 @@ sequenceDiagram
 
     Interp->>Vfs: read_bytes("C:\deploy.bat")
     Vfs-->>Interp: raw_bytes [0..N]
-    Reader->>Enc: decode_line_at(offset=0, CodePage::Oem437)
+    Reader->>Enc: decode_physical_line_from_bytes(offset=0, CodePage::OemUnitedStates)
     Enc-->>Reader: "chcp 65001 >nul\r\n" (next offset = 17)
     Reader-->>Interp: Statement 1 (cursor = 17)
     Interp->>Interp: Execute CHCP 65001 (console.codepage = Utf8)
 
     Interp->>Vfs: read_bytes("C:\deploy.bat")
     Vfs-->>Interp: raw_bytes [0..N]
-    Reader->>Enc: decode_line_at(offset=17, CodePage::Utf8)
+    Reader->>Enc: decode_physical_line_from_bytes(offset=17, CodePage::Utf8)
     Enc-->>Reader: line = echo echo Dynamic >> "%~f0" (next offset = 46)
     Reader-->>Interp: Statement 2 (cursor = 46)
     Interp->>Vfs: append_bytes("C:\deploy.bat", "echo Dynamic\r\n")
 
     Interp->>Vfs: read_bytes("C:\deploy.bat")
     Vfs-->>Interp: raw_bytes [0..N+14]
-    Reader->>Enc: decode_line_at(offset=46, CodePage::Utf8)
+    Reader->>Enc: decode_physical_line_from_bytes(offset=46, CodePage::Utf8)
     Enc-->>Reader: "echo Dynamic\r\n" (executes newly appended line!)
 ```
 
@@ -167,8 +167,8 @@ Every diagnostic in `wincheck` and every syntax error in `wincmd` maps expanded 
 - **`SourceMap` & `SourceFile` (`src/span.rs`)**: Stores raw bytes, decoded text, precomputed newline byte offsets (`O(log L)` binary search for `line_col`), and BOM length (`UTF-8` 3-byte, `UTF-16LE/BE` 2-byte).
 - **`CodePage` (`src/reader/encoding.rs`)**: Supports `Utf8` (`65001`), `OemUnitedStates` (`437`), `OemMultilingualLatin1` (`850`), `OemLatin2` (`852`), `OemNordic` (`865`), `OemCyrillic` (`866`), `WindowsLatin1` (`1252`), `Utf16Le` (`1200`), `Utf16Be` (`1201`), and `Ascii` (`20127`), plus `0x1A` (`SUB` / `Ctrl+Z`) logical EOF truncation.
 - **`ProvenanceMode` (`src/reader/char_map.rs`)**:
-  - `ProvenanceMode::Full`: Tracks per-character `ExpansionOrigin` (`LiteralSource`, `CaretContinuation`, `PositionalParam`, `ImmediateEnvVar`, `ForVariable`, `DelayedEnvVar`).
-  - `ProvenanceMode::Lightweight`: Elides heap `String` clones inside `ExpansionOrigin` on hot interpreter loops when sub-word provenance is not needed.
+  - `ProvenanceMode::Full`: Materializes sub-word `CstToken` slices alongside per-character `ExpansionOrigin` (`LiteralSource`, `CaretContinuation`, `PositionalParam`, `ImmediateEnvVar`, `ForVariable`, `DelayedEnvVar`) for static analysis.
+  - `ProvenanceMode::Compact`: Skips sub-word `CstToken` allocation during pure interpreter execution (paired with `WordPartsMode::Lightweight` in `src/parser/lower.rs`) so hot loops avoid unnecessary sub-word heap allocations.
 
 ```mermaid
 classDiagram
@@ -199,6 +199,7 @@ classDiagram
     class SpannedChar {
         +char ch
         +Span span
+        +bool escaped_by_caret
         +ExpansionOrigin origin
     }
     class ExpansionOrigin {
@@ -365,14 +366,21 @@ classDiagram
         +EnvironmentStack startup_env
         +Box~VirtualFileSystem~ vfs
         +Box~ProcessSpawner~ spawner
+        +Option~Box~DosKernelApi~~ dos_kernel
         +RegistryStore registry_store
         +Vec~PushdEntry~ pushd_stack
     }
     class SessionConfig {
         +HostBindingMode host_binding_mode
+        +ShellDialect dialect
+        +PermanentShellMode permanent_shell
+        +Option~u16~ dos_env_bytes
+        +MemoryProfile memory_profile
+        +ProvenanceMode provenance_mode
         +CmdLocaleConfig locale
         +VerifyCopyMode verify_state
         +OutputUnicodeMode unicode_output_mode
+        +PipeExecutionMode pipe_execution_mode
         +FileCompletionMode file_completion
         +ExecutionLimits limits
     }
@@ -381,14 +389,16 @@ classDiagram
         +CodePage codepage
         +u16 console_cols
         +u16 console_lines
+        +ConsoleRenderBackend render_backend
         +BTreeMap doskey_macros
         -VecDeque~String~ command_history
     }
     class ExecutionState {
         +SourceMap source_map
         -Option_SourceId_8 ephemeral_ring
+        -BTreeMap~String, SourceId~ batch_source_slots
         -Vec~BatchCallFrame~ call_stack
-        -Vec~ForVarBinding~ for_vars
+        -Vec~ForVarName_String~ for_vars
         -ExitCode last_exit_code
         -usize steps_executed
     }
@@ -422,7 +432,7 @@ flowchart TD
     REDIR -- "Redirection I/O Error" --> FAIL_REDIR["Emit stderr &amp; set ERRORLEVEL=1<br/>(Command body NOT executed)"]
     REDIR -- "Success" --> DRV{"Drive Switch?<br/>(e.g. 'D:')"}
     DRV -- "Yes" --> SET_DRV["vfs.set_current_drive(D:)"]
-    DRV -- "No" --> INT{"Tier 1: Core Internal Built-In?<br/>(try_dispatch_internal: 41 command names)"}
+    DRV -- "No" --> INT{"Tier 1: Core Internal Built-In?<br/>(try_dispatch_internal: 46 command names)"}
     INT -- "Match" --> RUN_INT["env_cmds / flow_cmds / fs_cmds / console_cmds / dos_cmds"]
     INT -- "None" --> SHIM{"Tier 2: Cross-Platform Utility Shim?<br/>(try_dispatch_shim: 18 shims)"}
     SHIM -- "Match" --> RUN_SHIM["shims_search / shims_admin / dos_cmds (MEM) / CMD"]
@@ -430,7 +440,7 @@ flowchart TD
     RESOLVE -- ".bat / .cmd" --> RUN_BAT["Push BatchCallFrame<br/>(Transfer control if no CALL; return if CALL)"]
     RESOLVE -- "ASSOC + FTYPE match" --> RUN_ASSOC["Expand FTYPE template (%1, %*) &amp; execute"]
     RESOLVE -- ".exe / .com / host binary" --> SPAWN["Tier 4: ProcessSpawner::spawn_external<br/>HostProcessSpawner (thread::scope) or DosProcessSpawner (%TEMP% spool)"]
-    RESOLVE -- "Not Found" --> ERR_9009["CmdError::UnknownCommand<br/>(ERRORLEVEL = 9009)"]
+    RESOLVE -- "Not Found" --> ERR_9009["CmdError::CommandNotRecognized<br/>(ERRORLEVEL = 9009)"]
 ```
 
 - **Zero-Copy VFS Sharing Across Pipelines (`cmd1 | cmd2`)**: Instead of deep-cloning `InMemoryVfs` for both sides of a pipe, `execute_pipeline` snapshots only per-drive CWDs (`VfsCwdSnapshot`), runs the left and right subshells with isolated `EnvironmentStack` and `ConsoleState` instances against the shared `VirtualFileSystem`, and restores the parent's CWD snapshot afterward.
@@ -534,12 +544,12 @@ flowchart TB
         INTERP_DOS["Interpreter + Linter + CLI"]
         DOS_VFS["DosFatVfs&lt;K: DosKernelApi&gt;<br/>8.3 / DOS 7 LFN, FatAttributeByte, PackedDosTimestamp"]
         DOS_EXEC["DosProcessSpawner&lt;K: DosKernelApi&gt;<br/>126-byte PspCommandTail, CMDLINE=, %TEMP% Spooling"]
-        DOS_CON["DosConsoleIo&lt;K: DosKernelApi&gt;<br/>BIOS Scan-Code Line Editor (F1/F3/F7/F8/F9, Tab) &amp; INT 10h CLS"]
+        DOS_CON["DosConsoleLineEditor &amp; run_dos_bios_repl<br/>BIOS Scan-Code Line Editor (F1/F3/F7/F8/F9, Tab) &amp; INT 10h CLS"]
         KTRAIT["pub trait DosKernelApi<br/>(Zero unsafe methods)"]
     end
 
     subgraph HostTest["Host Verification (Linux / macOS / Windows)"]
-        SIM["SimulatedDosKernel (src/dos/sim.rs)<br/>• In-memory FAT16/32 &amp; strict 8.3 truncation<br/>• 2-second FAT timestamp rounding<br/>• Scripted FaultRule queue &amp; .COM/.EXE handlers<br/>• 100.00% fn / line / branch llvm-cov"]
+        SIM["SimulatedDosKernel (src/dos/sim.rs)<br/>• In-memory FAT16/32 &amp; strict 8.3 truncation<br/>• 2-second FAT timestamp rounding<br/>• Scripted DosFaultRule queue &amp; .COM/.EXE handlers<br/>• 100.00% fn / line / branch llvm-cov"]
     end
 
     subgraph TargetDos["MS-DOS Target Adapter (crates/wincmd-dos/)"]

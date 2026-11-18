@@ -1475,23 +1475,15 @@ mod tests {
 
         let os_ro_nested = host_c.join("sdir").join("inner").join("os_ro.txt");
         assert!(std::fs::write(&os_ro_nested, b"ro").is_ok());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert!(
-                std::fs::set_permissions(&os_ro_nested, std::fs::Permissions::from_mode(0o444))
-                    .is_ok()
-            );
-        }
-        assert!(host::has_host_os_readonly_recursive(&host_c.join("sdir")));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert!(
-                std::fs::set_permissions(&os_ro_nested, std::fs::Permissions::from_mode(0o644))
-                    .is_ok()
-            );
-        }
+        let ro_check = std::fs::metadata(&os_ro_nested).and_then(|m| {
+            let writable = m.permissions();
+            let mut ro = writable.clone();
+            ro.set_readonly(true);
+            std::fs::set_permissions(&os_ro_nested, ro)?;
+            assert!(host::has_host_os_readonly_recursive(&host_c.join("sdir")));
+            std::fs::set_permissions(&os_ro_nested, writable)
+        });
+        assert!(ro_check.is_ok());
         assert!(!host::has_host_os_readonly_recursive(&host_c.join("sdir")));
 
         assert_eq!(

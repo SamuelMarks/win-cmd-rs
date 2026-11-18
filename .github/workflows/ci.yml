@@ -8,6 +8,7 @@ name: CI
       - "v*"
   pull_request:
     branches:
+      - master
   workflow_dispatch:
 
 permissions:
@@ -55,7 +56,7 @@ jobs:
       - name: Run Clippy with all targets and strict lints
         run: |
           cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
-          CARGO_TARGET_DIR=target/wincmd-dos-host cargo +stable clippy --manifest-path crates/wincmd-dos/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo +stable clippy --manifest-path crates/wincmd-dos/Cargo.toml --target-dir target/wincmd-dos-host --all-targets --all-features -- -D warnings
 
       - name: Check Rustdoc (including private items)
         env:
@@ -171,12 +172,14 @@ jobs:
 
       - name: Run target Clippy checks
         if: matrix.run_clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path crates/wincmd-dos/Cargo.toml --target-dir target/wincmd-dos-host --all-targets --all-features -- -D warnings
 
       - name: Run unit, integration & property tests
         run: |
           cargo test --workspace --all-targets --all-features
-          CARGO_TARGET_DIR=target/wincmd-dos-host cargo test --manifest-path crates/wincmd-dos/Cargo.toml --all-targets --all-features
+          cargo test --manifest-path crates/wincmd-dos/Cargo.toml --target-dir target/wincmd-dos-host --all-targets --all-features
 
       - name: Run documentation tests
         run: cargo test --workspace --doc --all-features
@@ -295,7 +298,7 @@ jobs:
           echo "$RUNNER_TEMP/dos-env/djgpp/bin" >> "$GITHUB_PATH"
 
           curl -fsSL -L --retry 3 \
-            "https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/repos/base/cwsdpmi.zip" \
+            "https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/repositories/1.3/util/cwsdpmi.zip" \
             -o "$RUNNER_TEMP/dos-env/cwsdpmi.zip"
           unzip -j -o "$RUNNER_TEMP/dos-env/cwsdpmi.zip" "BIN/CWSDPMI.EXE" -d "$RUNNER_TEMP/dos-env"
 
@@ -515,8 +518,8 @@ jobs:
                   "qemu-system-i386",
                   "-m", "8M",
                   "-cpu", "pentium",
-                  "-fda", str(boot_img),
-                  "-hda", str(hd_img),
+                  "-drive", f"file={boot_img},format=raw,if=floppy",
+                  "-drive", f"file={hd_img},format=raw,if=ide",
                   "-boot", "a",
                   "-display", "none",
                   "-serial", f"file:{serial_log}",
@@ -619,7 +622,7 @@ jobs:
           tar -xjf "$RUNNER_TEMP/dos-env/djgpp.tar.bz2" -C "$RUNNER_TEMP/dos-env"
           echo "$RUNNER_TEMP/dos-env/djgpp/bin" >> "$GITHUB_PATH"
           curl -fsSL -L --retry 3 \
-            "https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/repos/base/cwsdpmi.zip" \
+            "https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/repositories/1.3/util/cwsdpmi.zip" \
             -o "$RUNNER_TEMP/dos-env/cwsdpmi.zip"
           unzip -j -o "$RUNNER_TEMP/dos-env/cwsdpmi.zip" "BIN/CWSDPMI.EXE" -d "$RUNNER_TEMP/dos-env"
 

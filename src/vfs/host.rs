@@ -1441,12 +1441,13 @@ impl VirtualFileSystem for HostOsVfs {
             PathBuf::from(rel_os)
         };
 
-        let _is_dir = matches!(
+        let is_dir = matches!(
             kind,
             MklinkKind::DirectorySymlink | MklinkKind::DirectoryJunction
         );
         #[cfg(unix)]
         {
+            std::hint::black_box(is_dir);
             map_io_res(
                 std::os::unix::fs::symlink(&symlink_payload, &link_host),
                 link_raw,
@@ -1455,7 +1456,7 @@ impl VirtualFileSystem for HostOsVfs {
         }
         #[cfg(windows)]
         {
-            let res = if _is_dir {
+            let res = if is_dir {
                 std::os::windows::fs::symlink_dir(&symlink_payload, &link_host)
             } else {
                 std::os::windows::fs::symlink_file(&symlink_payload, &link_host)

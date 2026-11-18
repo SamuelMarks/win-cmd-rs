@@ -1039,35 +1039,29 @@ mod tests {
 
         // Make `tmp_fix` read-only with a new fixable warning so `write_file_to_disk` exercises I/O error mapping.
         assert!(std::fs::write(&tmp_fix, format!("@echo off{CRLF}set X=2   {CRLF}")).is_ok());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert!(
-                std::fs::set_permissions(&tmp_fix, std::fs::Permissions::from_mode(0o444)).is_ok()
+        let ro_res = std::fs::metadata(&tmp_fix).and_then(|m| {
+            let writable = m.permissions();
+            let mut ro = writable.clone();
+            ro.set_readonly(true);
+            std::fs::set_permissions(&tmp_fix, ro)?;
+            let mut ro_in = Cursor::new(Vec::new());
+            let mut ro_out = Vec::new();
+            let mut ro_err = Vec::new();
+            assert_ne!(
+                execute_wincheck_process(
+                    &[
+                        "--in-place".to_owned(),
+                        tmp_fix.to_string_lossy().into_owned()
+                    ],
+                    &mut ro_in,
+                    &mut ro_out,
+                    &mut ro_err,
+                ),
+                0
             );
-        }
-        let mut ro_in = Cursor::new(Vec::new());
-        let mut ro_out = Vec::new();
-        let mut ro_err = Vec::new();
-        assert_ne!(
-            execute_wincheck_process(
-                &[
-                    "--in-place".to_owned(),
-                    tmp_fix.to_string_lossy().into_owned()
-                ],
-                &mut ro_in,
-                &mut ro_out,
-                &mut ro_err,
-            ),
-            0
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert!(
-                std::fs::set_permissions(&tmp_fix, std::fs::Permissions::from_mode(0o644)).is_ok()
-            );
-        }
+            std::fs::set_permissions(&tmp_fix, writable)
+        });
+        assert!(ro_res.is_ok());
         assert!(std::fs::remove_file(&tmp_fix).is_ok());
     }
 
