@@ -330,227 +330,265 @@ jobs:
           DOS_ENV: ${{ runner.temp }}/dos-env
           DJGPP_REL: ${{ runner.temp }}/djgpp-target/i586-pc-msdosdjgpp/release
         run: |
-          import os, pathlib, shutil, struct, subprocess, sys
+          import os
+          import pathlib
+          import shutil
+          import struct
+          import subprocess
+          import sys
 
-          dos_env = pathlib.Path(os.environ["DOS_ENV"])
-          rel = pathlib.Path(os.environ["DJGPP_REL"])
-          work = dos_env / "qemu"
-          work.mkdir(parents=True, exist_ok=True)
 
-          boot_img = work / "boot.img"
-          shutil.copy2(dos_env / "x86BOOT.img", boot_img)
-          fdauto = work / "FDAUTO.BAT"
-          fdauto.write_bytes(
-              b"@ECHO OFF\r\n"
-              b"SET PATH=C:\\;A:\\FREEDOS\\BIN\r\n"
-              b"SET TEMP=C:\\TEMP\r\n"
-              b"C:\r\n"
-              b"CALL C:\\RUNTESTS.BAT\r\n"
-              b"A:\\FREEDOS\\BIN\\FDAPM.COM POWEROFF\r\n"
-          )
-          subprocess.run(
-              ["mcopy", "-i", str(boot_img), "-o", str(fdauto), "::/FDAUTO.BAT"],
-              check=True,
-          )
+          def build_fat16_hd_image(entries: list[tuple[str, str, int, bytes]]) -> bytes:
+              cyls, heads, spt = 32, 16, 63
+              total_sectors = cyls * heads * spt
+              part_lba = 63
+              part_sectors = total_sectors - part_lba
+              img = bytearray(total_sectors * 512)
+              img[446:462] = struct.pack(
+                  "<BBBBBBBBII",
+                  0x80,
+                  1,
+                  1,
+                  0,
+                  0x06,
+                  heads - 1,
+                  spt,
+                  cyls - 1,
+                  part_lba,
+                  part_sectors,
+              )
+              img[510:512] = b"\x55\xAA"
 
-          suite_bat = (
-              b"@echo off\r\n"
-              b"set /a SUM=19+23\r\n"
-              b"echo ARITH=%SUM%\r\n"
-              b"set ITEMS=\r\n"
-              b"for %%X in (A B C) do call :acc %%X\r\n"
-              b"echo LOOP=%ITEMS%\r\n"
-              b"md C:\\WORK\r\n"
-              b"echo HELLO_FAT > C:\\WORK\\A.TXT\r\n"
-              b"copy C:\\WORK\\A.TXT C:\\WORK\\B.TXT > NUL\r\n"
-              b"move C:\\WORK\\B.TXT C:\\WORK\\C.TXT > NUL\r\n"
-              b"attrib +R C:\\WORK\\C.TXT\r\n"
-              b"attrib C:\\WORK\\C.TXT\r\n"
-              b"attrib -R C:\\WORK\\C.TXT\r\n"
-              b"dir /B C:\\WORK\r\n"
-              b"truename C:\\WORK\\C.TXT\r\n"
-              b"chcp\r\n"
-              b"del /Q C:\\WORK\\C.TXT\r\n"
-              b"C:\\EXTCHILD.COM\r\n"
-              b"echo EXT_RC=%ERRORLEVEL%\r\n"
-              b"echo spool_ok| C:\\UPCASE.COM\r\n"
-              b"C:\\EXTCHILD.COM | C:\\UPCASE.COM\r\n"
-              b"goto :eof\r\n"
-              b":acc\r\n"
-              b"set ITEMS=%ITEMS%%1\r\n"
-              b"exit /b 0\r\n"
-          )
-          runtests_bat = (
-              b"@ECHO OFF\r\n"
-              b"C:\r\n"
-              b"CD \\\r\n"
-              b"SET TEMP=C:\\TEMP\r\n"
-              b"CTTY COM1\r\n"
-              b"ECHO === BOOTED FREEDOS ===\r\n"
-              b"C:\\WINCMD.EXE /E:ON /C C:\\SUITE.BAT\r\n"
-              b"ECHO SUITE_RC=%ERRORLEVEL%\r\n"
-              b"ECHO --- WINCHECK TTY ---\r\n"
-              b"C:\\WINCHECK.EXE --dialect dos622 --format tty C:\\PORT.BAT\r\n"
-              b"ECHO --- WINCHECK GCC ---\r\n"
-              b"C:\\WINCHECK.EXE --dialect dos622 --format gcc C:\\PORT.BAT\r\n"
-              b"ECHO --- WINCHECK JSON ---\r\n"
-              b"C:\\WINCHECK.EXE --dialect dos622 --format json C:\\PORT.BAT\r\n"
-              b"ECHO --- WINCHECK SARIF ---\r\n"
-              b"C:\\WINCHECK.EXE --dialect dos622 --format sarif C:\\PORT.BAT > C:\\SARIF.OUT\r\n"
-              b"IF EXIST C:\\SARIF.OUT ECHO SARIF_OK\r\n"
-              b"ECHO --- WINCHECK FIX IN-PLACE ---\r\n"
-              b"C:\\WINCHECK.EXE --dialect dos622 --fix --in-place C:\\PORT.BAT\r\n"
-              b"C:\\WINCHECK.EXE --dialect dos622 --format gcc C:\\PORT.BAT\r\n"
-              b"ECHO FIX_RC=%ERRORLEVEL%\r\n"
-              b"IF NOT ERRORLEVEL 1 ECHO PASS_ALL_DOS_TESTS\r\n"
-              b"ECHO === DONE_FREEDOS ===\r\n"
-              b"CTTY CON\r\n"
-          )
+              spc, res_sec, num_fats, root_entries, spf = 4, 1, 2, 512, 32
+              root_dir_secs = (root_entries * 32) // 512
+              bpb = bytearray(512)
+              bpb[0:3] = b"\xEB\x3C\x90"
+              bpb[3:11] = b"MSDOS5.0"
+              struct.pack_into(
+                  "<HBHBHHBHHHII",
+                  bpb,
+                  11,
+                  512,
+                  spc,
+                  res_sec,
+                  num_fats,
+                  root_entries,
+                  part_sectors,
+                  0xF8,
+                  spf,
+                  spt,
+                  heads,
+                  part_lba,
+                  0,
+              )
+              bpb[36] = 0x80
+              bpb[38] = 0x29
+              struct.pack_into("<I", bpb, 39, 0x19940622)
+              bpb[43:54] = b"WINCMDDOS  "
+              bpb[54:62] = b"FAT16   "
+              bpb[510:512] = b"\x55\xAA"
+              p_off = part_lba * 512
+              img[p_off : p_off + 512] = bpb
 
-          cyls, heads, spt = 32, 16, 63
-          total_sectors = cyls * heads * spt
-          part_lba = 63
-          part_sectors = total_sectors - part_lba
-          img = bytearray(total_sectors * 512)
-          img[446:462] = struct.pack(
-              "<BBBBBBBBII", 0x80, 1, 1, 0, 0x06, heads - 1, spt, cyls - 1, part_lba, part_sectors
-          )
-          img[510:512] = b"\x55\xAA"
+              fat1_off = p_off + res_sec * 512
+              fat2_off = fat1_off + spf * 512
+              for f_off in (fat1_off, fat2_off):
+                  struct.pack_into("<HH", img, f_off, 0xFFF8, 0xFFFF)
 
-          spc, res_sec, num_fats, root_entries, spf = 4, 1, 2, 512, 32
-          root_dir_secs = (root_entries * 32) // 512
-          bpb = bytearray(512)
-          bpb[0:3] = b"\xEB\x3C\x90"
-          bpb[3:11] = b"MSDOS5.0"
-          struct.pack_into(
-              "<HBHBHHBHHHII",
-              bpb,
-              11,
-              512,
-              spc,
-              res_sec,
-              num_fats,
-              root_entries,
-              part_sectors,
-              0xF8,
-              spf,
-              spt,
-              heads,
-              part_lba,
-              0,
-          )
-          bpb[36] = 0x80
-          bpb[38] = 0x29
-          struct.pack_into("<I", bpb, 39, 0x19940622)
-          bpb[43:54] = b"WINCMDDOS  "
-          bpb[54:62] = b"FAT16   "
-          bpb[510:512] = b"\x55\xAA"
-          p_off = part_lba * 512
-          img[p_off : p_off + 512] = bpb
+              root_off = fat2_off + spf * 512
+              data_off = root_off + root_dir_secs * 512
+              cluster_bytes = spc * 512
+              next_cluster = 2
 
-          fat1_off = p_off + res_sec * 512
-          fat2_off = fat1_off + spf * 512
-          for f_off in (fat1_off, fat2_off):
-              struct.pack_into("<HH", img, f_off, 0xFFF8, 0xFFFF)
-
-          root_off = fat2_off + spf * 512
-          data_off = root_off + root_dir_secs * 512
-          cluster_bytes = spc * 512
-          next_cluster = 2
-          root_idx = 0
-
-          def add_root_entry(name8, ext3, attr, data_bytes):
-              nonlocal next_cluster, root_idx
-              if attr & 0x10:
-                  cl = next_cluster
-                  next_cluster += 1
-                  for f_off in (fat1_off, fat2_off):
-                      struct.pack_into("<H", img, f_off + cl * 2, 0xFFFF)
-                  d_off = data_off + (cl - 2) * cluster_bytes
-                  struct.pack_into("<11sB10xHHHI", img, d_off, b".          ", 0x10, 0, 0x0021, cl, 0)
-                  struct.pack_into("<11sB10xHHHI", img, d_off + 32, b"..         ", 0x10, 0, 0x0021, 0, 0)
-                  size = 0
-              else:
-                  cl = next_cluster
-                  n_cl = max(1, (len(data_bytes) + cluster_bytes - 1) // cluster_bytes)
-                  for i in range(n_cl):
-                      c = cl + i
-                      nxt = 0xFFFF if i == n_cl - 1 else (c + 1)
+              for root_idx, (name8, ext3, attr, data_bytes) in enumerate(entries):
+                  if attr & 0x10:
+                      cl = next_cluster
+                      next_cluster += 1
                       for f_off in (fat1_off, fat2_off):
-                          struct.pack_into("<H", img, f_off + c * 2, nxt)
-                  d_off = data_off + (cl - 2) * cluster_bytes
-                  img[d_off : d_off + len(data_bytes)] = data_bytes
-                  next_cluster += n_cl
-                  size = len(data_bytes)
-              entry_off = root_off + root_idx * 32
-              raw11 = name8.ljust(8, " ").encode("ascii") + ext3.ljust(3, " ").encode("ascii")
-              struct.pack_into("<11sB10xHHHI", img, entry_off, raw11, attr, 0, 0x0021, cl, size)
-              root_idx += 1
+                          struct.pack_into("<H", img, f_off + cl * 2, 0xFFFF)
+                      d_off = data_off + (cl - 2) * cluster_bytes
+                      struct.pack_into(
+                          "<11sB10xHHHI", img, d_off, b".          ", 0x10, 0, 0x0021, cl, 0
+                      )
+                      struct.pack_into(
+                          "<11sB10xHHHI", img, d_off + 32, b"..         ", 0x10, 0, 0x0021, 0, 0
+                      )
+                      size = 0
+                  else:
+                      cl = next_cluster
+                      n_cl = max(1, (len(data_bytes) + cluster_bytes - 1) // cluster_bytes)
+                      for i in range(n_cl):
+                          c = cl + i
+                          nxt = 0xFFFF if i == n_cl - 1 else (c + 1)
+                          for f_off in (fat1_off, fat2_off):
+                              struct.pack_into("<H", img, f_off + c * 2, nxt)
+                      d_off = data_off + (cl - 2) * cluster_bytes
+                      img[d_off : d_off + len(data_bytes)] = data_bytes
+                      next_cluster += n_cl
+                      size = len(data_bytes)
+                  entry_off = root_off + root_idx * 32
+                  raw11 = name8.ljust(8, " ").encode("ascii") + ext3.ljust(3, " ").encode("ascii")
+                  struct.pack_into("<11sB10xHHHI", img, entry_off, raw11, attr, 0, 0x0021, cl, size)
 
-          add_root_entry("TEMP", "", 0x10, b"")
-          add_root_entry("CWSDPMI", "EXE", 0x20, (dos_env / "CWSDPMI.EXE").read_bytes())
-          add_root_entry("WINCMD", "EXE", 0x20, (rel / "wincmd.exe").read_bytes())
-          add_root_entry("WINCHECK", "EXE", 0x20, (rel / "wincheck.exe").read_bytes())
-          add_root_entry(
-              "EXTCHILD",
-              "COM",
-              0x20,
-              bytes.fromhex("ba0e01b409cd21b82a4ccd2190904558545f4348494c445f34320d0a24"),
-          )
-          add_root_entry(
-              "UPCASE",
-              "COM",
-              0x20,
-              bytes.fromhex(
-                  "b43f31dbb94000ba4001cd2189c6b440bb0100b90500ba2c01cd21b440bb010089f1ba4001cd21b8004ccd21504950453a"
-              ),
-          )
-          add_root_entry("PORT", "BAT", 0x20, b"@echo off\r\necho P1 & echo P2\r\ngoto :EOF\r\n")
-          add_root_entry("SUITE", "BAT", 0x20, suite_bat)
-          add_root_entry("RUNTESTS", "BAT", 0x20, runtests_bat)
+              return bytes(img)
 
-          hd_img = work / "hd_fat16.img"
-          hd_img.write_bytes(img)
-          serial_log = work / "serial.log"
 
-          subprocess.run(
-              [
-                  "qemu-system-i386",
-                  "-m", "8M",
-                  "-cpu", "pentium",
-                  "-drive", f"file={boot_img},format=raw,if=floppy",
-                  "-drive", f"file={hd_img},format=raw,if=ide",
-                  "-boot", "a",
-                  "-display", "none",
-                  "-serial", f"file:{serial_log}",
-              ],
-              check=True,
-              timeout=90,
-          )
+          def main() -> None:
+              dos_env = pathlib.Path(os.environ["DOS_ENV"])
+              rel = pathlib.Path(os.environ["DJGPP_REL"])
+              work = dos_env / "qemu"
+              work.mkdir(parents=True, exist_ok=True)
 
-          transcript = serial_log.read_text(encoding="latin-1")
-          print(transcript)
-          for expected in (
-              "=== BOOTED FREEDOS ===",
-              "ARITH=42",
-              "LOOP=ABC",
-              "C:\\WORK\\C.TXT",
-              "Active code page: 437",
-              "EXT_CHILD_42",
-              "EXT_RC=42",
-              "PIPE:spool_ok",
-              "PIPE:EXT_CHILD_42",
-              "SUITE_RC=0",
-              "CMD5004",
-              "CMD5006",
-              "SARIF_OK",
-              "FIX_RC=0",
-              "PASS_ALL_DOS_TESTS",
-              "=== DONE_FREEDOS ===",
-          ):
-              if expected not in transcript:
-                  print(f"Missing expected FreeDOS marker: {expected}", file=sys.stderr)
-                  sys.exit(1)
+              boot_img = work / "boot.img"
+              shutil.copy2(dos_env / "x86BOOT.img", boot_img)
+              fdauto = work / "FDAUTO.BAT"
+              fdauto.write_bytes(
+                  b"@ECHO OFF\r\n"
+                  b"SET PATH=C:\\;A:\\FREEDOS\\BIN\r\n"
+                  b"SET TEMP=C:\\TEMP\r\n"
+                  b"C:\r\n"
+                  b"CALL C:\\RUNTESTS.BAT\r\n"
+                  b"A:\\FREEDOS\\BIN\\FDAPM.COM POWEROFF\r\n"
+              )
+              subprocess.run(
+                  ["mcopy", "-i", str(boot_img), "-o", str(fdauto), "::/FDAUTO.BAT"],
+                  env={**os.environ, "MTOOLS_SKIP_CHECK": "1"},
+                  check=True,
+              )
+
+              suite_bat = (
+                  b"@echo off\r\n"
+                  b"set /a SUM=19+23\r\n"
+                  b"echo ARITH=%SUM%\r\n"
+                  b"set ITEMS=\r\n"
+                  b"for %%X in (A B C) do call :acc %%X\r\n"
+                  b"echo LOOP=%ITEMS%\r\n"
+                  b"md C:\\WORK\r\n"
+                  b"echo HELLO_FAT > C:\\WORK\\A.TXT\r\n"
+                  b"copy C:\\WORK\\A.TXT C:\\WORK\\B.TXT > NUL\r\n"
+                  b"move C:\\WORK\\B.TXT C:\\WORK\\C.TXT > NUL\r\n"
+                  b"attrib +R C:\\WORK\\C.TXT\r\n"
+                  b"attrib C:\\WORK\\C.TXT\r\n"
+                  b"attrib -R C:\\WORK\\C.TXT\r\n"
+                  b"dir /B C:\\WORK\r\n"
+                  b"truename C:\\WORK\\C.TXT\r\n"
+                  b"chcp\r\n"
+                  b"del /Q C:\\WORK\\C.TXT\r\n"
+                  b"C:\\EXTCHILD.COM\r\n"
+                  b"echo EXT_RC=%ERRORLEVEL%\r\n"
+                  b"echo spool_ok| C:\\UPCASE.COM\r\n"
+                  b"C:\\EXTCHILD.COM | C:\\UPCASE.COM\r\n"
+                  b"goto :eof\r\n"
+                  b":acc\r\n"
+                  b"set ITEMS=%ITEMS%%1\r\n"
+                  b"exit /b 0\r\n"
+              )
+              runtests_bat = (
+                  b"@ECHO OFF\r\n"
+                  b"C:\r\n"
+                  b"CD \\\r\n"
+                  b"SET TEMP=C:\\TEMP\r\n"
+                  b"CTTY COM1\r\n"
+                  b"ECHO === BOOTED FREEDOS ===\r\n"
+                  b"C:\\WINCMD.EXE /E:ON /C C:\\SUITE.BAT\r\n"
+                  b"ECHO SUITE_RC=%ERRORLEVEL%\r\n"
+                  b"ECHO --- WINCHECK TTY ---\r\n"
+                  b"C:\\WINCHECK.EXE --dialect dos622 --format tty C:\\PORT.BAT\r\n"
+                  b"ECHO --- WINCHECK GCC ---\r\n"
+                  b"C:\\WINCHECK.EXE --dialect dos622 --format gcc C:\\PORT.BAT\r\n"
+                  b"ECHO --- WINCHECK JSON ---\r\n"
+                  b"C:\\WINCHECK.EXE --dialect dos622 --format json C:\\PORT.BAT\r\n"
+                  b"ECHO --- WINCHECK SARIF ---\r\n"
+                  b"C:\\WINCHECK.EXE --dialect dos622 --format sarif C:\\PORT.BAT > C:\\SARIF.OUT\r\n"
+                  b"IF EXIST C:\\SARIF.OUT ECHO SARIF_OK\r\n"
+                  b"ECHO --- WINCHECK FIX IN-PLACE ---\r\n"
+                  b"C:\\WINCHECK.EXE --dialect dos622 --fix --in-place C:\\PORT.BAT\r\n"
+                  b"C:\\WINCHECK.EXE --dialect dos622 --format gcc C:\\PORT.BAT\r\n"
+                  b"ECHO FIX_RC=%ERRORLEVEL%\r\n"
+                  b"IF NOT ERRORLEVEL 1 ECHO PASS_ALL_DOS_TESTS\r\n"
+                  b"ECHO === DONE_FREEDOS ===\r\n"
+                  b"CTTY CON\r\n"
+              )
+
+              hd_entries = [
+                  ("TEMP", "", 0x10, b""),
+                  ("CWSDPMI", "EXE", 0x20, (dos_env / "CWSDPMI.EXE").read_bytes()),
+                  ("WINCMD", "EXE", 0x20, (rel / "wincmd.exe").read_bytes()),
+                  ("WINCHECK", "EXE", 0x20, (rel / "wincheck.exe").read_bytes()),
+                  (
+                      "EXTCHILD",
+                      "COM",
+                      0x20,
+                      bytes.fromhex(
+                          "ba0e01b409cd21b82a4ccd2190904558545f4348494c445f34320d0a24"
+                      ),
+                  ),
+                  (
+                      "UPCASE",
+                      "COM",
+                      0x20,
+                      bytes.fromhex(
+                          "b43f31dbb94000ba4001cd2189c6b440bb0100b90500ba2c01cd21b440bb010089f1ba4001cd21b8004ccd21504950453a"
+                      ),
+                  ),
+                  ("PORT", "BAT", 0x20, b"@echo off\r\necho P1 & echo P2\r\ngoto :EOF\r\n"),
+                  ("SUITE", "BAT", 0x20, suite_bat),
+                  ("RUNTESTS", "BAT", 0x20, runtests_bat),
+              ]
+
+              hd_img = work / "hd_fat16.img"
+              hd_img.write_bytes(build_fat16_hd_image(hd_entries))
+              serial_log = work / "serial.log"
+
+              subprocess.run(
+                  [
+                      "qemu-system-i386",
+                      "-m",
+                      "8M",
+                      "-cpu",
+                      "pentium",
+                      "-drive",
+                      f"file={boot_img},format=raw,if=floppy",
+                      "-drive",
+                      f"file={hd_img},format=raw,if=ide",
+                      "-boot",
+                      "a",
+                      "-display",
+                      "none",
+                      "-serial",
+                      f"file:{serial_log}",
+                  ],
+                  check=True,
+                  timeout=90,
+              )
+
+              transcript = serial_log.read_text(encoding="latin-1")
+              print(transcript)
+              for expected in (
+                  "=== BOOTED FREEDOS ===",
+                  "ARITH=42",
+                  "LOOP=ABC",
+                  "C:\\WORK\\C.TXT",
+                  "Active code page: 437",
+                  "EXT_CHILD_42",
+                  "EXT_RC=42",
+                  "PIPE:spool_ok",
+                  "PIPE:EXT_CHILD_42",
+                  "SUITE_RC=0",
+                  "CMD5004",
+                  "CMD5006",
+                  "SARIF_OK",
+                  "FIX_RC=0",
+                  "PASS_ALL_DOS_TESTS",
+                  "=== DONE_FREEDOS ===",
+              ):
+                  if expected not in transcript:
+                      print(f"Missing expected FreeDOS marker: {expected}", file=sys.stderr)
+                      sys.exit(1)
+
+
+          if __name__ == "__main__":
+              main()
 
   build-release:
     name: Build Release (${{ matrix.target }})

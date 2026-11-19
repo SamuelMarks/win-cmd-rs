@@ -93,7 +93,7 @@ repos:
                 check=False,
             )
             sys.exit(res.returncode)
-        files: (\.rs$|Cargo\.toml$)
+        files: (\.rs$|Cargo\.toml$|\.github/workflows/ci\.yml$|djgpp-linker\.sh$)
         pass_filenames: false
 
       - id: cargo-fmt

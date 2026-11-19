@@ -1,8 +1,11 @@
 //! Automated documentation coverage (`100%` file, module, type, field, variant, function,
-//! `# Arguments`, `# Returns`, `# Errors`) and architectural anti-pattern quality gates for `win-cmd-rs`.
+//! `# Arguments`, `# Returns`, `# Errors`), embedded CI/linker Python script static compilation,
+//! and architectural anti-pattern quality gates for `win-cmd-rs`.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Recursively collects all `.rs` source files under `dir` in deterministic lexicographical order.
 ///
@@ -1238,4 +1241,310 @@ fn test_all_sixty_lint_rules_catalog_and_dos_portability_gate() {
             d.rule_id
         );
     }
+}
+
+/// Extracts an indented YAML literal block scalar (`|`) starting immediately after `header_idx`.
+///
+/// # Arguments
+/// * `lines` - Source lines of the YAML file.
+/// * `header_idx` - 0-based line index of the `run: |` or `- |` block header.
+///
+/// # Returns
+/// Dedented multi-line text content of the YAML literal block scalar.
+#[must_use]
+fn extract_yaml_block_scalar(lines: &[&str], header_idx: usize) -> String {
+    let header_line = lines.get(header_idx).copied().unwrap_or("");
+    let header_indent = header_line
+        .len()
+        .saturating_sub(header_line.trim_start().len());
+
+    let mut block_indent: Option<usize> = None;
+    let mut raw_block: Vec<&str> = Vec::new();
+    let mut idx = header_idx.saturating_add(1);
+
+    while idx < lines.len() {
+        let line = lines.get(idx).copied().unwrap_or("");
+        if line.trim().is_empty() {
+            if block_indent.is_some() {
+                raw_block.push("");
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        let indent = line.len().saturating_sub(line.trim_start().len());
+        if let Some(min_indent) = block_indent {
+            if indent < min_indent {
+                break;
+            }
+            raw_block.push(line.get(min_indent..).unwrap_or(""));
+        } else {
+            if indent <= header_indent {
+                break;
+            }
+            block_indent = Some(indent);
+            raw_block.push(line.get(indent..).unwrap_or(""));
+        }
+        idx = idx.saturating_add(1);
+    }
+
+    while raw_block.last().is_some_and(|last| last.is_empty()) {
+        raw_block.pop();
+    }
+    raw_block.join("\n")
+}
+
+/// Extracts every `shell: python3 {0}` step script from `.github/workflows/ci.yml`.
+///
+/// # Arguments
+/// * `yaml_text` - Full UTF-8 text of `.github/workflows/ci.yml`.
+///
+/// # Returns
+/// Ordered `(step_label, python_source)` pairs for all inline Python workflow steps.
+#[must_use]
+fn extract_ci_python_step_scripts(yaml_text: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = yaml_text.lines().collect();
+    let mut out = Vec::new();
+    let mut current_step = String::from("unnamed-step");
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        let trimmed = lines.get(idx).copied().unwrap_or("").trim();
+        if let Some(step_name) = trimmed.strip_prefix("- name:") {
+            current_step = step_name.trim().to_owned();
+        } else if trimmed == "shell: python3 {0}" {
+            let mut scan = idx.saturating_add(1);
+            while scan < lines.len() {
+                let st = lines.get(scan).copied().unwrap_or("").trim();
+                if st.starts_with("- name:") {
+                    break;
+                }
+                if st == "run: |" {
+                    let script = extract_yaml_block_scalar(&lines, scan);
+                    out.push((format!(".github/workflows/ci.yml ({current_step})"), script));
+                    idx = scan;
+                    break;
+                }
+                scan = scan.saturating_add(1);
+            }
+        }
+        idx = idx.saturating_add(1);
+    }
+    out
+}
+
+/// Extracts every `entry: python3 -c` hook script from `.pre-commit-config.yaml`.
+///
+/// # Arguments
+/// * `yaml_text` - Full UTF-8 text of `.pre-commit-config.yaml`.
+///
+/// # Returns
+/// Ordered `(hook_label, python_source)` pairs for all Python pre-commit hooks.
+#[must_use]
+fn extract_precommit_python_hook_scripts(yaml_text: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = yaml_text.lines().collect();
+    let mut out = Vec::new();
+    let mut current_hook = String::from("unnamed-hook");
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        let trimmed = lines.get(idx).copied().unwrap_or("").trim();
+        if let Some(hook_id) = trimmed.strip_prefix("- id:") {
+            current_hook = hook_id.trim().to_owned();
+        } else if trimmed == "entry: python3 -c" {
+            let mut scan = idx.saturating_add(1);
+            while scan < lines.len() {
+                let st = lines.get(scan).copied().unwrap_or("").trim();
+                if st.starts_with("- id:") {
+                    break;
+                }
+                if st == "- |" {
+                    let script = extract_yaml_block_scalar(&lines, scan);
+                    out.push((format!(".pre-commit-config.yaml ({current_hook})"), script));
+                    idx = scan;
+                    break;
+                }
+                scan = scan.saturating_add(1);
+            }
+        }
+        idx = idx.saturating_add(1);
+    }
+    out
+}
+
+/// Extracts a single-quoted shell heredoc (`<<'MARKER' ... MARKER`) payload from `sh_text`.
+///
+/// # Arguments
+/// * `sh_text` - Full UTF-8 shell script text.
+/// * `marker` - Heredoc delimiter identifier (such as `"PYLINK"`).
+///
+/// # Returns
+/// Enclosed heredoc script body, or an empty `String` if the delimiter is absent.
+#[must_use]
+fn extract_heredoc_script(sh_text: &str, marker: &str) -> String {
+    let open_tag = format!("<<'{marker}'");
+    let Some((_, after_open)) = sh_text.split_once(&open_tag) else {
+        return String::new();
+    };
+    let body_start = after_open
+        .strip_prefix("\r\n")
+        .or_else(|| after_open.strip_prefix('\n'))
+        .unwrap_or(after_open);
+    let mut collected = Vec::new();
+    for line in body_start.lines() {
+        if line == marker {
+            break;
+        }
+        collected.push(line);
+    }
+    collected.join("\n")
+}
+
+/// Resolves an available Python 3 interpreter executable on the current host (`python` or `python3`).
+///
+/// # Returns
+/// `Some(program_name)` when a working Python 3 interpreter is on `PATH`, or `None` otherwise.
+#[must_use]
+fn resolve_python3_binary() -> Option<&'static str> {
+    let candidates = if cfg!(windows) {
+        ["python", "python3"]
+    } else {
+        ["python3", "python"]
+    };
+    for bin in candidates {
+        let ok = Command::new(bin)
+            .args([
+                "-c",
+                "import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|st| st.success());
+        if ok {
+            return Some(bin);
+        }
+    }
+    None
+}
+
+/// Compiles `source` via Python's built-in `compile(..., "exec")` pass without executing it,
+/// catching syntax, indentation, and PEP 3104 symbol-table (`nonlocal` / `global`) errors.
+///
+/// # Arguments
+/// * `py_bin` - Resolved Python 3 interpreter command name.
+/// * `label` - Virtual filename label attached to Python compiler diagnostics.
+/// * `source` - Python source text to validate.
+///
+/// # Returns
+/// `Ok(())` when `source` compiles cleanly to Python bytecode.
+///
+/// # Errors
+/// Returns `Err(String)` containing Python's compiler traceback if compilation fails.
+fn check_python_script_compiles(py_bin: &str, label: &str, source: &str) -> Result<(), String> {
+    let mut child = Command::new(py_bin)
+        .args([
+            "-c",
+            "import sys; compile(sys.stdin.read(), sys.argv[1], 'exec')",
+            label,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn `{py_bin}` for `{label}`: {err}"))?;
+
+    if let Some(mut stdin_pipe) = child.stdin.take() {
+        stdin_pipe
+            .write_all(source.as_bytes())
+            .map_err(|err| format!("failed writing stdin to `{py_bin}` for `{label}`: {err}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed waiting on `{py_bin}` for `{label}`: {err}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label}:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Verifies that every embedded Python script across `.github/workflows/ci.yml`,
+/// `.pre-commit-config.yaml`, and `crates/wincmd-dos/stub/djgpp-linker.sh` passes Python's
+/// AST + PEP 3104 symbol-table + bytecode compiler (`compile(..., "exec")`) with zero errors.
+#[test]
+fn test_embedded_ci_and_linker_python_scripts_compile_cleanly() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap_or_default();
+    let ci_scripts = extract_ci_python_step_scripts(&ci_yaml);
+    assert_eq!(
+        ci_scripts.len(),
+        3,
+        "Expected 3 `shell: python3 {{0}}` steps in `.github/workflows/ci.yml`, found {}",
+        ci_scripts.len()
+    );
+
+    let precommit_yaml =
+        fs::read_to_string(root.join(".pre-commit-config.yaml")).unwrap_or_default();
+    let precommit_scripts = extract_precommit_python_hook_scripts(&precommit_yaml);
+    assert_eq!(
+        precommit_scripts.len(),
+        3,
+        "Expected 3 `entry: python3 -c` hooks in `.pre-commit-config.yaml`, found {}",
+        precommit_scripts.len()
+    );
+
+    let linker_sh =
+        fs::read_to_string(root.join("crates/wincmd-dos/stub/djgpp-linker.sh")).unwrap_or_default();
+    let linker_py = extract_heredoc_script(&linker_sh, "PYLINK");
+    assert!(
+        linker_py.contains("def convert_pe_coff_to_go32"),
+        "Expected `PYLINK` heredoc script in `crates/wincmd-dos/stub/djgpp-linker.sh`"
+    );
+
+    let Some(py_bin) = resolve_python3_binary() else {
+        return;
+    };
+
+    // Confirm negative detection on the exact module-scope `nonlocal` bug class (PEP 3104).
+    let broken_nonlocal = "next_cluster = 2\ndef add_root_entry():\n    nonlocal next_cluster\n    next_cluster += 1\n";
+    let neg_res = check_python_script_compiles(py_bin, "<synthetic-nonlocal>", broken_nonlocal);
+    assert!(
+        neg_res
+            .as_ref()
+            .is_err_and(|msg| msg.contains("SyntaxError") && msg.contains("nonlocal")),
+        "Expected `compile()` gate to reject module-scope `nonlocal`, got: {neg_res:?}"
+    );
+
+    let mut all_scripts = Vec::new();
+    all_scripts.extend(ci_scripts);
+    all_scripts.extend(precommit_scripts);
+    all_scripts.push((
+        String::from("crates/wincmd-dos/stub/djgpp-linker.sh (PYLINK)"),
+        linker_py,
+    ));
+
+    let mut compile_errors = Vec::new();
+    for (label, script) in &all_scripts {
+        assert!(
+            !script.trim().is_empty(),
+            "Extracted empty Python script for `{label}`"
+        );
+        if let Err(err) = check_python_script_compiles(py_bin, label, script) {
+            compile_errors.push(err);
+        }
+    }
+
+    assert_eq!(
+        compile_errors,
+        Vec::<String>::new(),
+        "Embedded Python script compilation errors:\n{}",
+        compile_errors.join("\n\n")
+    );
 }
