@@ -284,7 +284,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 mtools dosfstools unzip curl bzip2 zip python3
+            qemu-system-x86 mtools dosfstools libfl2 unzip curl bzip2 zip python3
 
       - name: Install DJGPP cross-compiler, CWSDPMI.EXE & FreeDOS 1.3 boot floppy
         shell: bash
@@ -592,7 +592,7 @@ jobs:
           - target: i586-pc-msdosdjgpp
             os: ubuntu-latest
             archive: dos-zip
-            apt_packages: unzip curl bzip2 zip python3
+            apt_packages: libfl2 unzip curl bzip2 zip python3
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

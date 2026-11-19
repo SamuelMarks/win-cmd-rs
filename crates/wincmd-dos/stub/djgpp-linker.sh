@@ -157,18 +157,97 @@ def convert_pe_coff_to_go32(raw: bytes) -> bytes:
     return bytes(buf)
 
 
-def normalize_ar_archive(ar_path: str, work_dir: str, ar_tool: str, seq: int) -> str:
+def format_ar_header(name_field: bytes, mode_octal: bytes, size: int) -> bytes:
+    return (
+        name_field[:16].ljust(16, b" ")
+        + b"0".ljust(12, b" ")
+        + b"0".ljust(6, b" ")
+        + b"0".ljust(6, b" ")
+        + mode_octal[:8].ljust(8, b" ")
+        + str(size).encode("ascii").ljust(10, b" ")
+        + bytes([0x60, 0x0A])
+    )
+
+
+def extract_coff_defined_ext_symbols(raw: bytes) -> list[bytes]:
+    if len(raw) < 20:
+        return []
+    magic, _nscns, _timdat, symptr, nsyms, _opthdr, _flags = struct.unpack_from(
+        "<HHIIIHH", raw, 0
+    )
+    if magic != 0x014C or symptr == 0 or nsyms == 0:
+        return []
+    strtab_off = symptr + nsyms * 18
+    defined = []
+    idx = 0
+    while idx < nsyms:
+        off = symptr + idx * 18
+        if off + 18 > len(raw):
+            break
+        name8 = raw[off : off + 8]
+        val, scnum, _stype, sclass, naux = struct.unpack_from("<IhHBB", raw, off + 8)
+        idx += 1 + naux
+        if sclass == 2 and (scnum > 0 or scnum == -1 or (scnum == 0 and val > 0)):
+            z0, s_off = struct.unpack("<II", name8)
+            if z0 == 0 and strtab_off + s_off < len(raw):
+                end_i = raw.find(bytes([0]), strtab_off + s_off)
+                sym = raw[strtab_off + s_off : (len(raw) if end_i < 0 else end_i)]
+            else:
+                sym = name8.rstrip(bytes([0]))
+            if sym:
+                defined.append(sym)
+    return defined
+
+
+def build_gnu_coff_ar(member_blobs: list[bytes]) -> bytes:
+    sym_entries = []
+    for m_idx, raw in enumerate(member_blobs):
+        for sym in extract_coff_defined_ext_symbols(raw):
+            sym_entries.append((m_idx, sym))
+
+    nsyms = len(sym_entries)
+    str_blob = (
+        bytes([0]).join(sym for _, sym in sym_entries) + bytes([0])
+        if nsyms > 0
+        else b""
+    )
+    symtab_raw_len = 4 + 4 * nsyms + len(str_blob)
+    symtab_pad = bytes([0]) if (symtab_raw_len & 1) else b""
+    symtab_size = symtab_raw_len + len(symtab_pad)
+
+    cur_off = 8 + 60 + symtab_size
+    member_offsets = []
+    member_chunks = []
+    for m_idx, raw in enumerate(member_blobs):
+        member_offsets.append(cur_off)
+        m_hdr = format_ar_header(
+            f"m{m_idx:07d}.o/".encode("ascii"), b"644", len(raw)
+        )
+        m_pad = bytes([10]) if (len(raw) & 1) else b""
+        chunk = m_hdr + raw + m_pad
+        member_chunks.append(chunk)
+        cur_off += len(chunk)
+
+    out = bytearray(b"!<arch>" + bytes([10]))
+    out += format_ar_header(b"/", b"0", symtab_size)
+    out += struct.pack(">I", nsyms)
+    for m_idx, _ in sym_entries:
+        out += struct.pack(">I", member_offsets[m_idx])
+    out += str_blob + symtab_pad
+    for chunk in member_chunks:
+        out += chunk
+    return bytes(out)
+
+
+def normalize_ar_archive(ar_path: str, work_dir: str, seq: int) -> str:
     data = open(ar_path, "rb").read()
     ar_magic = b"!<arch>" + bytes([10])
     if not data.startswith(ar_magic) or b"@feat.00" not in data:
         return ar_path
 
-    member_dir = os.path.join(work_dir, f"ar_{seq}")
-    os.makedirs(member_dir, exist_ok=True)
     pos = 8
     longnames = b""
-    extracted = []
-    member_idx = 0
+    converted_members = []
     while pos + 60 <= len(data):
         hdr = data[pos : pos + 60]
         raw_name = hdr[0:16].decode("latin1")
@@ -195,17 +274,13 @@ def normalize_ar_archive(ar_path: str, work_dir: str, ar_tool: str, seq: int) ->
 
         if m_name.endswith(".rmeta") or m_name.startswith("lib.rmeta"):
             continue
-        converted = convert_pe_coff_to_go32(body)
-        out_member = os.path.join(member_dir, f"m{member_idx}_{os.path.basename(m_name)}")
-        with open(out_member, "wb") as mf:
-            mf.write(converted)
-        extracted.append(out_member)
-        member_idx += 1
+        converted_members.append(convert_pe_coff_to_go32(body))
 
-    if not extracted:
+    if not converted_members:
         return ar_path
     out_ar = os.path.join(work_dir, f"norm_{seq}_{os.path.basename(ar_path)}")
-    subprocess.run([ar_tool, "crs", out_ar, *extracted], check=True)
+    with open(out_ar, "wb") as out_f:
+        out_f.write(build_gnu_coff_ar(converted_members))
     return out_ar
 
 
@@ -264,7 +339,6 @@ def main() -> int:
     script_dir = sys.argv[1]
     in_args = expand_args(sys.argv[2:])
     djgpp_gcc = os.environ.get("DJGPP_GCC", "i586-pc-msdosdjgpp-gcc")
-    djgpp_ar = os.environ.get("DJGPP_AR", "i586-pc-msdosdjgpp-ar")
 
     work_dir = tempfile.mkdtemp(prefix="wincmd_djgpp_link_")
     try:
@@ -295,7 +369,7 @@ def main() -> int:
                     seq += 1
                     continue
             if os.path.isfile(arg) and (arg.endswith(".rlib") or arg.endswith(".a")):
-                filtered.append(normalize_ar_archive(arg, work_dir, djgpp_ar, seq))
+                filtered.append(normalize_ar_archive(arg, work_dir, seq))
                 seq += 1
                 continue
             filtered.append(arg)
