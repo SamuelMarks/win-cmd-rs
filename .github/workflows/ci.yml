@@ -590,6 +590,70 @@ jobs:
           if __name__ == "__main__":
               main()
 
+  linux-cross-build:
+    name: Linux Cross-Link Gate (aarch64-gnu & x86_64-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install cross-compilation packages (aarch64 glibc & x86_64 musl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross musl-tools
+
+      - name: Install Rust stable toolchain with Linux cross targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu, x86_64-unknown-linux-musl
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-cross
+
+      - name: Cross-compile and link wincmd & wincheck (aarch64-gnu & x86_64-musl)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --locked --bins --target aarch64-unknown-linux-gnu
+          cargo build --locked --bins --target x86_64-unknown-linux-musl
+          ./target/x86_64-unknown-linux-musl/debug/wincmd --version
+          ./target/x86_64-unknown-linux-musl/debug/wincheck --version
+
+      - name: Verify linked ELF64 machine architectures
+        shell: python3 {0}
+        run: |
+          import pathlib
+          import struct
+          import sys
+
+          expected_bins = (
+              ("target/aarch64-unknown-linux-gnu/debug/wincmd", 183),
+              ("target/aarch64-unknown-linux-gnu/debug/wincheck", 183),
+              ("target/x86_64-unknown-linux-musl/debug/wincmd", 62),
+              ("target/x86_64-unknown-linux-musl/debug/wincheck", 62),
+          )
+          for rel_path, expected_machine in expected_bins:
+              bin_path = pathlib.Path(rel_path)
+              if not bin_path.is_file():
+                  print(f"Missing cross-linked binary: {rel_path}", file=sys.stderr)
+                  sys.exit(1)
+              header = bin_path.read_bytes()[:24]
+              if len(header) < 24 or header[:4] != b"\x7fELF" or header[4] != 2:
+                  print(f"Invalid ELF64 header in {rel_path}", file=sys.stderr)
+                  sys.exit(1)
+              (_ident, e_type, e_machine, _e_version) = struct.unpack("<16sHHI", header)
+              if e_type not in (2, 3) or e_machine != expected_machine:
+                  print(
+                      f"Unexpected ELF header in {rel_path}: e_type={e_type}, "
+                      f"e_machine={e_machine} (expected {expected_machine})",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          print("Verified ELF64 headers for aarch64-unknown-linux-gnu and x86_64-unknown-linux-musl.")
+
   build-release:
     name: Build Release (${{ matrix.target }})
     needs:
@@ -597,6 +661,7 @@ jobs:
       - test
       - coverage
       - dos-cross-test
+      - linux-cross-build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     strategy:
@@ -613,7 +678,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
-            apt_packages: gcc-aarch64-linux-gnu
+            apt_packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -760,7 +825,7 @@ jobs:
           Compress-Archive -Path $StageDir -DestinationPath $ZipPath -Force
           Remove-Item -Recurse -Force $StageDir
           $Hash = (Get-FileHash -Algorithm SHA256 $ZipPath).Hash.ToLowerInvariant()
-          "$Hash  $StageName.zip" | Set-Content -NoNewline:$false -Encoding ascii "$ZipPath.sha256"
+          [System.IO.File]::WriteAllText("$ZipPath.sha256", "$Hash  $StageName.zip`n", [System.Text.Encoding]::ASCII)
 
       - name: Upload release artifact (${{ matrix.target }})
         uses: actions/upload-artifact@v7
@@ -779,6 +844,7 @@ jobs:
       - test
       - coverage
       - dos-cross-test
+      - linux-cross-build
       - build-release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -796,7 +862,8 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          cat ./*.sha256 | sort -k 2 > SHA256SUMS.txt
+          cat ./*.sha256 | tr -d '\r' | sort -k 2 > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release and upload assets

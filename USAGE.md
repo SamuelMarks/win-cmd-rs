@@ -16,7 +16,7 @@ This guide covers day-to-day usage of the **`wincmd` (`WINCMD.EXE`)** cross-plat
    - [MS-DOS `COMMAND.COM` Dialect (`--dialect dos622`, `/P`, `/E:nnnnn`)](#26-ms-dos-commandcom-dialect---dialect-dos622-p-ennnnn)
 3. [Batch Scripting Cookbook (`cmd.exe` & `COMMAND.COM` Semantics)](#3-batch-scripting-cookbook-cmdexe--commandcom-semantics)
    - [Variables, Delayed Expansion (`!VAR!`) & Slicing](#31-variables-delayed-expansion-var--slicing)
-   - [Parameters (`%0`–`%9`, `%*`) & `%~` Path Modifiers](#32-parameters-09---path-modifiers)
+   - [Parameters (`%0`–`%9`, `%*`) & `%~` Path Modifiers](#32-parameters-09----path-modifiers)
    - [Control Flow (`IF`, `FOR`, `CALL :label`, `GOTO :EOF`)](#33-control-flow-if-for-call-label-goto-eof)
    - [`SET /A` 32-Bit Signed Arithmetic](#34-set-a-32-bit-signed-arithmetic)
    - [Redirections, Reserved DOS Devices & Pipelines](#35-redirections-reserved-dos-devices--pipelines)

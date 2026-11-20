@@ -452,7 +452,7 @@ Unlike POSIX shells (`sh`, `bash`, `zsh`) that lex and parse a script into an AS
 
 ### Phase 0: Byte-Offset Script Reader, Encodings & Line Continuation
 
-- **Byte-Offset Seeking**: `BatchFrameReader` tracks `current_offset: ByteOffset`. Before fetching each statement, it reads the file from the `VirtualFileSystem` at `current_offset`. If a batch script appends commands to itself (`echo echo Added dynamically >> "%~f0"`), `wincmd` executes the newly appended lines just like native `cmd.exe`.
+- **Byte-Offset Seeking**: `BatchFrameReader` tracks `cursor: ByteOffset`. Before fetching each statement, it reads the file from the `VirtualFileSystem` at `cursor`. If a batch script appends commands to itself (`echo echo Added dynamically >> "%~f0"`), `wincmd` executes the newly appended lines just like native `cmd.exe`.
 - **Codepages & `0x1A` SUB EOF**: Supports `CodePage::Utf8` (`65001`), `OemUnitedStates` (`437`), `OemMultilingualLatin1` (`850`), `OemLatin2` (`852`), `OemNordic` (`865`), `OemCyrillic` (`866`), `WindowsLatin1` (`1252`), `Utf16Le` (`1200`), `Utf16Be` (`1201`), and `Ascii` (`20127`), with full 256-entry lookup tables for OEM box-drawing/international characters, live `DosKernelApi` `CHCP` synchronization, and `0x1A` (`Ctrl+Z`) logical EOF truncation.
 - **Physical-to-Logical Span Mapping**: Every character in `LogicalLineBuffer` is a `SpannedChar` tracking its exact `Span` and `ExpansionOrigin` (`LiteralSource`, `CaretContinuation`, `PositionalParam`, `ImmediateEnvVar`, `ForVariable`, `DelayedEnvVar`).
 

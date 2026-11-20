@@ -1485,8 +1485,8 @@ fn test_embedded_ci_and_linker_python_scripts_compile_cleanly() {
     let ci_scripts = extract_ci_python_step_scripts(&ci_yaml);
     assert_eq!(
         ci_scripts.len(),
-        3,
-        "Expected 3 `shell: python3 {{0}}` steps in `.github/workflows/ci.yml`, found {}",
+        4,
+        "Expected 4 `shell: python3 {{0}}` steps in `.github/workflows/ci.yml`, found {}",
         ci_scripts.len()
     );
 
@@ -1546,5 +1546,194 @@ fn test_embedded_ci_and_linker_python_scripts_compile_cleanly() {
         Vec::<String>::new(),
         "Embedded Python script compilation errors:\n{}",
         compile_errors.join("\n\n")
+    );
+}
+
+/// Pairing between a Debian/Ubuntu GNU C cross-compiler package and its target `glibc` development
+/// sysroot package (`Scrt1.o`, `crti.o`, `crtn.o`, `libc.so`), which Debian/Ubuntu marks only as
+/// `Recommends:` and therefore omits under `apt-get install --no-install-recommends`.
+struct DebianCrossSysrootRule {
+    /// Debian/Ubuntu `gcc-<triple>` cross-compiler package name.
+    gcc_package: &'static str,
+    /// Required companion `libc6-dev-<arch>-cross` package providing CRT startup objects and `libc.so`.
+    libc_dev_package: &'static str,
+}
+
+/// Known Debian/Ubuntu GNU cross-compiler -> `libc6-dev-*-cross` package pairings.
+const DEBIAN_CROSS_SYSROOT_RULES: &[DebianCrossSysrootRule] = &[
+    DebianCrossSysrootRule {
+        gcc_package: "gcc-aarch64-linux-gnu",
+        libc_dev_package: "libc6-dev-arm64-cross",
+    },
+    DebianCrossSysrootRule {
+        gcc_package: "gcc-x86-64-linux-gnu",
+        libc_dev_package: "libc6-dev-amd64-cross",
+    },
+    DebianCrossSysrootRule {
+        gcc_package: "gcc-arm-linux-gnueabihf",
+        libc_dev_package: "libc6-dev-armhf-cross",
+    },
+    DebianCrossSysrootRule {
+        gcc_package: "gcc-riscv64-linux-gnu",
+        libc_dev_package: "libc6-dev-riscv64-cross",
+    },
+    DebianCrossSysrootRule {
+        gcc_package: "gcc-powerpc64le-linux-gnu",
+        libc_dev_package: "libc6-dev-ppc64el-cross",
+    },
+    DebianCrossSysrootRule {
+        gcc_package: "gcc-s390x-linux-gnu",
+        libc_dev_package: "libc6-dev-s390x-cross",
+    },
+];
+
+/// Audits `.github/workflows/ci.yml` for cross-compilation sysroot completeness under
+/// `--no-install-recommends`, continuous non-tag Linux cross-link coverage, and LF-clean
+/// release `SHA256SUMS.txt` verification.
+///
+/// # Arguments
+/// * `yaml_text` - Full UTF-8 text of `.github/workflows/ci.yml`.
+///
+/// # Returns
+/// Ordered list of CI workflow invariant violation messages (empty when clean).
+#[must_use]
+fn audit_ci_cross_compile_and_release_workflow(yaml_text: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let lines: Vec<&str> = yaml_text.lines().collect();
+    let uses_no_install_recommends = yaml_text.contains("--no-install-recommends");
+
+    for (idx, raw_line) in lines.iter().enumerate() {
+        let trimmed = raw_line.trim();
+        let line_no = idx.saturating_add(1);
+
+        if uses_no_install_recommends && let Some(pkg_spec) = trimmed.strip_prefix("apt_packages:")
+        {
+            let tokens: Vec<&str> = pkg_spec.split_whitespace().collect();
+            for rule in DEBIAN_CROSS_SYSROOT_RULES {
+                if tokens.contains(&rule.gcc_package) && !tokens.contains(&rule.libc_dev_package) {
+                    violations.push(format!(
+                        ".github/workflows/ci.yml:{line_no}: `apt_packages` installs `{}` under `--no-install-recommends` without `{}` (missing `Scrt1.o`/`crti.o`/`libc.so`)",
+                        rule.gcc_package, rule.libc_dev_package
+                    ));
+                }
+            }
+        }
+
+        if trimmed.starts_with("sudo apt-get install")
+            && trimmed.contains("--no-install-recommends")
+        {
+            let mut joined = String::from(trimmed);
+            let mut cont_idx = idx;
+            while joined.trim_end().ends_with('\\') {
+                joined = joined.trim_end().trim_end_matches('\\').to_owned();
+                cont_idx = cont_idx.saturating_add(1);
+                let Some(next_line) = lines.get(cont_idx) else {
+                    break;
+                };
+                joined.push(' ');
+                joined.push_str(next_line.trim());
+            }
+            if !joined.contains("${{") {
+                let tokens: Vec<&str> = joined.split_whitespace().collect();
+                for rule in DEBIAN_CROSS_SYSROOT_RULES {
+                    if tokens.contains(&rule.gcc_package)
+                        && !tokens.contains(&rule.libc_dev_package)
+                    {
+                        violations.push(format!(
+                            ".github/workflows/ci.yml:{line_no}: `apt-get install --no-install-recommends` installs `{}` without `{}`",
+                            rule.gcc_package, rule.libc_dev_package
+                        ));
+                    }
+                }
+            }
+        }
+
+        if trimmed.contains("Set-Content") && trimmed.contains(".sha256") {
+            violations.push(format!(
+                ".github/workflows/ci.yml:{line_no}: PowerShell `Set-Content` emits CRLF in `.sha256` files; use `[System.IO.File]::WriteAllText` with LF"
+            ));
+        }
+    }
+
+    if !yaml_text.contains("  linux-cross-build:\n") {
+        violations.push(String::from(
+            ".github/workflows/ci.yml: missing continuous `linux-cross-build` job for non-tag pushes and pull requests",
+        ));
+    } else if let Some((_, after_job)) = yaml_text.split_once("  linux-cross-build:\n") {
+        let job_body = after_job
+            .split("\n  build-release:\n")
+            .next()
+            .unwrap_or(after_job);
+        if job_body.contains("refs/tags/v") {
+            violations.push(String::from(
+                ".github/workflows/ci.yml: `linux-cross-build` must run on `master` and `pull_request`, not only `refs/tags/v*`",
+            ));
+        }
+        for required_snippet in [
+            "--bins --target aarch64-unknown-linux-gnu",
+            "--bins --target x86_64-unknown-linux-musl",
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+        ] {
+            if !job_body.contains(required_snippet) {
+                violations.push(format!(
+                    ".github/workflows/ci.yml: `linux-cross-build` missing `{required_snippet}`"
+                ));
+            }
+        }
+    }
+
+    if !yaml_text.contains("sha256sum -c SHA256SUMS.txt") {
+        violations.push(String::from(
+            ".github/workflows/ci.yml: `Generate combined SHA256SUMS.txt` must verify archives via `sha256sum -c SHA256SUMS.txt`",
+        ));
+    }
+
+    violations
+}
+
+/// Verifies `.github/workflows/ci.yml` cross-compilation sysroot invariants, continuous Linux
+/// cross-link coverage, and LF-clean `SHA256SUMS.txt` verification, including negative mutation
+/// checks for the `v0.0.1` `Scrt1.o`/`crti.o` failure mode.
+#[test]
+fn test_ci_cross_compile_and_release_workflow_invariants_gate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap_or_default();
+    assert!(
+        !ci_yaml.is_empty(),
+        "Expected `.github/workflows/ci.yml` to be readable"
+    );
+
+    // Confirm negative detection on the exact v0.0.1 regression (`gcc-aarch64-linux-gnu` without `libc6-dev-arm64-cross`).
+    let broken_sysroot_yaml = ci_yaml.replace(
+        "apt_packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross",
+        "apt_packages: gcc-aarch64-linux-gnu",
+    );
+    let sysroot_violations = audit_ci_cross_compile_and_release_workflow(&broken_sysroot_yaml);
+    assert!(
+        sysroot_violations
+            .iter()
+            .any(|msg| msg.contains("libc6-dev-arm64-cross")),
+        "Expected audit to catch missing `libc6-dev-arm64-cross`, got: {sysroot_violations:?}"
+    );
+
+    // Confirm negative detection on CRLF PowerShell `.sha256` generation.
+    let broken_crlf_yaml = ci_yaml.replace(
+        "[System.IO.File]::WriteAllText(\"$ZipPath.sha256\", \"$Hash  $StageName.zip`n\", [System.Text.Encoding]::ASCII)",
+        "\"$Hash  $StageName.zip\" | Set-Content -NoNewline:$false -Encoding ascii \"$ZipPath.sha256\"",
+    );
+    let crlf_violations = audit_ci_cross_compile_and_release_workflow(&broken_crlf_yaml);
+    assert!(
+        crlf_violations
+            .iter()
+            .any(|msg| msg.contains("Set-Content")),
+        "Expected audit to catch CRLF `Set-Content` `.sha256` emission, got: {crlf_violations:?}"
+    );
+
+    let violations = audit_ci_cross_compile_and_release_workflow(&ci_yaml);
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "CI workflow cross-compilation / release violations:\n{}",
+        violations.join("\n")
     );
 }

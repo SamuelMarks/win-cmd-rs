@@ -140,21 +140,21 @@ sequenceDiagram
 
     Interp->>Vfs: read_bytes("C:\deploy.bat")
     Vfs-->>Interp: raw_bytes [0..N]
-    Reader->>Enc: decode_physical_line_from_bytes(offset=0, CodePage::OemUnitedStates)
+    Reader->>Enc: decode_physical_line_at(offset=0, CodePage::OemUnitedStates)
     Enc-->>Reader: "chcp 65001 >nul\r\n" (next offset = 17)
     Reader-->>Interp: Statement 1 (cursor = 17)
     Interp->>Interp: Execute CHCP 65001 (console.codepage = Utf8)
 
     Interp->>Vfs: read_bytes("C:\deploy.bat")
     Vfs-->>Interp: raw_bytes [0..N]
-    Reader->>Enc: decode_physical_line_from_bytes(offset=17, CodePage::Utf8)
+    Reader->>Enc: decode_physical_line_at(offset=17, CodePage::Utf8)
     Enc-->>Reader: line = echo echo Dynamic >> "%~f0" (next offset = 46)
     Reader-->>Interp: Statement 2 (cursor = 46)
     Interp->>Vfs: append_bytes("C:\deploy.bat", "echo Dynamic\r\n")
 
     Interp->>Vfs: read_bytes("C:\deploy.bat")
     Vfs-->>Interp: raw_bytes [0..N+14]
-    Reader->>Enc: decode_physical_line_from_bytes(offset=46, CodePage::Utf8)
+    Reader->>Enc: decode_physical_line_at(offset=46, CodePage::Utf8)
     Enc-->>Reader: "echo Dynamic\r\n" (executes newly appended line!)
 ```
 
@@ -242,7 +242,7 @@ flowchart LR
     CSTP -- "RecoveryMode::Recovering" --> CST_REC["CstScript + Vec&lt;PegDiagnostic&gt;<br/>(Probable Misuse & ErrorNode Recovery)"]
 
     CST_STRICT -- "WordPartsMode::Lightweight" --> AST_EXEC["Statement AST<br/>(Zero Sub-Word Heap Alloc)"]
-    CST_REC -- "WordPartsMode::PopulateSubwordParts" --> AST_LINT["LoweredScript<br/>(ParsedScript + Sub-Word WordParts)"]
+    CST_REC -- "WordPartsMode::PopulateSubwordParts" --> AST_LINT["ParsedScript<br/>(Statements + Sub-Word WordParts)"]
     CST_REC <--> REW["linter::rewriter<br/>Lossless Source-Preserving Edits"]
 ```
 
@@ -381,10 +381,10 @@ classDiagram
         +VerifyCopyMode verify_state
         +OutputUnicodeMode unicode_output_mode
         +PipeExecutionMode pipe_execution_mode
-        +StartWaitMode start_wait_mode
+        +WaitMode start_wait_mode
         +StartWindowMode start_window_mode
         +StartEnvMode start_env_mode
-        +StartPriorityClass start_priority
+        +ProcessPriority start_priority
         +FileCompletionMode file_completion
         +String version_banner
         +ExecutionLimits limits
@@ -469,7 +469,7 @@ All filesystem operations in `reader`, `parser` (`%~dpnxfsatz$PATH:`), `runtime`
 
 ```mermaid
 flowchart TD
-    RAW_P["Raw Path Input<br/>e.g. 'D:sub\\..\\PROGRA~1\\*.txt' or '\\\\srv\\share\\f'"] --> DEV{"DosDevice::intercept_path?<br/>NUL, CON, PRN, AUX, CLOCK$, COM1..9, LPT1..9"}
+    RAW_P["Raw Path Input<br/>e.g. 'D:sub\\..\\PROGRA~1\\*.txt' or '\\\\srv\\share\\f'"] --> DEV{"DosDevice::split_path_device?<br/>NUL, CON, PRN, AUX, CLOCK$, COM1..9, LPT1..9"}
     DEV -- "Device Match" --> DEV_IO["Device Stream / IF EXIST 'dir\\NUL' Check"]
     DEV -- "Filesystem Path" --> CLASS["classify_path (vfs/path.rs)<br/>DriveAbsolute | DriveRelative | RootRelative | Relative | Unc | InvalidUnc"]
     CLASS --> NORM["Resolve against Active Drive &amp; Per-Drive CWD<br/>Strip Win32 trailing dots/spaces (MultiDotMode::NtTrailingDotStrip)<br/>Case-insensitive Eq / Ord / Hash on WindowsPath"]
@@ -581,7 +581,7 @@ flowchart TB
 
 ### 11.2 Single-Tasking `%TEMP%` Pipeline Spooling (`src/runtime/dos_exec.rs`)
 
-Because real-mode MS-DOS is single-tasking and has no concurrent anonymous kernel pipes, `Interpreter::execute_pipeline` (`PipeExecutionMode::InMemoryBuffered`) and `DosProcessSpawner` execute multi-stage pipelines (`prog1.com | builtin | prog2.exe`) sequentially via collision-free 8.3 temporary spool files (`_WCI0000.TMP`, `_WCO0000.TMP`, `_WCE0000.TMP`, plus `_WCR0000.RSP` response files under `LongCmdlineTransfer::AtResponseFile`) resolved in priority order `%WINCMD_PIPE_DIR%` -> `%TEMP%` -> `%TMP%` -> active drive root, polling `DosKernelApi::poll_ctrl_break()` between stages and unconditionally cleaning up spool files:
+Because real-mode MS-DOS is single-tasking and has no concurrent anonymous kernel pipes, `Interpreter::execute_pipeline` (`PipeExecutionMode::InMemoryBuffered`) and `DosProcessSpawner` execute multi-stage pipelines (`prog1.com | builtin | prog2.exe`) sequentially via collision-free 8.3 temporary spool files (`_WCI0000.TMP`, `_WCO0000.TMP`, `_WCE0000.TMP`, plus `_WCR0000.RSP` response files under `LongCmdlineTransfer::ResponseFileAtSign`) resolved in priority order `%WINCMD_PIPE_DIR%` -> `%TEMP%` -> `%TMP%` -> active drive root, polling `DosKernelApi::poll_ctrl_break()` between stages and unconditionally cleaning up spool files:
 
 ```mermaid
 sequenceDiagram

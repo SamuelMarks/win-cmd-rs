@@ -1,8 +1,8 @@
 //! AST & CST static analysis passes and CST tree-rewriter pass modules.
 //!
 //! Contains the static analysis visitor (`analyze_parsed_script_with_externals`) covering `CMD1001`–`CMD4010`
-//! with zero `std::convert::identity` branch-masking tricks, plus the four modular CST
-//! rewrite pass implementations (`delayed_exp`, `dialect`, `quoting`, `structural`).
+//! with zero `std::convert::identity` branch-masking tricks, plus the five modular CST
+//! rewrite pass implementations (`delayed_exp`, `dialect`, `dos_compat`, `quoting`, `structural`).
 
 pub mod delayed_exp;
 pub mod dialect;
